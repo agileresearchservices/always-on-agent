@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import secrets
-import tempfile
 import uuid
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -19,7 +17,7 @@ from .events import Event
 from . import github_monitor as gh
 from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
 from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RESOLVED_KEY, RETRYABLE, check_summary, decide, report_text
-from .pr_resolve import Resolver, with_heartbeat
+from .pr_resolve import AUTO_MERGE_ON, ResolveError, Resolver, resolve_root, with_heartbeat
 from .pr_review import github_body, parse_verdict, slack_text
 
 
@@ -257,8 +255,17 @@ class AgentActivities:
         if not a["same_repo"] or a["head_ref"] in a.get("protected_refs", []):
             return {"status": "failed", "action": "needs_human",
                     "reason": "the PR comes from a fork or its head is a base/default branch; resolve the conflicts by hand"}
-        # outside the data dir: the tests are repo code, and nothing should sit next to .env or the store
-        workdir = Path(tempfile.gettempdir()) / "aoa-resolve" / uuid.uuid4().hex[:12]
+
+        async def auto_merge_off() -> None:  # with auto-merge on, the push alone could merge a model-written commit
+            pr = (await gh.gh_call("GET", f"/repos/{repo}/pulls/{a['number']}")).json()
+            if pr.get("auto_merge"):
+                raise ResolveError(AUTO_MERGE_ON, "auto_merge")
+
+        try:
+            await auto_merge_off()
+        except ResolveError as e:
+            return {"status": "failed", "action": e.action, "reason": str(e)}
+        workdir = resolve_root() / uuid.uuid4().hex[:12]
         mark = lambda sha, files: self.core.store.kv_set(  # noqa: E731
             a["session"], f"{RESOLVED_KEY}{repo}#{a['number']}@{sha}", files)
         r = Resolver(repo=repo, sha=a["sha"], head_ref=a["head_ref"], base_ref=a["base_ref"], workdir=workdir,
@@ -266,7 +273,7 @@ class AgentActivities:
                      llm=self.core.llm, model=self.s.helper_model, max_tokens=self.s.max_tokens,
                      protected_refs=tuple(a.get("protected_refs", [])),
                      on_usage=lambda m, u: self.core.store.usage_add(f"resolve/{repo}#{a['number']}", m, u),
-                     on_commit=mark)
+                     on_commit=mark, before_push=auto_merge_off)
         out = await with_heartbeat(r.run(), activity.heartbeat)
         if out["status"] == "resolved":
             mark(out["new_sha"], out["files"])  # also on a retry that found its earlier push

@@ -110,7 +110,7 @@ def github_body(v: dict[str, Any]) -> str:
 def slack_text(v: dict[str, Any] | None, pr: dict[str, Any], posted: bool, note: str = "") -> str:
     from .github_monitor import slack_safe
 
-    head = f"[{slack_safe(pr['repo'])}#{pr['number']} {slack_safe(pr['title'])}]({pr['url']})"
+    head = f"[{slack_safe(pr['repo'], True)}#{pr['number']} {slack_safe(pr['title'], True)}]({pr['url']})"
     if v is None:
         return f"Review failed for {head}: the reviewer did not return a usable verdict. Nothing was posted. {note}".strip()
     icon = ":white_check_mark:" if v["verdict"] == "approve" else ":x:"

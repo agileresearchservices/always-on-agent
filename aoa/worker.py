@@ -13,6 +13,7 @@ from .config import Settings
 from .core import AgentCore
 from .llm import AnthropicLLM
 from .memory import MemoryStore
+from .pr_resolve import clean_stale_workdirs
 from .scheduling import TemporalScheduler, ensure_github_schedule
 from .store import Store
 from .workflows import (
@@ -38,6 +39,8 @@ async def build_worker(settings: Settings, client: Client, core: AgentCore | Non
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    if n := clean_stale_workdirs():
+        logging.info("removed %d stale conflict-resolution work dir(s)", n)
     settings = Settings.from_env()
     client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
     worker = await build_worker(settings, client)

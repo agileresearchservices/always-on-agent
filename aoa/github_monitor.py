@@ -41,9 +41,14 @@ def _clean(s: str, limit: int = 200) -> str:
     return re.sub(r"\s+", " ", s or "").strip()[:limit]
 
 
-def slack_safe(s: str) -> str:
-    """Untrusted text going into a Slack message: no mentions, links or markup."""
-    return re.sub(r"[<>&\[\]`*_~|]", "", s)
+def slack_safe(s: str, label: bool = False) -> str:
+    """Untrusted text going into a Slack message, escaped rather than stripped (titles keep their `_` and
+    `[...]`): & < > become entities (no mentions or links), a backtick becomes ' (it would end aoa's code
+    spans), and `](` is split so `to_mrkdwn` cannot turn it into a masked link. In a link label
+    (label=True) brackets become parentheses, since a ] would end the label. Slack has no escape for
+    * _ ~ and only formats them at word boundaries, so they stay: cosmetic at worst."""
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "'")
+    return s.replace("[", "(").replace("]", ")") if label else s.replace("](", "] (")
 
 
 def _headers(token: str, accept: str = "application/vnd.github+json") -> dict[str, str]:
@@ -131,7 +136,7 @@ def notice_text(prs: list[dict[str, Any]]) -> str:
     lines = [f"*{n} PR{'s' if n != 1 else ''} ready for review*"]
     for pr in prs[:MAX_LISTED]:
         tail = " (new commits)" if pr["why"] == "new commits" else ""
-        lines.append(f"• [{slack_safe(pr['repo'])}#{pr['number']} {slack_safe(pr['title'])}]({pr['url']}) "
+        lines.append(f"• [{slack_safe(pr['repo'], True)}#{pr['number']} {slack_safe(pr['title'], True)}]({pr['url']}) "
                      f"by {slack_safe(pr['author'])}{tail}")
     if n > MAX_LISTED:
         lines.append(f"…and {n - MAX_LISTED} more")

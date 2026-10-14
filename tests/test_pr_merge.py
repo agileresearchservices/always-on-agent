@@ -73,14 +73,19 @@ def test_report_merged_without_linked_issue_warns():
 def test_report_failure_offers_retry_only_when_it_can_help():
     assert "try again" in report_text(OFFER, {"status": "failed", "action": "checks_failed", "reason": "failing checks: x"})
     assert "try again" not in report_text(OFFER, {"status": "failed", "action": "stale", "reason": "new commits"})
+    for action in ("no_conflict", "auto_merge", "resolve_failed"):
+        assert "try again" in report_text(OFFER, {"status": "failed", "action": action, "reason": "r"})
+    t = report_text(OFFER, {"status": "failed", "action": "tests_failed", "reason": "tests failed"})
+    assert "try again" not in t and "Fix the tests" in t
 
 
 def test_report_resolved_lists_files_tests_and_next_step():
     out = {"status": "resolved", "new_sha": "1234567890", "files": ["app.py"], "summaries": {"app.py": "kept both"},
-           "tests": "passed (`pytest`)"}
+           "tests": "passed", "test_cmd": 'pip install -e ".[dev]" && pytest -k `x`'}
     t = report_text(OFFER, out)
     assert "Resolved merge conflicts" in t and "`1234567`" in t and "not merged" in t
-    assert "app.py" in t and "kept both" in t and "Tests: passed" in t and "new card" in t
+    assert "app.py" in t and "kept both" in t and "new card" in t
+    assert """Tests: passed (`pip install -e ".[dev]" &amp;&amp; pytest -k 'x'`)""" in t  # escaped, not mangled
 
 
 def test_reviewer_is_told_about_an_aoa_resolution():
@@ -92,8 +97,8 @@ def test_reviewer_is_told_about_an_aoa_resolution():
 
 
 def test_report_escapes_titles():
-    t = report_text(OFFER | {"title": "<!channel> *boom*"}, {"status": "updated"})
-    assert "<!channel>" not in t and "*boom*" not in t
+    t = report_text(OFFER | {"title": "<!channel> [WIP] fix tool_choice"}, {"status": "updated"})
+    assert "<!channel>" not in t and "&lt;!channel&gt; (WIP) fix tool_choice](" in t
 
 
 # ---- activities against a fake GitHub ---------------------------------------------------------
@@ -301,3 +306,14 @@ def test_merge_endpoint_rejects_unknown_wrong_session_and_out_of_scope(api):
     assert client.post("/sessions/main/merges/mrg-bbbbbbbbbbbb", json={}).status_code == 403
     assert client.post("/sessions/main/merges/mrg-cccccccccccc", json={}).status_code == 404
     assert fake.started == []
+
+
+async def test_resolve_refuses_while_auto_merge_is_on(acts, monkeypatch):
+    fake = use(monkeypatch, FakeGitHub({
+        ("GET", "/repos/agileresearchservices/demo/pulls/7"): (200, ghpr() | {"auto_merge": {"merge_method": "squash"}}),
+    }))
+    out = await acts.resolve_conflicts({"session": "main", "repo": OFFER["repo"], "number": 7, "sha": SHA,
+                                        "head_ref": "feat/x", "base_ref": "main", "same_repo": True,
+                                        "protected_refs": ["main"]})
+    assert out["action"] == "auto_merge" and "auto-merge is on" in out["reason"]
+    assert [c[0] for c in fake.calls] == ["GET"]  # stopped before cloning anything

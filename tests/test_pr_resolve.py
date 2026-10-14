@@ -212,3 +212,86 @@ async def test_tool_choice_is_not_forced_and_4xx_is_not_retried(tmp_path, remote
     out = await resolver(tmp_path, remote, llm).run()
     assert out["status"] == "failed" and "refused the request (400)" in out["reason"]
     assert len(llm.calls) == 1 and llm.calls[0]["tool_choice"] is None  # forced tool use is rejected live
+
+
+async def test_clean_merge_is_reported_not_pushed(tmp_path, remote):
+    origin, _, seed = remote
+    git(seed, "checkout", "-q", "-b", "clean", "main")
+    (seed / "other.py").write_text("y = 1\n")
+    git(seed, "add", ".")
+    git(seed, "commit", "-qm", "unrelated")
+    git(seed, "push", "-q", "origin", "clean")
+    sha = git(seed, "rev-parse", "clean")
+    llm = FakeLLM([])
+    r = Resolver(repo=REPO, sha=sha, head_ref="clean", base_ref="main", workdir=tmp_path / "w", remote_url=str(origin),
+                 token=None, llm=llm, model="m", max_tokens=1000)
+    out = await r.run()
+    assert out["action"] == "no_conflict" and "out of date" in out["reason"] and not llm.calls
+    assert git(origin, "rev-parse", "clean") == sha
+
+
+async def test_text_outside_the_conflict_must_survive(tmp_path, remote):
+    origin, sha, _ = remote
+    out = await resolver(tmp_path, remote, FakeLLM([resolution("a = 1\nx = 2  # feat\nx3 = 3  # main\nz = 9\n")])).run()
+    assert out["status"] == "failed" and "outside the conflicting regions" in out["reason"]
+    assert out["action"] == "resolve_failed"  # a second model run may do better
+    assert git(origin, "rev-parse", "feat") == sha
+
+
+async def test_trailing_newline_is_restored(tmp_path, remote):
+    origin, _, _ = remote
+    out = await resolver(tmp_path, remote, FakeLLM([resolution("a = 0\nx = 2  # feat\nx3 = 3  # main\nz = 9")])).run()
+    assert out["status"] == "resolved", out
+    assert subprocess.run(["git", "show", "feat:app.py"], cwd=origin, capture_output=True, text=True).stdout.endswith("z = 9\n")
+
+
+def test_conflict_context_and_line_endings():
+    from aoa.pr_resolve import ResolveError, conflict_context, finish_resolution
+
+    conflicted = ("Title\r\n=======\r\n<<<<<<< HEAD\r\nours\r\n||||||| base\r\nold\r\n=======\r\ntheirs\r\n"
+                  ">>>>>>> origin/base\r\ntail\r\n")
+    assert conflict_context(conflicted) == ["Title\r\n=======\r\n", "tail\r\n"]  # an underline is not a separator
+    texts = {"conflicted": conflicted, "ours": "Title\r\n=======\r\nours\r\ntail\r\n",
+             "theirs": "Title\r\n=======\r\ntheirs\r\ntail\r\n"}
+    assert finish_resolution("Title\n=======\nours\ntheirs\ntail", texts) == "Title\r\n=======\r\nours\r\ntheirs\r\ntail\r\n"
+    with pytest.raises(ResolveError):
+        finish_resolution("Title\n=======\nours\ntheirs\n", texts)  # dropped "tail"
+
+
+async def test_test_failures_are_final_but_timeouts_can_be_retried(tmp_path, remote, tests_cmd, monkeypatch):
+    tests_cmd("exit 1")
+    out = await resolver(tmp_path, remote, FakeLLM([resolution()])).run()
+    assert out["action"] == "tests_failed"
+    tests_cmd("sleep 5")
+    monkeypatch.setenv("AOA_RESOLVE_TEST_TIMEOUT", "0.5")
+    out = await resolver(tmp_path, remote, FakeLLM([resolution()])).run()
+    assert out["action"] == "resolve_failed" and "timed out" in out["reason"]
+
+
+async def test_before_push_can_stop_the_push(tmp_path, remote):
+    from aoa.pr_resolve import ResolveError
+
+    origin, sha, _ = remote
+
+    async def auto_merge_on():
+        raise ResolveError("auto-merge is on", "auto_merge")
+
+    r = resolver(tmp_path, remote, FakeLLM([resolution()]), marks=(marks := []))
+    r.before_push = auto_merge_on
+    out = await r.run()
+    assert out["action"] == "auto_merge" and marks == []  # not marked, not pushed
+    assert git(origin, "rev-parse", "feat") == sha
+
+
+def test_stale_work_dirs_are_cleaned(tmp_path, monkeypatch):
+    import os
+    import tempfile
+
+    from aoa.pr_resolve import clean_stale_workdirs, resolve_root
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    old, new = resolve_root() / "old", resolve_root() / "new"
+    for d in (old, new):
+        (d / "clone").mkdir(parents=True)
+    os.utime(old, (0, 0))
+    assert clean_stale_workdirs() == 1 and not old.exists() and new.exists()

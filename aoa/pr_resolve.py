@@ -2,7 +2,8 @@
 
 Started only from a human [Merge] click that found conflicts. In a throwaway clone: check out the exact
 reviewed commit, merge the base into it, have a model resolve each conflicted file (validated), commit, run
-the repo's tests, and push to the PR branch without force. The new commit is then reviewed again and gets
+the repo's tests, and push to the PR branch without force (never while GitHub auto-merge is on: the push
+alone would merge). The new commit is then reviewed again and gets
 its own Merge button, so no AI-written resolution reaches the base branch without a second human click.
 
 Secrets: the GitHub token reaches git only through GIT_CONFIG_* environment variables (never argv, the
@@ -19,15 +20,21 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 MAX_FILES = 10
 MAX_FILE_BYTES = 40_000
-TEST_TIMEOUT = 600
+TEST_TIMEOUT = 1200  # AOA_RESOLVE_TEST_TIMEOUT overrides; the activity's start-to-close is 30 min
 GIT_TIMEOUT = 300
+TIMED_OUT = -1000  # _run's exit code for "killed at the timeout" (a real SIGKILL is -9)
+STALE_WORKDIR_SECONDS = 3600
 MARKER = re.compile(r"^(<{7}|>{7})(\s|$)", re.MULTILINE)  # a lone ======= is a legit RST/Markdown underline
 COMMIT_TAG = "conflicts resolved by aoa"
+AUTO_MERGE_ON = ("auto-merge is on for this PR, so pushing a resolution could merge it without a second click; "
+                 "turn auto-merge off first")
 BOT_EMAIL = "aoa-agent@users.noreply.github.com"
 BOT = ["-c", "user.name=aoa agent", "-c", f"user.email={BOT_EMAIL}"]
 REPO_TEST_FILE = ".aoa/test-command"
@@ -116,8 +123,83 @@ async def _run_bytes(args: list[str], cwd: Path, env: dict[str, str], timeout: f
             pass
         if isinstance(e, asyncio.CancelledError):
             raise
-        return -9, f"timed out after {timeout:.0f}s".encode()
+        return TIMED_OUT, f"timed out after {timeout:.0f}s".encode()
     return p.returncode or 0, out
+
+
+def resolve_root() -> Path:
+    """Where work dirs live: outside the data dir (the tests are repo code; nothing should sit next to .env
+    or the store). One function for creating and cleaning, so both agree on TMPDIR."""
+    return Path(tempfile.gettempdir()) / "aoa-resolve"
+
+
+def clean_stale_workdirs(max_age: float = STALE_WORKDIR_SECONDS) -> int:
+    """Remove work dirs a killed worker left behind (a live attempt is never older than its 30 min timeout)."""
+    removed, cutoff = 0, time.time() - max_age
+    root = resolve_root()
+    for d in root.iterdir() if root.is_dir() else []:
+        try:
+            if d.is_dir() and not d.is_symlink() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _is_marker(line: str, ch: str) -> bool:
+    return re.match(rf"{re.escape(ch)}{{7}}(\s|$)", line) is not None
+
+
+def conflict_context(conflicted: str) -> list[str]:
+    """The text outside the conflict hunks, as chunks in file order. `=======` only counts as a separator
+    inside a hunk (outside it is a legit RST/Markdown underline)."""
+    chunks, cur, state = [], [], "out"
+    for line in conflicted.splitlines(keepends=True):
+        if state == "out":
+            if _is_marker(line, "<"):
+                chunks.append("".join(cur))
+                cur, state = [], "ours"
+            else:
+                cur.append(line)
+        elif state == "ours" and _is_marker(line, "|"):
+            state = "base"
+        elif state in ("ours", "base") and line.rstrip("\r\n") == "=======":
+            state = "theirs"
+        elif state == "theirs" and _is_marker(line, ">"):
+            state = "out"
+    chunks.append("".join(cur))
+    return [c for c in chunks if c]
+
+
+def _lf(s: str) -> str:
+    return s.replace("\r\n", "\n")
+
+
+def _crlf(s: str) -> bool:
+    return "\r\n" in s and s.count("\r\n") == s.count("\n")
+
+
+def finish_resolution(content: str, texts: dict[str, str]) -> str:
+    """Check a model's resolution against the conflicted file and match the file's conventions.
+
+    Everything outside the conflict hunks must survive verbatim and in order (the model is told not to touch
+    it). Line endings follow the two sides (CRLF if both use it), and so does the trailing newline."""
+    lf = _lf(content)
+    ours, theirs = texts["ours"], texts["theirs"]
+    if ours.endswith("\n") and theirs.endswith("\n") and not lf.endswith("\n"):
+        lf += "\n"
+    elif not ours.endswith("\n") and not theirs.endswith("\n") and lf.endswith("\n"):
+        lf = lf[:-1]
+    pos = 0
+    for chunk in conflict_context(texts["conflicted"]):
+        i = lf.find(_lf(chunk), pos)
+        if i < 0:
+            first = _lf(chunk).strip().splitlines()[:1]
+            raise ResolveError("the resolution changed text outside the conflicting regions"
+                               + (f" (near {first[0][:60]!r})" if first else ""))
+        pos = i + len(_lf(chunk))
+    return lf.replace("\n", "\r\n") if _crlf(ours) and _crlf(theirs) else lf
 
 
 class Resolver:
@@ -126,11 +208,13 @@ class Resolver:
     def __init__(self, *, repo: str, sha: str, head_ref: str, base_ref: str, workdir: Path, remote_url: str,
                  token: str | None, llm: Any, model: str, max_tokens: int, protected_refs: tuple[str, ...] = (),
                  on_usage: Callable[[str, dict[str, int]], None] = lambda m, u: None,
-                 on_commit: Callable[[str, list[str]], None] = lambda sha, files: None):
+                 on_commit: Callable[[str, list[str]], None] = lambda sha, files: None,
+                 before_push: Callable[[], Awaitable[None]] | None = None):
         self.repo, self.sha, self.head_ref, self.base_ref = repo, sha, head_ref, base_ref
         self.dir, self.remote_url, self.genv = workdir / "clone", remote_url, git_env(token, workdir / "home")
         self.workdir, self.llm, self.model, self.max_tokens, self.on_usage = workdir, llm, model, max_tokens, on_usage
-        self.on_commit = on_commit
+        self.on_commit, self.before_push = on_commit, before_push  # before_push raises ResolveError to stop
+        self.test_cmd = ""
         self.protected_refs = {base_ref, *protected_refs}
 
     async def git(self, *args: str, check: bool = True) -> str:
@@ -172,6 +256,9 @@ class Resolver:
         files = list(unmerged)
         if code != 0 and not files:
             raise ResolveError(f"git merge failed: {out.strip()[-300:]}")
+        if not files:  # a clean merge, or the branch already has the base: GitHub's "dirty" was out of date
+            raise ResolveError("GitHub reported conflicts, but git merges the base cleanly, so GitHub's status "
+                               "was probably out of date; nothing was pushed", "no_conflict")
         if len(files) > MAX_FILES:
             raise ResolveError(f"{len(files)} conflicted files; more than {MAX_FILES} needs a human", "needs_human")
         summaries = {}
@@ -179,11 +266,12 @@ class Resolver:
             summaries[f] = await self._resolve_file(f, unmerged[f])
         if await self._unmerged():
             raise ResolveError("conflicts remain after resolving")
-        resolved = ", ".join(files) or "none"
         await self.git(*BOT, "commit", "-q", "-m",
-                       f"Merge {self.base_ref} into {self.head_ref}: {COMMIT_TAG}\n\nResolved files: {resolved}")
+                       f"Merge {self.base_ref} into {self.head_ref}: {COMMIT_TAG}\n\nResolved files: {', '.join(files)}")
         new_sha = (await self.git("rev-parse", "HEAD")).strip()
         tests, tail = await self._tests()
+        if self.before_push is not None:  # e.g. auto-merge was switched on meanwhile: the push alone could merge
+            await self.before_push()
         self.on_commit(new_sha, files)  # before the push, so the poll can never see the commit unmarked
         push_code, push_out = await _run(["git", "push", "-q", "origin", f"{new_sha}:refs/heads/{self.head_ref}"],
                                          self.dir, self.genv, GIT_TIMEOUT)
@@ -192,7 +280,7 @@ class Resolver:
                 raise ResolveError("the PR branch moved while resolving; nothing was pushed", "stale")
             raise ResolveError(f"push failed: {push_out.strip()[-300:]}")
         return {"status": "resolved", "new_sha": new_sha, "files": files, "summaries": summaries,
-                "tests": tests, "test_tail": tail}
+                "tests": tests, "test_cmd": self.test_cmd[:120], "test_tail": tail}
 
     async def _unmerged(self) -> dict[str, dict[int, str]]:
         """Unmerged paths -> {stage: file mode}, NUL-separated so odd file names survive."""
@@ -215,8 +303,9 @@ class Resolver:
             raise ResolveError(f"{path}: a side added, deleted or renamed it; that needs a human", "needs_human")
         if any(m not in ("100644", "100755") for m in modes.values()):
             raise ResolveError(f"{path} is a symlink or submodule; that needs a human", "needs_human")
-        target = (self.dir / path).resolve()
-        if not target.is_relative_to(self.dir.resolve()) or target.is_symlink() or not target.is_file():
+        target = (self.dir / path).resolve()  # resolve() follows links, so test the path itself for one
+        if ((self.dir / path).is_symlink() or not target.is_relative_to(self.dir.resolve())
+                or not target.is_file()):
             raise ResolveError(f"{path} is not a regular file in the clone; that needs a human", "needs_human")
         blobs = {}
         for n, name in ((1, "base"), (2, "ours"), (3, "theirs")):
@@ -237,8 +326,9 @@ class Resolver:
         prompt = (f"Repository {self.repo}; pull request branch {self.head_ref} merging in {self.base_ref}.\n"
                   f"File: {path}\n\n" + "".join(f"<{k}>\n{v}\n</{k}>\n\n" for k, v in texts.items()))
         resp = await self._call_model(prompt)
-        if resp.stop_reason == "max_tokens":
-            raise ResolveError(f"{path}: the model's answer was cut off")
+        if resp.stop_reason == "max_tokens":  # trying again will not help: this file is too big for one answer
+            raise ResolveError(f"{path}: the model's answer was cut off at the output limit; resolve it by hand",
+                               "needs_human")
         call = next((b for b in resp.content if b["type"] == "tool_use" and b["name"] == "submit_resolution"), None)
         content = (call or {}).get("input", {}).get("content")
         if not isinstance(content, str):
@@ -247,6 +337,10 @@ class Resolver:
             raise ResolveError(f"{path}: the resolution still has conflict markers")
         if len(content.strip()) < 0.5 * min(len(texts["ours"].strip()), len(texts["theirs"].strip())):
             raise ResolveError(f"{path}: the resolution is much shorter than either side, so it was not trusted")
+        try:
+            content = finish_resolution(content, texts)
+        except ResolveError as e:
+            raise ResolveError(f"{path}: {e}") from None
         target.write_bytes(content.encode("utf-8"))
         await self.git("add", "--", path)
         return str(call["input"].get("summary", ""))[:300]
@@ -265,7 +359,7 @@ class Resolver:
                 return resp
             except Exception as e:  # noqa: BLE001 - provider hiccup (5xx/529): a few tries, then give up
                 status = getattr(e, "status_code", None)
-                if isinstance(status, int) and 400 <= status < 500 and status != 429:
+                if isinstance(status, int) and 400 <= status < 500 and status not in (408, 409, 429):
                     raise ResolveError(f"the model API refused the request ({status}): {str(e)[:200]}") from None
                 if attempt == 3:
                     raise ResolveError(f"the model call kept failing: {str(e)[:200]}") from None
@@ -276,13 +370,18 @@ class Resolver:
         cmd = repo_test_command(self.repo, self.dir, base_file if code == 0 else None)
         if not cmd:
             return "none (no test command for this repo)", ""
+        self.test_cmd = cmd
         home = self.workdir / "home"
         home.mkdir(exist_ok=True)
-        code, out = await _run([cmd], self.dir, safe_env() | {"HOME": str(home)}, TEST_TIMEOUT, shell=True)
+        timeout = float(os.environ.get("AOA_RESOLVE_TEST_TIMEOUT") or TEST_TIMEOUT)
+        code, out = await _run([cmd], self.dir, safe_env() | {"HOME": str(home)}, timeout, shell=True)
         tail = out.strip()[-1200:]
-        if code != 0:
-            raise ResolveError(f"tests failed after resolving, so nothing was pushed. Last output: {tail[-500:]}")
-        return f"passed (`{cmd[:120]}`)", tail[-300:]
+        if code == TIMED_OUT:  # maybe a cold install: worth another click (or a bigger AOA_RESOLVE_TEST_TIMEOUT)
+            raise ResolveError(f"the tests timed out after {timeout:.0f}s, so nothing was pushed")
+        if code != 0:  # the same resolution would fail the same way: fix the branch or resolve by hand
+            raise ResolveError(f"tests failed after resolving, so nothing was pushed. Last output: {tail[-500:]}",
+                               "tests_failed")
+        return "passed", tail[-300:]
 
 
 async def with_heartbeat(coro: Awaitable[Any], beat: Callable[[], None], every: float = 30) -> Any:
