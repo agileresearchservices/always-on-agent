@@ -92,6 +92,7 @@ class SessionWorkflow:
         self._warm_requested = False
         self._last_warm = -1e9
         self._flush_at: float | None = None  # when the held digest may go out (epoch seconds)
+        self._apr_at: float | None = None  # when a pending approval next needs a nudge or lapses
 
     # ---- signals / queries ------------------------------------------------------------
     @workflow.signal
@@ -134,12 +135,13 @@ class SessionWorkflow:
         for ev in inp.get("carry", []):
             self.submit_event(ev)
         ops = WorkflowOps(session, cfg)
-        await self._arm_flush(session)  # items held before a continue-as-new still need their timer
+        await self._arm_timers(session)  # items held / pending before a continue-as-new still need their timers
 
         while not self._stop:
             if not self._should_wake():
                 idle = None if self._asleep else float(cfg["idle_sleep"])
-                due = None if self._flush_at is None else max(1.0, self._flush_at - workflow.time())
+                nxt = [t for t in (self._flush_at, self._apr_at) if t is not None]
+                due = max(1.0, min(nxt) - workflow.time()) if nxt else None
                 wait = idle if due is None else (due if idle is None else min(idle, due))
                 try:
                     if wait is None:
@@ -147,8 +149,18 @@ class SessionWorkflow:
                     else:
                         await workflow.wait_condition(self._should_wake, timeout=timedelta(seconds=wait))
                 except asyncio.TimeoutError:
+                    fired = False
                     if self._flush_at is not None and workflow.time() >= self._flush_at:
                         await self._flush_digest(session)
+                        fired = True
+                    if self._apr_at is not None and workflow.time() >= self._apr_at:
+                        res = await workflow.execute_activity(
+                            "approvals_tick", session, start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=STATE_RETRY,
+                        )
+                        self._apr_at = res.get("next")
+                        fired = True
+                    if fired:
                         continue
                     await workflow.execute_activity(
                         "sandbox_sleep", session, start_to_close_timeout=timedelta(minutes=2),
@@ -183,20 +195,24 @@ class SessionWorkflow:
             else:
                 events, self._bg_q = self._bg_q, []
             await self._run_turn(ops, session, cfg, events)
-            await self._arm_flush(session)
+            await self._arm_timers(session)
 
             if workflow.info().is_continue_as_new_suggested() and workflow.all_handlers_finished():
                 workflow.continue_as_new(
                     {"session": session, "cfg": cfg, "carry": self._user_q + self._bg_q}
                 )
 
-    async def _arm_flush(self, session: str) -> None:
-        """Ask when held updates may go out, so a durable timer (not the next message) delivers them."""
-        if not workflow.patched("digest-flush"):
-            return
-        self._flush_at = await workflow.execute_activity(
-            "digest_status", session, start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
-        )
+    async def _arm_timers(self, session: str) -> None:
+        """Ask when held updates may go out and when a pending approval needs a nudge or lapses, so durable
+        timers (not the next message) act on them."""
+        if workflow.patched("digest-flush"):
+            self._flush_at = await workflow.execute_activity(
+                "digest_status", session, start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
+            )
+        if workflow.patched("approval-expiry"):
+            self._apr_at = await workflow.execute_activity(
+                "approvals_next", session, start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
+            )
 
     async def _flush_digest(self, session: str) -> None:
         res = await workflow.execute_activity(

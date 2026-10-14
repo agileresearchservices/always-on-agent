@@ -266,3 +266,21 @@ async def test_held_update_is_flushed_by_a_timer(client, env, monkeypatch):
     outs = store.outbox_since(sid)
     assert outs[0]["payload"]["text"] == "first"
     assert outs[1]["kind"] == "update" and "second" in outs[1]["payload"]["text"]
+
+
+async def test_pending_approval_is_nudged_then_expires(client, env, monkeypatch):
+    """No click ever comes: the workflow's timers nudge once, then expire the approval, with nothing else
+    arriving at the session."""
+    monkeypatch.setenv("AOA_APPROVAL_NUDGE", "2")
+    monkeypatch.setenv("AOA_APPROVAL_EXPIRE", "5")
+    monkeypatch.setenv("AOA_QUIET_START", "0")
+    monkeypatch.setenv("AOA_QUIET_END", "0")  # never quiet
+    s = Settings.from_env()
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    script = [[tool("call_deferred", name="external_send", arguments={"channel": "email:bob", "text": "hi"})], text("waiting for the approval")]
+    store, _ = await _run(client, s, script, sid, [user_event("send bob a note")], 3, timeout=30)
+    texts = [o["payload"].get("text", "") for o in store.outbox_since(sid)]
+    assert any("Still waiting on your decision" in t for t in texts), [(o["kind"], o["payload"]) for o in store.outbox_since(sid)]
+    assert any("lapsed" in t for t in texts)
+    aid = next(o["payload"]["approval_id"] for o in store.outbox_since(sid) if o["kind"] == "approval")
+    assert store.approval_get(aid)["status"] == "expired"

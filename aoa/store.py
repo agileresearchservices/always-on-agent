@@ -263,6 +263,16 @@ class Store:
             )
             return cur.rowcount == 1
 
+    def approvals_pending(self, session: str) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM approvals WHERE session=? AND status='pending'", (session,)).fetchall()
+        return [dict(r) | {"action": json.loads(r["action"])} for r in rows]
+
+    def approval_expire(self, approval_id: str) -> bool:
+        with self._conn() as c:
+            cur = c.execute("UPDATE approvals SET status='expired' WHERE id=? AND status='pending'", (approval_id,))
+            return cur.rowcount == 1
+
     # ---- routines ----------------------------------------------------------
     def routine_put(self, session: str, name: str, cron: str, prompt: str) -> None:
         with self._conn() as c:

@@ -189,7 +189,12 @@ class Bridge:
             f"/sessions/{self.cfg.session}/approvals/{approval_id}", json={"approve": approved}
         )
         if r.status_code == 409:
-            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{approval_id} was already decided._")
+            try:
+                detail = str(r.json().get("detail") or "")
+            except ValueError:
+                detail = ""
+            what = detail if "expired" in detail else "was already decided"
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{approval_id} {what}._")
             return
         self._check(r, "decide approval")
         if r.status_code >= 400:

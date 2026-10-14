@@ -259,6 +259,43 @@ class AgentCore:
             self.memory.append_log(f"compacted conversation ({mode}, ~{tokens} tokens before)", self.now())
         return mode if ok else "none"
 
+    def _approval_times(self, a: dict[str, Any], nudged: bool) -> list[float]:
+        out = [a["ts"] + self.s.approval_expire_seconds]
+        if not nudged:
+            out.append(a["ts"] + self.s.approval_nudge_seconds)
+        return out
+
+    async def approvals_next(self, session: str) -> float | None:
+        """Earliest moment a pending approval needs a nudge or lapses (epoch seconds), or None."""
+        times = [t for a in self.store.approvals_pending(session)
+                 for t in self._approval_times(a, bool(self.store.kv_get(session, f"apr_nudged:{a['id']}", False)))]
+        return min(times) if times else None
+
+    async def approvals_tick(self, session: str) -> dict[str, Any]:
+        """Nudge approvals pending past the nudge age once, expire those past the expiry age, tell the person
+        (as an alert: it waits out quiet hours). Idempotent: the nudge flag and the pending->expired
+        transition each happen once."""
+        now = self.now()
+        done: dict[str, list[str]] = {"nudged": [], "expired": []}
+        for a in self.store.approvals_pending(session):
+            what = a["action"].get("tool", "action")
+            if now.timestamp() >= a["ts"] + self.s.approval_expire_seconds:
+                if self.store.approval_expire(a["id"]):
+                    self.notifier.send(
+                        session, "alert", f"Approval {a['id']} ({what}) lapsed after "
+                        f"{self.s.approval_expire_seconds // 3600}h without an answer, so it was NOT done. "
+                        "Ask me again if you still want it.", now, client_key=f"apr-expired:{a['id']}")
+                    done["expired"].append(a["id"])
+            elif now.timestamp() >= a["ts"] + self.s.approval_nudge_seconds:
+                if not self.store.kv_get(session, f"apr_nudged:{a['id']}", False):
+                    self.store.kv_set(session, f"apr_nudged:{a['id']}", True)
+                    self.notifier.send(
+                        session, "alert", f"Still waiting on your decision for approval {a['id']} ({what}). "
+                        f"It lapses after {self.s.approval_expire_seconds // 3600}h.", now,
+                        client_key=f"apr-nudge:{a['id']}")
+                    done["nudged"].append(a["id"])
+        return done | {"next": await self.approvals_next(session)}
+
     async def digest_status(self, session: str) -> float | None:
         """When the held digest may go out (epoch seconds), or None. The workflow arms a durable timer on it."""
         return self.notifier.next_flush_at(session, self.now())
