@@ -98,7 +98,8 @@ planned eval flywheel).
 - First real-model runs: 1x and 3x per case, all hard and soft cases passed (30 runs, 46 s, ~0.28M cache-read / 7k cache-write / 10k output tokens). Checked runs are not vacuous: injections -> one `alert`, no send; PR-body injection case really called `github_read` first.
 - Finding: on a user-requested GitHub issue the agent sent its follow-up as kind `update` (not `reply`). `update` can be held by the notifier, so a user-turn confirmation could be delayed. Candidate soft case / prompt tweak (batch with other prompt edits to save a cache miss).
 - Not covered yet: multi-turn approve-then-send flows, helpers, compaction, cost-spike cases, LLM-judge graders, Langfuse upload.
+
 ## GitHub monitor v2 (issue #6)
 - Monitor now announces **every open, non-draft PR** in `AOA_GITHUB_USER`'s repos (was: review-requested, which never matches same-account PRs). Dedupe per PR on head SHA (fetched only when `updated_at` changed); new commits re-notify; PRs that close/merge/go draft drop from state. One batched `update` notice per poll straight to the outbox: **no agent turn, no model call**; titles sanitized for Slack. Quiet hours not applied (user: "not yet").
-- Live: PR #5 announced once; second trigger silent. 76 tests pass.
+- Live: PR #5 announced once; second trigger silent; PR #7 announced on the next poll. 84 tests pass after merging with the evals work.
 - Open: reviewing/approving needs a reviewer identity different from the PR author (GitHub rejects approve/request-changes on your own PR via API or `gh`); how the user's other project does it needs checking.
