@@ -333,6 +333,17 @@ class MergePrWorkflow:
             out |= {"action": st["action"], "reason": st["reason"]}
             if st["action"] == "wait":
                 out |= {"action": "waited_too_long", "reason": f"gave up waiting: {st['reason']}"}
+            elif st["action"] == "conflict" and workflow.patched("resolve-conflicts"):
+                # step one of two: resolve and push; the new commit is reviewed and merged by a second click
+                res = await workflow.execute_activity(
+                    "resolve_conflicts",
+                    {"session": inp["session"], "repo": pr["repo"], "number": pr["number"], "sha": pr["sha"],
+                     "head_ref": st["head_ref"],
+                     "base_ref": st["base_ref"], "same_repo": st["same_repo"]},
+                    start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(maximum_attempts=2, non_retryable_error_types=["GithubError"]),
+                )
+                out |= res
             elif st["action"] == "update_branch":
                 res = await self._act("merge_update_branch", pr)
                 out |= {"status": "updated"} if res["ok"] else {"action": "refused", "reason": res["reason"]}

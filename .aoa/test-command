@@ -1,0 +1,1 @@
+python3 -m venv .aoa-venv && .aoa-venv/bin/pip install -q -e ".[dev]" && .aoa-venv/bin/python -m pytest -q -m "not temporal"

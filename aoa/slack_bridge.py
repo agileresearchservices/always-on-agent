@@ -116,6 +116,7 @@ def card_blocks(card_text: str, status: str | None = None, offer_id: str | None 
 
 
 MERGE_STATUS = {"merged": ":tada: Merged", "updated": ":arrows_counterclockwise: Branch updated; re-review coming",
+                "resolved": ":wrench: Conflicts resolved and pushed; re-review coming",
                 "failed": ":no_entry: Not merged (see below)"}
 
 
