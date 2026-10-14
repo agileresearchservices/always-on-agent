@@ -119,3 +119,17 @@ async def test_outbox_pump_starts_from_now_then_posts_new_items(tmp_path):
         await asyncio.wait_for(bridge.pump_outbox(), timeout=0.5)
     assert [p["text"] for p in web.posted] == ["new"]
     assert (tmp_path / "cursor.txt").read_text() == "3"
+
+
+async def test_duplicate_click_is_applied_once(tmp_path):
+    calls = []
+
+    def handler(req):
+        calls.append(req.url.path)
+        return httpx.Response(200 if len(calls) == 1 else 409, json={"status": "approved"})
+
+    bridge, web = make_bridge(tmp_path, handler)
+    payload = action() | {"message": {"ts": "9.9", "text": "Send?"}}
+    await asyncio.gather(bridge.handle_interactive(payload), bridge.handle_interactive(payload))
+    assert calls == ["/sessions/main/approvals/apr-1"]
+    assert not web.posted  # no "already decided" noise

@@ -108,6 +108,7 @@ def resolved_blocks(original_text: str, approved: bool) -> list[dict[str, Any]]:
 class Bridge:
     def __init__(self, cfg: BridgeConfig, web: Any, http: httpx.AsyncClient, cursor_path: Path):
         self.cfg, self.web, self.http, self.cursor_path = cfg, web, http, cursor_path
+        self._decided: set[str] = set()  # Slack can deliver one click twice; act on each approval once
 
     # ---- Slack -> agent --------------------------------------------------------------
     async def handle_event(self, event: dict[str, Any]) -> None:
@@ -137,6 +138,9 @@ class Bridge:
             log.warning("could not update approval message", exc_info=True)
 
     async def _decide(self, approval_id: str, approved: bool) -> None:
+        if approval_id in self._decided:
+            return
+        self._decided.add(approval_id)
         r = await self.http.post(
             f"/sessions/{self.cfg.session}/approvals/{approval_id}", json={"approve": approved}
         )
