@@ -364,10 +364,17 @@ def test_merge_still_starts_when_the_server_does_not_know_the_search_attributes(
 
     async def picky(workflow, arg, **kw):
         if "search_attributes" in kw:
-            raise RPCError("Namespace default has no mapping defined for search attribute Repo", RPCStatusCode.INVALID_ARGUMENT, b"")
+            raise RPCError("rejected", RPCStatusCode.INVALID_ARGUMENT, b"")
         return await real(workflow, arg, **kw)
 
     fake.start_workflow = picky
     store.kv_set("main", "merge-offer:mrg-0123456789ab", OFFER)
     assert client.post("/sessions/main/merges/mrg-0123456789ab", json={}).status_code == 202
     assert fake.started[0]["workflow"] == "MergePrWorkflow" and "search_attributes" not in fake.started[0]
+
+
+def test_merge_starts_even_if_the_stored_offer_lacks_a_field(api):
+    client, fake, store = api
+    store.kv_set("main", "merge-offer:mrg-0123456789ab", {k: v for k, v in OFFER.items() if k != "sha"})
+    assert client.post("/sessions/main/merges/mrg-0123456789ab", json={}).status_code == 202
+    assert "search_attributes" not in fake.started[0]

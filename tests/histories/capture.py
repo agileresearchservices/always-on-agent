@@ -120,7 +120,7 @@ async def session(client: Client) -> None:
 async def poll_and_review(client: Client) -> None:
     """GithubPollWorkflow starts a PrReviewWorkflow child (with search attributes), which runs the reviewer helper."""
     s = mk_env()
-    stubs = [stub("poll_github", {"announced": 1, "review": [PR]}), stub("publish_pr_review", {"posted": True, "verdict": "approve"})]
+    stubs = [stub("poll_github", {"announced": 1, "review": [PR], "search_attrs": True}), stub("publish_pr_review", {"posted": True, "verdict": "approve"})]
     w, _ = await worker_with(client, s, FakeLLM([text(VERDICT)]), stubs)
     async with w:
         wid = f"poll-{uuid.uuid4().hex[:6]}"

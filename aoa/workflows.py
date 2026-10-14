@@ -307,8 +307,10 @@ class GithubPollWorkflow:
             return res
         for pr in res["review"]:
             wid = f"pr-review-{inp['session']}-{pr['repo'].replace('/', '-')}-{pr['number']}-{pr['sha'][:12]}"
+            # only when the worker confirmed the server knows them: a child start that names an unknown attribute
+            # fails the workflow task (it cannot be caught here), which would stop every later poll
             attrs = ({"search_attributes": pr_attrs(pr["repo"], pr["number"], pr["sha"], inp["session"])}
-                     if workflow.patched("pr-search-attrs") else {})
+                     if res.get("search_attrs") and workflow.patched("pr-search-attrs") else {})
             try:
                 await workflow.start_child_workflow(
                     "PrReviewWorkflow", {"session": inp["session"], "cfg": inp["cfg"], "pr": pr}, id=wid,

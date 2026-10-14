@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
-from temporalio.service import RPCError
+from temporalio.service import RPCError, RPCStatusCode
 
 from .config import Settings
 from .delivery import deliver_event, signal_typing
@@ -167,11 +167,14 @@ async def merge(sid: str, offer_id: str, m: MergeRequest) -> dict[str, Any]:
             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,  # finished: a retry may run (it re-checks GitHub)
         )
         inp = {"session": sid, "offer_id": offer_id, "offer": offer, "card_ts": m.card_ts}
-        attrs = pr_attrs(offer["repo"], offer["number"], offer["sha"], sid)
         try:
-            await app.state.client.start_workflow("MergePrWorkflow", inp, search_attributes=attrs, **args)
+            attrs = pr_attrs(offer["repo"], offer["number"], offer["sha"], sid)
+        except (KeyError, TypeError, ValueError):  # an odd stored offer: the merge itself must still start
+            attrs = None
+        try:
+            await app.state.client.start_workflow("MergePrWorkflow", inp, **({"search_attributes": attrs} if attrs else {}), **args)
         except RPCError as e:  # the server does not know the attributes yet: a merge must not depend on them
-            if "search attribute" not in str(e).lower():
+            if attrs is None or e.status != RPCStatusCode.INVALID_ARGUMENT:
                 raise
             await app.state.client.start_workflow("MergePrWorkflow", inp, **args)
     except WorkflowAlreadyStartedError as e:

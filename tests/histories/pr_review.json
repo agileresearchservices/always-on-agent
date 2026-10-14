@@ -41,31 +41,31 @@
       "indexedFields": {
        "PrNumber": {
         "metadata": {
-         "type": "SW50",
-         "encoding": "anNvbi9wbGFpbg=="
+         "encoding": "anNvbi9wbGFpbg==",
+         "type": "SW50"
         },
         "data": "Nw=="
        },
        "Sha": {
         "metadata": {
-         "type": "S2V5d29yZA==",
-         "encoding": "anNvbi9wbGFpbg=="
+         "encoding": "anNvbi9wbGFpbg==",
+         "type": "S2V5d29yZA=="
         },
         "data": "ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEi"
        },
-       "Session": {
-        "metadata": {
-         "type": "S2V5d29yZA==",
-         "encoding": "anNvbi9wbGFpbg=="
-        },
-        "data": "Im1haW4i"
-       },
        "Repo": {
         "metadata": {
-         "type": "S2V5d29yZA==",
-         "encoding": "anNvbi9wbGFpbg=="
+         "encoding": "anNvbi9wbGFpbg==",
+         "type": "S2V5d29yZA=="
         },
         "data": "ImFnaWxlcmVzZWFyY2hzZXJ2aWNlcy9kZW1vIg=="
+       },
+       "Session": {
+        "metadata": {
+         "encoding": "anNvbi9wbGFpbg==",
+         "type": "S2V5d29yZA=="
+        },
+        "data": "Im1haW4i"
        }
       }
      },

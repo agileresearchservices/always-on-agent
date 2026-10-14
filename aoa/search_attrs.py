@@ -13,6 +13,12 @@ SHA = SearchAttributeKey.for_keyword("Sha")
 SESSION = SearchAttributeKey.for_keyword("Session")
 
 log = logging.getLogger(__name__)
+_registered = False
+
+
+def registered() -> bool:
+    """True once this process has confirmed the server knows the attributes (workflows only use them then)."""
+    return _registered
 
 
 def pr_attrs(repo: str, number: int, sha: str, session: str) -> TypedSearchAttributes:
@@ -27,8 +33,9 @@ async def ensure_registered(client: Any) -> bool:
     False (and logs) when the server refuses, so callers can carry on without attributes."""
     from temporalio.api.enums.v1 import IndexedValueType
     from temporalio.api.operatorservice.v1 import AddSearchAttributesRequest, ListSearchAttributesRequest
-    from temporalio.service import RPCError
+    from temporalio.service import RPCError, RPCStatusCode
 
+    global _registered
     want = {k.name: k.indexed_value_type for k in (REPO, PR_NUMBER, SHA, SESSION)}
     ops = client.operator_service
     try:
@@ -39,7 +46,13 @@ async def ensure_registered(client: Any) -> bool:
                 namespace=client.namespace,
                 search_attributes={n: IndexedValueType.Value(f"INDEXED_VALUE_TYPE_{t.name}") for n, t in missing.items()},
             ))
-        return True
+        _registered = True
     except RPCError as e:
-        log.warning("could not register search attributes (%s); PR workflows start without them", e.status)
-        return False
+        # the worker and the server both register at start: the loser of that race sees AlreadyExists
+        _registered = e.status == RPCStatusCode.ALREADY_EXISTS
+        if not _registered:
+            log.warning("could not register search attributes (%s); PR workflows start without them", e.status)
+    except Exception as e:  # noqa: BLE001 - never block startup over a visibility nicety
+        _registered = False
+        log.warning("could not register search attributes (%s); PR workflows start without them", type(e).__name__)
+    return _registered

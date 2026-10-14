@@ -50,3 +50,10 @@ async def test_replay_catches_a_nondeterministic_change():
     with pytest.raises(Exception, match="(?i)determinis"):
         await Replayer(workflows=[_ChangedMergeWorkflow]).replay_workflow(
             WorkflowHistory.from_json(d["workflow_id"], d["history"]))
+
+
+@pytest.mark.parametrize("path", HISTORIES, ids=lambda p: p.stem)
+def test_histories_hold_no_secrets_or_local_paths(path: Path):
+    body = path.read_text()
+    for needle in ("/Users/", "/private/", "/var/folders", "sk-ant", "ghp_", "github_pat", "xoxb-", "xoxp-", "PRIVATE KEY"):
+        assert needle not in body, f"{path.name} contains {needle!r}"
