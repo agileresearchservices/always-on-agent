@@ -30,6 +30,7 @@ LLM_RETRY = RetryPolicy(
 )
 STATE_RETRY = RetryPolicy(maximum_attempts=5, initial_interval=timedelta(seconds=1))
 NO_RETRY = RetryPolicy(maximum_attempts=1)
+CUT_OFF = "[helper output was cut off at the token limit]"
 
 
 class WorkflowOps:
@@ -229,6 +230,8 @@ class HelperWorkflow:
         text = res.text or "(helper finished without a result)"
         if res.stop == "max_steps":
             text = "[helper hit its step limit; this is a partial result]\n" + text
+        elif res.stop == "max_tokens":
+            text = CUT_OFF + "\n" + text
         return text[:6000]
 
 
@@ -289,6 +292,8 @@ class PrReviewWorkflow:
             )
         except ChildWorkflowError as e:
             note = f"Reviewer failed: {type(e.cause).__name__ if e.cause else 'error'}."
+        if text.startswith(CUT_OFF):
+            note = "The reviewer's answer was cut off at the output token limit (AOA_MAX_TOKENS)."
         return await workflow.execute_activity(
             "publish_pr_review", {"session": session, "pr": pr, "review_text": text, "note": note},
             start_to_close_timeout=timedelta(seconds=60), retry_policy=STATE_RETRY,

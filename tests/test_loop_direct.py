@@ -200,3 +200,14 @@ async def test_external_send_needs_approval_then_sends(make_core):
     import pytest
     with pytest.raises(ToolError):
         await REGISTRY["external_send"].handler(ctx, {**args, "text": "different"})
+
+
+async def test_cut_off_final_answer_is_reported_as_max_tokens(make_core):
+    from aoa.direct import DirectOps
+    from aoa.loop import run_agent_loop
+
+    core, _ = make_core([{"content": [{"type": "text", "text": '{"verdict": "appr'}], "stop_reason": "max_tokens"}])
+    await core.prepare_helper("h1", "review it")
+    res = await run_agent_loop(DirectOps(core, "s"), conv="h1", role="helper", depth=1, turn_key="h",
+                               max_steps=3, max_helper_depth=1, trigger_user=False)
+    assert res.stop == "max_tokens" and res.text.startswith('{"verdict"')
