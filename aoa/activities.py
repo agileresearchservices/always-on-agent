@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import secrets
+import tempfile
+import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -15,7 +18,8 @@ from .delivery import deliver_event
 from .events import Event
 from . import github_monitor as gh
 from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
-from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RETRYABLE, check_summary, decide, report_text
+from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RESOLVED_KEY, RETRYABLE, check_summary, decide, report_text
+from .pr_resolve import Resolver, with_heartbeat
 from .pr_review import github_body, parse_verdict, slack_text
 
 
@@ -78,7 +82,12 @@ class AgentActivities:
             prs = await poll_once(http, self.core.store, a["session"], a["user"], token_provider())
         if prs:
             self.core.store.outbox_push(a["session"], "update", {"text": notice_text(prs)}, client_key=notice_key(prs))
-        return {"announced": len(prs), "review": reviews_to_start(self.core.store, a["session"], prs, a["user"])}
+        review = reviews_to_start(self.core.store, a["session"], prs, a["user"])
+        for pr in review:  # a commit aoa wrote to resolve conflicts: point the reviewer at those files
+            files = self.core.store.kv_get(a["session"], f"{RESOLVED_KEY}{pr['repo']}#{pr['number']}@{pr['sha']}")
+            if files is not None:
+                pr["resolved_files"] = files
+        return {"announced": len(prs), "review": review}
 
     @activity.defn(name="publish_pr_review")
     async def publish_pr_review(self, a: dict[str, Any]) -> dict[str, Any]:
@@ -147,6 +156,7 @@ class AgentActivities:
             "action": action, "reason": reason, "title": pr.get("title", ""),
             "head_ref": head.get("ref", ""),
             "protected_refs": [r for r in (base.get("ref"), (base.get("repo") or {}).get("default_branch")) if r],
+            "base_ref": base.get("ref", ""),
             "same_repo": ((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower(),
             "default_base": base.get("ref") == (base.get("repo") or {}).get("default_branch"),
             "merge_sha": pr.get("merge_commit_sha") if pr.get("merged") else None,
@@ -239,6 +249,29 @@ class AgentActivities:
                 out.append({**i, "state": "UNKNOWN"})
         return out
 
+    @activity.defn(name="resolve_conflicts")
+    async def resolve_conflicts(self, a: dict[str, Any]) -> dict[str, Any]:
+        """Merge the base into the reviewed commit in a throwaway clone, let a model resolve the conflicted
+        files, run the repo's tests and push (no force). Long-running: heartbeats while it works."""
+        repo = gh.check_repo_in_scope(a["repo"])
+        if not a["same_repo"] or a["head_ref"] in a.get("protected_refs", []):
+            return {"status": "failed", "action": "needs_human",
+                    "reason": "the PR comes from a fork or its head is a base/default branch; resolve the conflicts by hand"}
+        # outside the data dir: the tests are repo code, and nothing should sit next to .env or the store
+        workdir = Path(tempfile.gettempdir()) / "aoa-resolve" / uuid.uuid4().hex[:12]
+        mark = lambda sha, files: self.core.store.kv_set(  # noqa: E731
+            a["session"], f"{RESOLVED_KEY}{repo}#{a['number']}@{sha}", files)
+        r = Resolver(repo=repo, sha=a["sha"], head_ref=a["head_ref"], base_ref=a["base_ref"], workdir=workdir,
+                     remote_url=a.get("remote_url") or f"https://github.com/{repo}.git", token=token_provider(),
+                     llm=self.core.llm, model=self.s.helper_model, max_tokens=self.s.max_tokens,
+                     protected_refs=tuple(a.get("protected_refs", [])),
+                     on_usage=lambda m, u: self.core.store.usage_add(f"resolve/{repo}#{a['number']}", m, u),
+                     on_commit=mark)
+        out = await with_heartbeat(r.run(), activity.heartbeat)
+        if out["status"] == "resolved":
+            mark(out["new_sha"], out["files"])  # also on a retry that found its earlier push
+        return out
+
     @activity.defn(name="merge_report")
     async def merge_report(self, a: dict[str, Any]) -> None:
         """Final notice, plus what the bridge needs to update the original card."""
@@ -257,5 +290,5 @@ class AgentActivities:
             self.maybe_compact, self.sandbox_sleep, self.warm_cache, self.report_failure,
             self.deliver_routine_event, self.poll_github, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
-            self.merge_issue_states, self.merge_report,
+            self.merge_issue_states, self.merge_report, self.resolve_conflicts,
         ]

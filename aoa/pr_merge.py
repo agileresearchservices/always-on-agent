@@ -13,10 +13,11 @@ from .github_monitor import slack_safe
 OFFER_KEY = "merge-offer:"  # kv: merge-offer:<id> -> the offer
 OFFER_FOR_KEY = "merge-offer-for:"  # kv: merge-offer-for:<repo>#<n>@<sha> -> <id>, so a retried publish reuses it
 OFFER_ID_RE = r"mrg-[0-9a-f]{12}"
+RESOLVED_KEY = "aoa-resolved:"  # kv: aoa-resolved:<repo>#<n>@<sha> -> files aoa resolved in that commit
 
 FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
 # outcomes after which clicking Merge again on the same card can succeed (same commit, state may change)
-RETRYABLE = {"checks_failed", "waited_too_long", "blocked", "draft", "error", "refused"}
+RETRYABLE = {"checks_failed", "waited_too_long", "blocked", "draft", "error", "refused", "resolve_failed"}  # not needs_human / stale
 
 
 def check_summary(status: dict[str, Any], check_runs: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -61,7 +62,7 @@ def decide(pr: dict[str, Any], sha: str, failing: list[str], pending: list[str])
     if pr.get("mergeable") is None or state == "unknown":
         return "wait", "GitHub is still computing mergeability"
     if state == "dirty" or pr.get("mergeable") is False:
-        return "conflict", "the branch has merge conflicts with the base; resolve them, then the new commit is re-reviewed"
+        return "conflict", "the branch has merge conflicts with the base"
     if state == "behind":
         return "update_branch", "the branch is behind the base"
     if state == "blocked":
@@ -95,6 +96,18 @@ def report_text(offer: dict[str, Any], out: dict[str, Any]) -> str:
                              f":warning: Issue {ref} is still {str(i.get('state', 'unknown')).lower()}.")
         if out.get("note"):
             lines.append(f"_{slack_safe(out['note'])}_")
+        return "\n".join(lines)
+    if status == "resolved":
+        if out.get("already"):
+            return (f":wrench: {head}: the conflict resolution was already pushed (`{out['new_sha'][:7]}`). "
+                    "Merge it from the new card after its review.")
+        files = ", ".join(f"`{slack_safe(f)}`" for f in out.get("files", [])[:10]) or "none"
+        lines = [f":wrench: *Resolved merge conflicts* in {head} and pushed `{out['new_sha'][:7]}` (not merged).",
+                 f"Files: {files}"]
+        for f, s in list((out.get("summaries") or {}).items())[:10]:
+            lines.append(f"• `{slack_safe(f)}`: {slack_safe(s)}")
+        lines.append(f"Tests: {slack_safe(out.get('tests', 'unknown'))}")
+        lines.append("The new commit will be reviewed again; merge it from the new card.")
         return "\n".join(lines)
     if status == "updated":
         return (f":arrows_counterclockwise: {head} was behind its base, so I updated the branch. The new commit "

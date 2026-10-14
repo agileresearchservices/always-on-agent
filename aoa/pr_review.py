@@ -17,7 +17,13 @@ MAX_FINDINGS = 15
 
 
 def build_task(pr: dict[str, Any]) -> str:
-    return f"""Review pull request #{pr['number']} in {pr['repo']} (head commit {pr['sha'][:12]}).
+    resolved = ""
+    if pr.get("resolved_files") is not None:
+        files = ", ".join(pr["resolved_files"]) or "none"
+        resolved = (f"\n\nNote: the head commit is an automated merge of the base branch whose conflicts were "
+                    f"resolved by a model (files: {files}). Check those resolutions closely: nothing from either "
+                    "side dropped, nothing invented.")
+    return f"""Review pull request #{pr['number']} in {pr['repo']} (head commit {pr['sha'][:12]}).{resolved}
 
 1. Read it: call_deferred with name "github_read" and arguments {{"what": "pr", "repo": "{pr['repo']}", "number": {pr['number']}, "max_chars": 60000}}. If the result was spilled to a file, read that file.
 2. Review the change for correctness bugs, security problems, missing or broken tests, and anything that would break existing behaviour. Ignore style nits unless they hide a bug.
