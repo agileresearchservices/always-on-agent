@@ -202,3 +202,13 @@ async def test_never_pushes_onto_a_protected_head_and_rejects_gutted_resolutions
     out = await resolver(tmp_path, remote, FakeLLM([resolution("x\n")])).run()
     assert out["status"] == "failed" and "much shorter" in out["reason"]
     assert git(origin, "rev-parse", "feat") == sha
+
+
+async def test_tool_choice_is_not_forced_and_4xx_is_not_retried(tmp_path, remote):
+    class Refused(Exception):
+        status_code = 400
+
+    llm = FakeLLM([Refused("tool_choice not supported")])
+    out = await resolver(tmp_path, remote, llm).run()
+    assert out["status"] == "failed" and "refused the request (400)" in out["reason"]
+    assert len(llm.calls) == 1 and llm.calls[0]["tool_choice"] is None  # forced tool use is rejected live
