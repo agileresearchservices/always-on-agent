@@ -51,6 +51,7 @@ def test_rendering():
     text, blocks = render_outbox_item({"kind": "approval", "payload": {"text": "Send?", "approval_id": "apr-1"}})
     assert [b["value"] for b in blocks[1]["elements"]] == ["apr-1", "apr-1"]
     assert render_outbox_item({"kind": "urgent", "payload": {"text": "x"}})[0].startswith(":rotating_light:")
+    assert render_outbox_item({"kind": "alert", "payload": {"text": "x"}})[0].startswith(":warning: *ALERT*")
 
 
 class FakeWeb:

@@ -6,6 +6,8 @@ clients render whatever kind they receive. This module decides *whether* it goes
 Rules:
 * replying to a live user turn always goes out
 * question, approval, urgent and reaction always go out
+* "alert" (worth knowing soon, not an emergency: a refused injection, a failing background task) skips
+  the spacing between updates but still waits out quiet hours
 * everything else ("update") is held for a digest when it comes too soon after the last one,
   or during quiet hours. Held items ride along with the next update that is allowed through.
 """
@@ -18,7 +20,7 @@ from zoneinfo import ZoneInfo
 from .config import Settings
 from .store import Store
 
-KINDS = {"reply", "update", "question", "approval", "urgent", "reaction"}
+KINDS = {"reply", "update", "alert", "question", "approval", "urgent", "reaction"}
 ALWAYS = {"reply", "question", "approval", "urgent", "reaction"}
 
 
@@ -46,7 +48,7 @@ class Notifier:
             last = self.store.kv_get(session, "last_notified_ts", 0.0)
             too_soon = (now.timestamp() - last) < self.s.min_update_interval_seconds
             quiet = in_quiet_hours(now.astimezone(ZoneInfo(self.s.tz)), self.s.quiet_start_hour, self.s.quiet_end_hour)
-            if too_soon or quiet:
+            if quiet or (too_soon and kind != "alert"):
                 held = self.store.kv_get(session, "digest", [])
                 held.append(text)
                 self.store.kv_set(session, "digest", held[-20:])
@@ -55,7 +57,7 @@ class Notifier:
 
         held = self.store.kv_get(session, "digest", [])
         body = text
-        if held and kind in ("update", "reply"):
+        if held and kind in ("update", "reply", "alert"):
             body = text + "\n\nEarlier updates:\n" + "\n".join(f"- {h}" for h in held)
             self.store.kv_set(session, "digest", [])
         seq = self.store.outbox_push(session, kind, {"text": body}, client_key=client_key)

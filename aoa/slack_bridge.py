@@ -27,6 +27,7 @@ PREFIX = {
     "reply": "",
     "update": "_update_ ",
     "question": ":question: ",
+    "alert": ":warning: *ALERT* ",
     "urgent": ":rotating_light: *URGENT* ",
     "approval": ":lock: ",
     "system": "_system_ ",

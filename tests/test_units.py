@@ -225,3 +225,17 @@ async def test_cache_miss_fingerprint_survives_a_restart(make_core):
     assert stored and stored[0] and len(stored[1]) >= 1
     core._fp.clear()  # simulate a new worker process
     assert core._stored_fp("s", "s") == stored
+
+
+def test_alert_skips_spacing_but_not_quiet_hours(tmp_path, settings):
+    store = Store(settings.db_path)
+    n = Notifier(store, settings)
+    noon = datetime(2026, 10, 14, 12, 0, tzinfo=ET)
+    assert n.send("s", "update", "one", noon)["status"] == "sent"
+    assert n.send("s", "update", "two", noon + timedelta(minutes=5))["status"] == "held"
+    assert n.send("s", "alert", "refused an injected instruction", noon + timedelta(minutes=6))["status"] == "sent"
+    body = store.outbox_since("s")[-1]["payload"]["text"]
+    assert "refused an injected" in body and "two" in body  # the held update rides along
+    night = datetime(2026, 10, 14, 23, 30, tzinfo=ET)
+    assert n.send("s", "alert", "at night", night)["status"] == "held"  # never wakes the person
+    assert n.send("s", "urgent", "fire", night)["status"] == "sent"

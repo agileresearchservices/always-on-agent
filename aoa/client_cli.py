@@ -19,6 +19,7 @@ RENDER = {
     "reply": "\033[1magent\033[0m",
     "update": "\033[2magent (update)\033[0m",
     "question": "\033[33magent asks\033[0m",
+    "alert": "\033[33;1mALERT\033[0m",
     "urgent": "\033[31;1mURGENT\033[0m",
     "reaction": "\033[2magent reacts\033[0m",
     "approval": "\033[35mapproval needed\033[0m",

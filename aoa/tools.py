@@ -299,7 +299,7 @@ def _tools() -> list[ToolSpec]:
             "Send the person a message. This is the ONLY way they see anything. Skip it when there is nothing worth saying.",
             _obj({
                 "text": {"type": "string"},
-                "kind": {"type": "string", "enum": ["reply", "update", "question", "urgent", "reaction"]},
+                "kind": {"type": "string", "enum": ["reply", "update", "alert", "question", "urgent", "reaction"]},
                 "client_key": {"type": "string", "description": "optional idempotency key"},
             }, ["text"]),
             h_send_user, helper_ok=False,
