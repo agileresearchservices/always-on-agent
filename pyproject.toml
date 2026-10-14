@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+slack = ["slack_sdk", "aiohttp"]
 
 [tool.setuptools]
 packages = ["aoa"]

@@ -37,6 +37,12 @@ The API server refuses to start unless `AOA_API_TOKEN` and `AOA_WEBHOOK_SECRET` 
 `AOA_ALLOW_INSECURE=1` to bypass that for local development only. For a real deployment you also need a
 production Temporal (not `start-dev`) and a persistent, absolute `AOA_DATA_DIR`.
 
+## Slack client
+
+`python -m aoa.slack_bridge` (needs `pip install -e '.[slack]'`) connects a private Slack channel to a
+session: your messages go in as trusted user messages, replies and approval requests (with buttons) come
+back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.md`.
+
 ## How the lecture maps to the code
 
 | Lecture idea | Where |
