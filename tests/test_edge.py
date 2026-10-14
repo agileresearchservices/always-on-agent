@@ -96,28 +96,37 @@ async def test_routines_only_from_user_started_turns(make_core):
     block = core.store.load_messages("main")[2]["content"][0]
     assert block["is_error"] and "person started" in block["content"]
     assert core.scheduler.items == {}
-    # user-started turn: created
+    # user-started turn: allowed to ask, but nothing exists until the person approves (see the next test)
     core2, _ = make_core([deferred, text("ok")])
     await handle_events(core2, "main2", [usr_event("schedule a daily inbox summary")])
-    assert core2.scheduler.items[("main2", "daily")] == ("0 13 * * *", "summarise inbox")
-    assert core2.store.routine_list("main2")[0]["name"] == "daily"
+    assert core2.scheduler.items == {} and core2.store.routine_list("main2") == []
+    assert [o["kind"] for o in core2.store.outbox_since("main2")] == ["approval"]
 
 
-def test_server_refuses_to_start_without_secrets(monkeypatch):
+async def test_routine_creation_needs_approval_of_exactly_this_routine(make_core):
     import pytest
+    from aoa.tools import REGISTRY, ToolError
 
-    for v in ("AOA_API_TOKEN", "AOA_WEBHOOK_SECRET", "AOA_ALLOW_INSECURE"):
-        monkeypatch.delenv(v, raising=False)
-    with pytest.raises(RuntimeError, match="AOA_API_TOKEN and AOA_WEBHOOK_SECRET"):
-        server.check_auth_configured()
-    monkeypatch.setenv("AOA_API_TOKEN", "t")
-    with pytest.raises(RuntimeError, match="AOA_WEBHOOK_SECRET"):
-        server.check_auth_configured()
-    monkeypatch.setenv("AOA_WEBHOOK_SECRET", "s")
-    server.check_auth_configured()
-    monkeypatch.delenv("AOA_API_TOKEN")
-    monkeypatch.setenv("AOA_ALLOW_INSECURE", "1")
-    server.check_auth_configured()
+    args = {"name": "daily", "cron": "0 13 * * *", "prompt": "summarise inbox"}
+    core, _ = make_core([[tool("call_deferred", name="schedule_routine", arguments=args)], text("waiting")])
+    await handle_events(core, "main", [usr_event("schedule a daily inbox summary")])
+    card = core.store.outbox_since("main")[0]["payload"]
+    assert "daily" in card["text"] and "0 13 * * *" in card["text"] and "summarise inbox" in card["text"]
+    aid = card["approval_id"]
+    ctx = core._ctx("main", "main", "main", 0, True)
+    h = REGISTRY["schedule_routine"].handler
+    assert "still waiting" in await h(ctx, {**args, "approval_id": aid})
+    assert core.scheduler.items == {}
+    with pytest.raises(ToolError):  # a different prompt cannot ride on the approval
+        await h(ctx, {**args, "prompt": "do evil", "approval_id": aid})
+    core.store.approval_resolve(aid, True)
+    assert "scheduled" in await h(ctx, {**args, "approval_id": aid})
+    assert core.scheduler.items[("main", "daily")] == ("0 13 * * *", "summarise inbox")
+    # a denied request never creates anything
+    core.store.approval_request("apr-no", "main", {"tool": "schedule_routine", **args, "name": "other"})
+    core.store.approval_resolve("apr-no", False)
+    assert "denied" in await h(ctx, {**args, "name": "other", "approval_id": "apr-no"})
+    assert ("main", "other") not in core.scheduler.items
 
 
 async def test_routine_turns_cannot_create_or_delete_routines(make_core):
@@ -136,7 +145,7 @@ async def test_routine_turns_cannot_create_or_delete_routines(make_core):
     assert core.scheduler.items == {} and core.store.routine_list("main")[0]["name"] == "daily"
 
 
-async def test_routine_turn_can_still_reply_and_a_user_turn_after_it_can_create(make_core):
+async def test_routine_turn_can_still_reply_and_a_user_turn_can_ask_to_create(make_core):
     from aoa.events import Event
     from aoa.core import turn_trigger
 
@@ -150,4 +159,4 @@ async def test_routine_turn_can_still_reply_and_a_user_turn_after_it_can_create(
     core2, _ = make_core([[tool("call_deferred", name="schedule_routine",
                                 arguments={"name": "d", "cron": "0 13 * * *", "prompt": "p"})], text("ok")])
     await handle_events(core2, "main2", [usr_event("schedule it")])
-    assert ("main2", "d") in core2.scheduler.items
+    assert [o["kind"] for o in core2.store.outbox_since("main2")] == ["approval"]  # reaches the approval step

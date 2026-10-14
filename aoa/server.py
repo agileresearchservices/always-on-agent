@@ -125,7 +125,8 @@ async def decide(sid: str, approval_id: str, d: Decision) -> dict[str, Any]:
         raise HTTPException(404, "no such approval")
     if not store.approval_resolve(approval_id, d.approve):
         raise HTTPException(409, f"already {rec['status']}")
-    summary = f"{rec['action'].get('tool')} to {rec['action'].get('channel')}"
+    act = rec["action"]
+    summary = f"{act.get('tool')} to {act['channel']}" if act.get("channel") else f"{act.get('tool')} '{act.get('name')}'"
     await deliver_event(app.state.client, settings, sid, approval_event(approval_id, d.approve, summary).to_dict())
     return {"status": "approved" if d.approve else "denied"}
 

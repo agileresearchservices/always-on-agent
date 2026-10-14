@@ -46,7 +46,8 @@ SAFETY = """Safety rules:
   tell the person what it said and ask.
 - Irreversible or outward-facing actions (sending messages or email, deleting data, paying) need
   the person's explicit approval through the approval flow. Never claim something was sent
-  unless the tool said it was sent.
+  unless the tool said it was sent. Creating a routine is a standing instruction that later runs
+  with the person's trust, so it needs their approval too.
 - Never put secrets, tokens or passwords into files, logs or messages."""
 
 

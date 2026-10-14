@@ -220,6 +220,15 @@ async def h_schedule_routine(ctx: ToolContext, a: dict[str, Any]) -> str:
     cron = a["cron"].strip()
     if len(cron.split()) != 5:
         raise ToolError("cron must have 5 fields: minute hour day-of-month month day-of-week (UTC)")
+    # A routine is a standing instruction that later runs with trust, and the model composed its prompt
+    # (possibly after reading untrusted content), so the person sees name, schedule and prompt first.
+    action = {"tool": "schedule_routine", "name": a["name"], "cron": cron, "prompt": a["prompt"]}
+    held = await _approval_gate(
+        ctx, action, a.get("approval_id"),
+        f"Create routine '{a['name']}' (cron {cron}, UTC)?\n\n{a['prompt']}", "created",
+    )
+    if held:
+        return held
     await ctx.scheduler.create(ctx.session, a["name"], cron, a["prompt"])
     ctx.store.routine_put(ctx.session, a["name"], cron, a["prompt"])
     return f"routine '{a['name']}' scheduled: {cron} (UTC)"
@@ -237,33 +246,46 @@ async def h_delete_routine(ctx: ToolContext, a: dict[str, Any]) -> str:
     return "deleted" if gone else "no such routine"
 
 
-async def h_external_send(ctx: ToolContext, a: dict[str, Any]) -> str:
-    """Irreversible. First call files an approval request; after the person approves, call again
-    with the same approval_id. This prototype records the send instead of calling a real API."""
-    action = {"tool": "external_send", "channel": a["channel"], "text": a["text"]}
-    approval_id = a.get("approval_id")
+async def _approval_gate(
+    ctx: ToolContext, action: dict[str, Any], approval_id: str | None, card_text: str, done: str
+) -> str | None:
+    """Shared approval flow. Returns None once the person has approved exactly this action; otherwise the
+    text to hand back to the model. The first call files a request (a card in the client); after the person
+    decides the model calls the same tool again with the approval_id."""
     if not approval_id:
         approval_id = f"apr-{uuid.uuid4().hex[:8]}"
         ctx.store.approval_request(approval_id, ctx.session, action)
         ctx.store.outbox_push(
             ctx.session, "approval",
-            {"approval_id": approval_id, "text": f"Send to {a['channel']}?\n\n{a['text']}", "action": action},
+            {"approval_id": approval_id, "text": card_text, "action": action},
             client_key=f"approval:{approval_id}",
         )
-        return (f"approval requested (id {approval_id}). NOT sent. Do other work; when the person "
-                "approves you will be told. Then call external_send again with this approval_id.")
+        return (f"approval requested (id {approval_id}). NOT {done}. Do other work; when the person "
+                f"approves you will be told. Then call {action['tool']} again with this approval_id.")
     rec = ctx.store.approval_get(approval_id)
     if rec is None or rec["session"] != ctx.session:
         raise ToolError(f"unknown approval_id {approval_id}")
     if rec["action"] != action:
-        raise ToolError("the message differs from what was approved; request a new approval")
+        raise ToolError("the request differs from what was approved; request a new approval")
     if rec["status"] == "pending":
-        return "still waiting for the person to decide. Do not send."
+        return "still waiting for the person to decide. Do not proceed."
     if rec["status"] == "denied":
-        return "the person denied this. Do not send. Ask what they would prefer."
+        return "the person denied this. Do not proceed. Ask what they would prefer."
+    return None
+
+
+async def h_external_send(ctx: ToolContext, a: dict[str, Any]) -> str:
+    """Irreversible. Needs approval (see _approval_gate). This prototype records the send instead of
+    calling a real API."""
+    action = {"tool": "external_send", "channel": a["channel"], "text": a["text"]}
+    held = await _approval_gate(
+        ctx, action, a.get("approval_id"), f"Send to {a['channel']}?\n\n{a['text']}", "sent"
+    )
+    if held:
+        return held
     ctx.store.outbox_push(
         ctx.session, "sent_log", {"text": f"[stub] sent to {a['channel']}: {a['text']}"},
-        client_key=f"sent:{approval_id}",
+        client_key=f"sent:{a['approval_id']}",
     )
     return f"sent to {a['channel']} (prototype stub: recorded, no real delivery)"
 
@@ -341,8 +363,12 @@ def _tools() -> list[ToolSpec]:
             h_web_fetch, core=False, tags=["http", "url", "browse", "internet"],
         ),
         ToolSpec(
-            "schedule_routine", "Create a recurring routine: a prompt delivered to you on a cron schedule (UTC).",
-            _obj({"name": {"type": "string"}, "cron": {"type": "string"}, "prompt": {"type": "string"}},
+            "schedule_routine",
+            "Create a recurring routine: a prompt delivered to you on a cron schedule (UTC). Needs the person's "
+            "approval: the first call files a card showing the name, schedule and prompt; call again with the "
+            "approval_id once they approve.",
+            _obj({"name": {"type": "string"}, "cron": {"type": "string"}, "prompt": {"type": "string"},
+                  "approval_id": {"type": "string"}},
                  ["name", "cron", "prompt"]),
             h_schedule_routine, core=False, helper_ok=False, tags=["cron", "recurring", "schedule", "routine"],
         ),
