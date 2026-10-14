@@ -30,6 +30,7 @@ LLM_RETRY = RetryPolicy(
 )
 STATE_RETRY = RetryPolicy(maximum_attempts=5, initial_interval=timedelta(seconds=1))
 NO_RETRY = RetryPolicy(maximum_attempts=1)
+CUT_OFF = "[helper output was cut off at the token limit]"
 
 
 class WorkflowOps:
@@ -229,6 +230,8 @@ class HelperWorkflow:
         text = res.text or "(helper finished without a result)"
         if res.stop == "max_steps":
             text = "[helper hit its step limit; this is a partial result]\n" + text
+        elif res.stop == "max_tokens":
+            text = CUT_OFF + "\n" + text
         return text[:6000]
 
 
@@ -289,7 +292,84 @@ class PrReviewWorkflow:
             )
         except ChildWorkflowError as e:
             note = f"Reviewer failed: {type(e.cause).__name__ if e.cause else 'error'}."
+        if text.startswith(CUT_OFF):
+            note = "The reviewer's answer was cut off at the output token limit (AOA_MAX_TOKENS)."
         return await workflow.execute_activity(
             "publish_pr_review", {"session": session, "pr": pr, "review_text": text, "note": note},
             start_to_close_timeout=timedelta(seconds=60), retry_policy=STATE_RETRY,
         )
+
+
+# GitHub calls: retried for 5xx/network; scope violations, 401/403/404 (GithubError) will not get better
+GH_RETRY = RetryPolicy(maximum_attempts=5, initial_interval=timedelta(seconds=2), maximum_interval=timedelta(seconds=30),
+                       non_retryable_error_types=["GithubError"])
+
+
+@workflow.defn(name="MergePrWorkflow")
+class MergePrWorkflow:
+    """Started by the server when the person clicks [Merge] on an approved review card; never by the model.
+
+    Inspect (waiting for running checks / mergeability), then squash-merge pinned to the reviewed commit,
+    delete the branch, confirm the linked issues closed, and report. A branch that is merely behind its base
+    is updated instead; the new commit is re-reviewed and gets its own Merge button. Conflicts are stage 3."""
+
+    async def _act(self, name: str, arg: Any) -> Any:
+        return await workflow.execute_activity(
+            name, arg, start_to_close_timeout=timedelta(seconds=60), retry_policy=GH_RETRY,
+        )
+
+    @workflow.run
+    async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
+        offer = inp["offer"]
+        pr = {"repo": offer["repo"], "number": offer["number"], "sha": offer["sha"]}
+        out: dict[str, Any] = {"status": "failed"}
+        try:
+            deadline = workflow.time() + inp.get("wait_seconds", 600)
+            while True:
+                st = await self._act("merge_inspect", pr)
+                if st["action"] != "wait" or workflow.time() >= deadline:
+                    break
+                await workflow.sleep(inp.get("poll_seconds", 20))
+            out |= {"action": st["action"], "reason": st["reason"]}
+            if st["action"] == "wait":
+                out |= {"action": "waited_too_long", "reason": f"gave up waiting: {st['reason']}"}
+            elif st["action"] == "update_branch":
+                res = await self._act("merge_update_branch", pr)
+                out |= {"status": "updated"} if res["ok"] else {"action": "refused", "reason": res["reason"]}
+            elif st["action"] in ("merge", "already_merged"):
+                res = (await self._act("merge_pr", pr | {"title": st["title"]}) if st["action"] == "merge"
+                       else {"merged": True, "merge_sha": st["merge_sha"] or ""})
+                if not res["merged"]:
+                    out |= {"action": "refused", "reason": res["reason"]}
+                else:
+                    out |= {"status": "merged", "merge_sha": res["merge_sha"]}
+                    try:  # the merge is done; a close-out failure must not hide that
+                        out["branch"] = await self._act("merge_delete_branch", {
+                            "repo": pr["repo"], "ref": st["head_ref"], "same_repo": st["same_repo"],
+                            "protected_refs": st.get("protected_refs", [])})
+                        out |= await self._closeout_issues(st, inp.get("issue_poll_seconds", 5))
+                    except ActivityError as e:
+                        out["note"] = (f"Close-out failed ({type(e.cause).__name__ if e.cause else 'error'}): "
+                                       "check the branch and linked issues by hand.")
+        except ActivityError as e:
+            out |= {"action": "error", "reason": f"a GitHub step failed ({type(e.cause).__name__ if e.cause else 'error'})"}
+        await workflow.execute_activity(
+            "merge_report",
+            {"session": inp["session"], "offer_id": inp["offer_id"], "offer": offer, "card_ts": inp.get("card_ts"),
+             "outcome": out, "run_id": workflow.info().run_id},
+            start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
+        )
+        return out
+
+    async def _closeout_issues(self, st: dict[str, Any], every: float) -> dict[str, Any]:
+        """GitHub closes `Closes #N` issues asynchronously after the merge: look a few times."""
+        issues = st["issues"]
+        if issues is None:
+            return {"note": "Could not read the PR's linked issues."}
+        note = "" if st["default_base"] else "The base is not the default branch, so closing keywords do not fire."
+        for attempt in range(4):
+            if not issues or all(i["state"] == "CLOSED" for i in issues):
+                break
+            await workflow.sleep(every * (attempt + 1))
+            issues = await self._act("merge_issue_states", issues)
+        return {"issues": issues, "note": note}

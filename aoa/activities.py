@@ -1,7 +1,9 @@
 """Temporal activities: thin wrappers over AgentCore, one per durable step."""
 from __future__ import annotations
 
+import secrets
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from temporalio import activity
@@ -13,6 +15,7 @@ from .delivery import deliver_event
 from .events import Event
 from . import github_monitor as gh
 from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
+from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RETRYABLE, check_summary, decide, report_text
 from .pr_review import github_body, parse_verdict, slack_text
 
 
@@ -101,17 +104,158 @@ class AgentActivities:
                         raise  # transient: let Temporal retry the activity
                     note = f"GitHub post failed: {e.response.status_code} {e.response.text[:150]}"
                 # other httpx errors (network) propagate and are retried too
+        card = slack_text(v, pr, posted, note)
+        payload = {"text": card, "repo": pr["repo"], "number": pr["number"], "sha": pr["sha"],
+                   "url": pr["url"], "verdict": v["verdict"] if v else None}
+        if v is not None and v["verdict"] == "approve":
+            payload["merge_offer"] = self._merge_offer(session, pr, card)
         self.core.store.outbox_push(
-            session, "pr_review",
-            {"text": slack_text(v, pr, posted, note), "repo": pr["repo"], "number": pr["number"], "sha": pr["sha"],
-             "url": pr["url"], "verdict": v["verdict"] if v else None},
-            client_key=f"prreview:{pr['repo']}#{pr['number']}@{pr['sha']}",
+            session, "pr_review", payload, client_key=f"prreview:{pr['repo']}#{pr['number']}@{pr['sha']}",
         )
         return {"verdict": v["verdict"] if v else None, "posted": posted}
+
+    def _merge_offer(self, session: str, pr: dict[str, Any], card: str) -> str:
+        """An opaque id the [Merge] button carries. It names this PR at this reviewed commit, so a click can
+        only ever merge what was reviewed. Stable across activity retries."""
+        st = self.core.store
+        for_key = f"{OFFER_FOR_KEY}{pr['repo']}#{pr['number']}@{pr['sha']}"
+        oid = st.kv_get(session, for_key)
+        if not oid:
+            oid = "mrg-" + secrets.token_hex(6)
+            st.kv_set(session, f"{OFFER_KEY}{oid}", {
+                "repo": pr["repo"], "number": pr["number"], "sha": pr["sha"], "url": pr["url"],
+                "title": pr.get("title", ""), "verdict": "approve", "card_text": card,
+            })
+            st.kv_set(session, for_key, oid)
+        return oid
+
+    # ---- merge (MergePrWorkflow); started only by a human click, never by the model ------------------
+    @activity.defn(name="merge_inspect")
+    async def merge_inspect(self, a: dict[str, Any]) -> dict[str, Any]:
+        """GitHub's current view of the PR, reduced to one decision. Read-only, so safe to retry."""
+        repo, n, sha = gh.check_repo_in_scope(a["repo"]), a["number"], a["sha"]
+        pr = (await gh.gh_call("GET", f"/repos/{repo}/pulls/{n}")).json()
+        failing, pending = [], []
+        if not pr.get("merged") and pr.get("state") == "open":
+            status = (await gh.gh_call("GET", f"/repos/{repo}/commits/{sha}/status")).json()
+            runs = (await gh.gh_call("GET", f"/repos/{repo}/commits/{sha}/check-runs?per_page=100")).json()
+            failing, pending = check_summary(status, runs)
+        action, reason = decide(pr, sha, failing, pending)
+        base = pr.get("base") or {}
+        head = pr.get("head") or {}
+        return {
+            "action": action, "reason": reason, "title": pr.get("title", ""),
+            "head_ref": head.get("ref", ""),
+            "protected_refs": [r for r in (base.get("ref"), (base.get("repo") or {}).get("default_branch")) if r],
+            "same_repo": ((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower(),
+            "default_base": base.get("ref") == (base.get("repo") or {}).get("default_branch"),
+            "merge_sha": pr.get("merge_commit_sha") if pr.get("merged") else None,
+            # read before merging: what `Closes #N` will close (None = could not tell)
+            "issues": await self._closing_issues(repo, n) if action in ("merge", "already_merged") else None,
+        }
+
+    async def _closing_issues(self, repo: str, n: int) -> list[dict[str, Any]] | None:
+        owner, name = repo.split("/")
+        q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){"
+             "closingIssuesReferences(first:20){nodes{number state repository{nameWithOwner}}}}}}")
+        try:
+            data = (await gh.gh_call("POST", "/graphql", {"query": q, "variables": {"o": owner, "r": name, "n": n}})).json()
+            nodes = data["data"]["repository"]["pullRequest"]["closingIssuesReferences"]["nodes"]
+        except (gh.GithubError, httpx.HTTPStatusError, KeyError, TypeError):
+            return None
+        return [{"repo": x["repository"]["nameWithOwner"], "number": x["number"], "state": x["state"]} for x in nodes]
+
+    @activity.defn(name="merge_pr")
+    async def merge_pr(self, a: dict[str, Any]) -> dict[str, Any]:
+        """Squash-merge pinned to the reviewed commit. Safe to retry: GitHub's state is checked first, and a
+        refused or failed merge is re-checked, since a merge can succeed and still return an error."""
+        repo, n, sha = gh.check_repo_in_scope(a["repo"]), a["number"], a["sha"]
+
+        async def merged() -> dict[str, Any] | None:
+            pr = (await gh.gh_call("GET", f"/repos/{repo}/pulls/{n}")).json()
+            return {"merged": True, "merge_sha": pr.get("merge_commit_sha") or ""} if pr.get("merged") else None
+
+        if done := await merged():
+            return done
+        try:
+            r = await gh.gh_call("PUT", f"/repos/{repo}/pulls/{n}/merge", {
+                "merge_method": "squash", "sha": sha, "commit_title": f"{a['title']} (#{n})"[:250],
+            })
+            return {"merged": True, "merge_sha": r.json().get("sha", "")}
+        except httpx.HTTPStatusError as e:
+            if done := await merged():
+                return done
+            if e.response.status_code >= 500:
+                raise  # transient; the retry re-checks first
+            try:
+                msg = str(e.response.json().get("message", ""))
+            except ValueError:
+                msg = ""
+            return {"merged": False, "reason": f"GitHub refused the merge ({e.response.status_code}): {msg[:200]}"}
+        except gh.GithubError as e:
+            return {"merged": False, "reason": str(e)[:200]}
+
+    @activity.defn(name="merge_update_branch")
+    async def merge_update_branch(self, a: dict[str, Any]) -> dict[str, Any]:
+        repo, n = gh.check_repo_in_scope(a["repo"]), a["number"]
+        try:
+            await gh.gh_call("PUT", f"/repos/{repo}/pulls/{n}/update-branch", {"expected_head_sha": a["sha"]})
+            return {"ok": True}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise
+            return {"ok": False, "reason": f"GitHub refused to update the branch ({e.response.status_code})"}
+        except gh.GithubError as e:
+            return {"ok": False, "reason": str(e)[:200]}
+
+    @activity.defn(name="merge_delete_branch")
+    async def merge_delete_branch(self, a: dict[str, Any]) -> dict[str, Any]:
+        repo, ref = gh.check_repo_in_scope(a["repo"]), a["ref"]
+        if not a["same_repo"] or not ref:
+            return {"ref": ref, "result": "left alone (it lives in a fork)"}
+        if ref in a.get("protected_refs", []):
+            return {"ref": ref, "result": "left alone (it is the base or default branch)"}
+        try:
+            await gh.gh_call("DELETE", f"/repos/{repo}/git/refs/heads/{quote(ref, safe='/')}")
+            return {"ref": ref, "result": "deleted"}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 422:  # already gone (e.g. the repo auto-deletes merged branches)
+                return {"ref": ref, "result": "deleted"}
+            if e.response.status_code >= 500:
+                raise
+            return {"ref": ref, "result": f"not deleted ({e.response.status_code})"}
+        except gh.GithubError:  # 404: already gone, or no permission
+            return {"ref": ref, "result": "not found (already deleted?)"}
+
+    @activity.defn(name="merge_issue_states")
+    async def merge_issue_states(self, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out = []
+        for i in issues:
+            try:
+                repo = gh.check_repo_in_scope(i["repo"])
+                st = (await gh.gh_call("GET", f"/repos/{repo}/issues/{i['number']}")).json().get("state", "")
+                out.append({**i, "state": st.upper()})
+            except (gh.GithubError, httpx.HTTPStatusError):
+                out.append({**i, "state": "UNKNOWN"})
+        return out
+
+    @activity.defn(name="merge_report")
+    async def merge_report(self, a: dict[str, Any]) -> None:
+        """Final notice, plus what the bridge needs to update the original card."""
+        offer, out = a["offer"], a["outcome"]
+        self.core.store.outbox_push(
+            a["session"], "pr_merge",
+            {"text": report_text(offer, out), "status": out["status"], "offer_id": a["offer_id"],
+             "card_ts": a.get("card_ts"), "card_text": offer.get("card_text", ""),
+             "retry": out["status"] == "failed" and out.get("action") in RETRYABLE},
+            client_key=f"prmerge:{a['run_id']}",
+        )
 
     def all(self) -> list:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
             self.maybe_compact, self.sandbox_sleep, self.warm_cache, self.report_failure,
             self.deliver_routine_event, self.poll_github, self.publish_pr_review,
+            self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
+            self.merge_issue_states, self.merge_report,
         ]

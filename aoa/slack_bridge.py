@@ -5,7 +5,8 @@
 Inbound  (Socket Mode, so no public URL): messages from ONE allowed user in ONE private channel become
          trusted user messages; button clicks and "approve <id>" / "deny <id>" resolve approvals.
 Outbound: long-polls the session outbox and posts each item to the channel, with Approve/Deny buttons
-         for approval requests.
+         for approval requests and a Merge button on approved PR review cards. A merge result also
+         updates the card it came from.
 
 Everything else in the workspace is ignored. See docs/slack-setup.md for creating the app.
 """
@@ -33,6 +34,7 @@ PREFIX = {
     "system": "_system_ ",
     "sent_log": "_outbound_ ",
     "pr_review": ":mag: ",
+    "pr_merge": "",
 }
 TYPED_DECISION = re.compile(r"^\s*(approve|deny)\s+(apr-[0-9a-f]+)\s*$", re.IGNORECASE)
 
@@ -80,10 +82,49 @@ def parse_block_action(payload: dict[str, Any], cfg: BridgeConfig) -> tuple[str,
     return None
 
 
+def parse_merge_action(payload: dict[str, Any], cfg: BridgeConfig) -> str | None:
+    """Merge button click -> merge offer id, only from the allowed user in our channel."""
+    if payload.get("type") != "block_actions" or (payload.get("user") or {}).get("id") != cfg.user:
+        return None
+    if (payload.get("channel") or {}).get("id") != cfg.channel:
+        return None
+    for act in payload.get("actions", []):
+        if act.get("action_id") == "aoa_merge" and act.get("value"):
+            return act["value"]
+    return None
+
+
+def merge_button(offer_id: str) -> dict[str, Any]:
+    return {"type": "actions", "block_id": f"aoa_{offer_id}", "elements": [
+        {"type": "button", "action_id": "aoa_merge", "style": "primary", "value": offer_id,
+         "text": {"type": "plain_text", "text": "Merge"},
+         "confirm": {"title": {"type": "plain_text", "text": "Squash-merge this PR?"},
+                     "text": {"type": "mrkdwn", "text": "Squash-merges the reviewed commit and deletes the branch."},
+                     "confirm": {"type": "plain_text", "text": "Merge"},
+                     "deny": {"type": "plain_text", "text": "Cancel"}}},
+    ]}
+
+
+def card_blocks(card_text: str, status: str | None = None, offer_id: str | None = None) -> list[dict[str, Any]]:
+    """A PR review card: its text, an optional status line, and a Merge button when one is offered."""
+    blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": card_text[:2900]}}]
+    if status:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": status}]})
+    if offer_id:
+        blocks.append(merge_button(offer_id))
+    return blocks
+
+
+MERGE_STATUS = {"merged": ":tada: Merged", "updated": ":arrows_counterclockwise: Branch updated; re-review coming",
+                "failed": ":no_entry: Not merged (see below)"}
+
+
 def render_outbox_item(item: dict[str, Any]) -> tuple[str, list[dict[str, Any]] | None]:
     """Outbox row -> (fallback text, Block Kit blocks or None)."""
     kind, p = item["kind"], item["payload"]
     text = PREFIX.get(kind, f"_{kind}_ ") + to_mrkdwn(str(p.get("text", "")))
+    if kind == "pr_review" and p.get("merge_offer"):
+        return text, card_blocks(text, offer_id=p["merge_offer"])
     if kind != "approval" or not p.get("approval_id"):
         return text, None
     aid = p["approval_id"]
@@ -112,6 +153,7 @@ class Bridge:
         self.cfg, self.web, self.http, self.cursor_path = cfg, web, http, cursor_path
         self._decided: set[str] = set()  # Slack can deliver one click twice; act on each approval once
         self._cards: dict[str, tuple[str, str]] = {}  # approval_id -> (message ts, text) of its posted card
+        self._merging: set[str] = set()  # merge offers clicked and not yet reported (Slack may deliver twice)
 
     # ---- Slack -> agent --------------------------------------------------------------
     async def handle_event(self, event: dict[str, Any]) -> None:
@@ -126,6 +168,11 @@ class Bridge:
             self._check(r, "send message")
 
     async def handle_interactive(self, payload: dict[str, Any]) -> None:
+        offer = parse_merge_action(payload, self.cfg)
+        if offer is not None:
+            msg = payload.get("message") or {}
+            await self._merge(offer, msg.get("ts"), msg.get("text", ""))
+            return
         parsed = parse_block_action(payload, self.cfg)
         if parsed is None:
             return
@@ -155,6 +202,42 @@ class Bridge:
             )
         except Exception:  # noqa: BLE001 - cosmetic only
             log.warning("could not update approval message", exc_info=True)
+
+    async def _merge(self, offer_id: str, ts: str | None, text: str) -> None:
+        if offer_id in self._merging:
+            return
+        self._merging.add(offer_id)
+        try:
+            r = await self.http.post(f"/sessions/{self.cfg.session}/merges/{offer_id}", json={"card_ts": ts})
+        except Exception:
+            self._merging.discard(offer_id)  # never leave the button dead until a restart
+            raise
+        if r.status_code == 409:
+            return  # already running; its result will arrive
+        if r.status_code >= 400:
+            self._merging.discard(offer_id)
+            self._check(r, "start merge")
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_Could not start the merge ({r.status_code})._")
+            return
+        if ts:
+            try:  # take the button away while the merge runs
+                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text,
+                                           blocks=card_blocks(text, ":hourglass_flowing_sand: Merging…"))
+            except Exception:  # noqa: BLE001 - cosmetic only
+                log.warning("could not update PR card", exc_info=True)
+
+    async def _merge_result(self, p: dict[str, Any]) -> None:
+        """A merge finished: update the card it started from (button back only if a retry can help)."""
+        self._merging.discard(p.get("offer_id", ""))
+        if not p.get("card_ts"):
+            return
+        card = PREFIX["pr_review"] + to_mrkdwn(str(p.get("card_text", "")))
+        blocks = card_blocks(card, MERGE_STATUS.get(p.get("status"), p.get("status")),
+                             p.get("offer_id") if p.get("retry") else None)
+        try:
+            await self.web.chat_update(channel=self.cfg.channel, ts=p["card_ts"], text=card, blocks=blocks)
+        except Exception:  # noqa: BLE001 - cosmetic only
+            log.warning("could not update PR card", exc_info=True)
 
     def _check(self, r: httpx.Response, what: str) -> None:
         if r.status_code == 401:
@@ -196,6 +279,8 @@ class Bridge:
                     ts = resp.get("ts") if resp is not None and hasattr(resp, "get") else None
                     if aid and ts:
                         self._cards[aid] = (ts, text)
+                    if item["kind"] == "pr_merge":
+                        await self._merge_result(item["payload"])
                     after = item["seq"]
                     self._save_cursor(after)  # after posting: a crash re-sends at most one item
             except httpx.HTTPError:

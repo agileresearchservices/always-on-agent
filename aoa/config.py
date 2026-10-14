@@ -58,7 +58,7 @@ class Settings:
             max_steps_per_turn=_int("AOA_MAX_STEPS", 40),
             max_helper_steps=_int("AOA_MAX_HELPER_STEPS", 30),
             max_helper_depth=_int("AOA_MAX_HELPER_DEPTH", 1),
-            max_tokens=_int("AOA_MAX_TOKENS", 4096),
+            max_tokens=_int("AOA_MAX_TOKENS", 16000),
             tool_result_max_chars=_int("AOA_TOOL_RESULT_MAX_CHARS", 8000),
             context_hard_limit_tokens=_int("AOA_CONTEXT_HARD_LIMIT", 120_000),
             context_warm_compact_tokens=_int("AOA_CONTEXT_WARM_COMPACT", 50_000),

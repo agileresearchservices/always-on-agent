@@ -30,7 +30,7 @@ class Ops(Protocol):
 class LoopResult:
     text: str
     steps: int
-    stop: str  # "end_turn" | "max_steps"
+    stop: str  # "end_turn" | "max_steps" | "max_tokens" (the final answer was cut off)
 
 
 def _err(tool_use_id: str, msg: str) -> dict[str, Any]:
@@ -57,7 +57,7 @@ async def run_agent_loop(
             last_text = resp["text"]
         tool_uses = resp["tool_uses"]
         if not tool_uses:
-            return LoopResult(last_text, step + 1, "end_turn")
+            return LoopResult(last_text, step + 1, "max_tokens" if resp["stop_reason"] == "max_tokens" else "end_turn")
 
         if resp["stop_reason"] == "max_tokens":
             # the call was cut off mid-output; the tool input may be incomplete, so do not run it

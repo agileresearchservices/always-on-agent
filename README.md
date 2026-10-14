@@ -73,6 +73,7 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 | Auto-review of commands by a second model | `safety.py`: denylist, then reviewer model, fail closed |
 | Untrusted input is data; irreversible actions need approval | `events.render_event_text`, `safety.wrap_untrusted`, `external_send` approval flow |
 | Errors written for agents | `ToolError` messages say what to do next |
+| Watch, review, merge (PR flow) | `github_monitor.py` announces PRs; `PrReviewWorkflow` runs a reviewer sub-agent and posts a comment review (`pr_review.py`); an approved card gets a Slack [Merge] button that starts `MergePrWorkflow` (`pr_merge.py`): wait for checks, squash-merge pinned to the reviewed commit, delete the branch, confirm linked issues closed. The model never has a merge tool |
 
 ## Honest limits
 
@@ -87,3 +88,6 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 - **Auth is minimal** (two shared secrets, required unless `AOA_ALLOW_INSECURE=1`). Put it behind real auth and TLS before exposing it.
 - `warm_cache` reliably warms the system and tool blocks; warming conversation history is best effort.
 - Routines inherit trust from whoever created them, so only a user-started turn may create one.
+- **The API token is reachable from the sandbox.** Merges and approvals are triggered through the local API with
+  `AOA_API_TOKEN`, and a non-isolated sandbox command could read `.env`. The command reviewer stands between the
+  model and that; real isolation (above) is the fix.
