@@ -295,3 +295,34 @@ def test_stale_work_dirs_are_cleaned(tmp_path, monkeypatch):
         (d / "clone").mkdir(parents=True)
     os.utime(old, (0, 0))
     assert clean_stale_workdirs() == 1 and not old.exists() and new.exists()
+
+
+def test_test_timeout_is_parsed_defensively(monkeypatch):
+    from aoa.pr_resolve import TEST_TIMEOUT, test_timeout
+
+    for bad in ("soon", "-5", "0"):
+        monkeypatch.setenv("AOA_RESOLVE_TEST_TIMEOUT", bad)
+        assert test_timeout() == TEST_TIMEOUT
+    monkeypatch.setenv("AOA_RESOLVE_TEST_TIMEOUT", "90")
+    assert test_timeout() == 90
+
+
+async def test_too_little_time_left_means_no_push(tmp_path, remote):
+    import time
+
+    origin, sha, _ = remote
+    r = resolver(tmp_path, remote, FakeLLM([resolution()]))
+    r.deadline = time.monotonic() + 30
+    out = await r.run()
+    assert out["status"] == "failed" and "too little time" in out["reason"]
+    assert git(origin, "rev-parse", "feat") == sha
+
+
+def test_context_must_match_whole_lines():
+    from aoa.pr_resolve import ResolveError, finish_resolution
+
+    conflicted = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> base\nend = 1\n"
+    texts = {"conflicted": conflicted, "ours": "ours\nend = 1\n", "theirs": "theirs\nend = 1\n"}
+    assert finish_resolution("ours\ntheirs\nend = 1\n", texts).endswith("end = 1\n")
+    with pytest.raises(ResolveError):
+        finish_resolution("ours\ntheirs\nfriend = 1\n", texts)  # "end = 1" only mid-line
