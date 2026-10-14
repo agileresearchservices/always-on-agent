@@ -47,3 +47,7 @@ Things that are easy to break:
 ## Testing
 
 `aoa/testing.py` (shipped in the package) provides `FakeLLM` (scripted responses; helpers `text()` and `tool()`; a step may be content blocks, a callable, or an Exception) and `MemoryScheduler`. `tests/conftest.py`'s `make_core(script)` builds an `AgentCore` with a fixed clock (2026-10-14 14:00 New York) and returns `(core, llm)`; `bg_event` / `usr_event` build event dicts. Prefer testing through `direct.handle_events` rather than needing Temporal; reserve `@pytest.mark.temporal` for workflow-specific behavior (`tests/test_temporal_e2e.py`).
+
+## Pull requests
+
+Link every PR to the issue it addresses with a closing keyword in the body (`Closes #N`, `Fixes #N`), so merging closes the issue automatically. If there is no issue, create one first. Use `Refs #N` only when the PR intentionally leaves the issue open. Keywords only fire when the PR merges into the default branch. `.github/pull_request_template.md` has the skeleton.
