@@ -48,7 +48,7 @@ planned eval flywheel).
 4. **Secrets hygiene.** Two Anthropic API keys were pasted into the Claude Code chat; rotate them. Slack tokens went straight from the Slack page to `.env` via the clipboard.
 5. ~~Typed approve/deny leaves the card's buttons live.~~ Fixed in ceb914b. Limitation: the card map is in memory, so a typed decision for a card posted before a bridge restart resolves the approval but cannot update that card.
 6. **Injection warning was held, not shown (until the next update).** The agent correctly refused the injected email and told the user via `send_user(kind="update")`, but the notifier held it (min update interval), so it was not visible in Slack. Policy question: should "attempted injection / suspicious external instruction" bypass the hold (e.g. a distinct kind, or urgent)? Eval case candidate for issue #1.
-7. **Routine turns are treated as user-triggered.** `prepare_turn` marks any turn containing a trusted event as `trigger_user`, and routine events are trusted, so a routine-started turn can use `schedule_routine` and reply as if the person were present. README says routines inherit trust from their creator, so this is by design, but it allows routines to create routines. Consider a distinct trust level for routine turns.
+7. **Routine trust policy (analysed, decision pending).** `prepare_turn` sets `trigger_user` for any turn containing a trusted event, and routine events are trusted. `trigger_user` gates only two things: (a) `send_user(kind="reply")` (otherwise downgraded to `update`, which the notifier can hold for quiet hours / min interval), and (b) `schedule_routine`. Effect (a) is wanted: a reminder the person scheduled should not be held. Effect (b) is the gap: a routine turn that ingested untrusted content can plant a new routine, whose prompt is later rendered as trusted text (persistent injection). A second path exists with no routine at all: in a user-started turn the model reads untrusted content and then composes a routine prompt; `trigger_user` does not detect that. Options: (1) routine turns may not create/delete routines (small); (2) approval-gate `schedule_routine` so the person sees name, cron and prompt on a card before it exists (medium; reuses the approval flow; closes both paths); (3) taint tracking, block routine creation in any turn that saw untrusted content (larger). Recommended: 1 now, then 2.
 8. **Cache-miss detector false positive** right after compaction (history legitimately shrinks); now partly explained by the new cause line, but the warning itself still fires.
 
 ## Improvement backlog (not scheduled)
@@ -59,3 +59,13 @@ planned eval flywheel).
 - Slack bridge: log ignored messages with the reason (wrong user/channel) to make setup problems visible.
 - Agent replies in Slack can be very long (full code listings). Consider a length guideline or snippet upload.
 - Production deployment: real Temporal, Postgres instead of SQLite, persistent absolute `AOA_DATA_DIR`, TLS + real auth, sandbox in a container/VM.
+
+## Recommended next steps (keep this list current; most valuable first)
+
+1. **Routine trust, part 1 (small, no change for normal use).** Add a distinct `routine` trigger so routine turns cannot call `schedule_routine`/`delete_routine`; keep reply behavior. Tests for both. Status: recommended, not started.
+2. **Routine trust, part 2 (medium).** Approval-gate routine creation (card shows name, cron, prompt). Generalize the `external_send` approval helper. Status: recommended after 1.
+3. **Make it actually always-on.** Today the Temporal dev server, worker, API server and Slack bridge die with the Claude Code session. Run them under launchd (or compose) with `.env`, restart-on-failure and log files. Highest practical value before adding features. Status: not started.
+4. **Decide the injection-warning policy** (finding 6): should "refused a suspicious external instruction" bypass the update hold? Needs a product decision; then an eval case.
+5. **Watch the cache-miss cause line.** No recurrence since diagnostics were added; read the line when it fires, decide whether it is our prefix or the provider.
+6. **First monitor: GitHub PRs awaiting your review** (poller on a Temporal Schedule, wakes the agent only on new items; read-only token kept out of the sandbox). Proves the pattern for calendar ICS, Jira, Slack mentions, Gmail.
+7. **Start evals (issue #1)** with the cases we already exercised by hand: injection email ignored, approval required before send, routine creation not planted by untrusted content, quiet low-value events.
