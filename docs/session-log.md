@@ -163,3 +163,8 @@ planned eval flywheel).
   - Full eval suite 3/3 on all 15 cases.
 - Both Merge buttons (#24, #25) were clicked at once. The two runs merged one after the other with no conflict, and the combined main passed 167 tests. Services restarted on `fe3891e`.
 - **#27 merged** (`77a714c`); services restarted, 168 tests pass. The GitHub App setup and key-rotation reminders were dropped at the owner's request. The only open issue is #1 (eval flywheel / Langfuse).
+
+## Platform features — 2026-10-14 (night)
+
+- Review of Temporal/Anthropic features produced six work items (issues below). Order: timers, replay tests + search attributes, 1h cache TTL, thinking blocks, native tool search + structured outputs, batch evals.
+- **#28 digest flush timer:** `Notifier.next_flush_at` / `flush_digest`; `SessionWorkflow` waits with `min(idle_sleep, time to flush)` and flushes held updates when quiet hours end or the spacing passes (previously they waited for the next message).

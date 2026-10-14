@@ -259,6 +259,13 @@ class AgentCore:
             self.memory.append_log(f"compacted conversation ({mode}, ~{tokens} tokens before)", self.now())
         return mode if ok else "none"
 
+    async def digest_status(self, session: str) -> float | None:
+        """When the held digest may go out (epoch seconds), or None. The workflow arms a durable timer on it."""
+        return self.notifier.next_flush_at(session, self.now())
+
+    async def flush_digest(self, session: str) -> dict[str, Any]:
+        return self.notifier.flush_digest(session, self.now())
+
     async def sandbox_sleep(self, session: str) -> str:
         sb = self.sandbox(session)
         await sb.sleep()

@@ -54,6 +54,14 @@ class AgentActivities:
     async def maybe_compact(self, a: dict[str, Any]) -> str:
         return await self.core.maybe_compact(a["session"], a["conv"])
 
+    @activity.defn(name="digest_status")
+    async def digest_status(self, session: str) -> float | None:
+        return await self.core.digest_status(session)
+
+    @activity.defn(name="flush_digest")
+    async def flush_digest(self, session: str) -> dict[str, Any]:
+        return await self.core.flush_digest(session)
+
     @activity.defn(name="sandbox_sleep")
     async def sandbox_sleep(self, session: str) -> str:
         return await self.core.sandbox_sleep(session)
@@ -314,7 +322,7 @@ class AgentActivities:
     def all(self) -> list:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
-            self.maybe_compact, self.sandbox_sleep, self.warm_cache, self.report_failure,
+            self.maybe_compact, self.digest_status, self.flush_digest, self.sandbox_sleep, self.warm_cache, self.report_failure,
             self.deliver_routine_event, self.poll_github, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
             self.merge_issue_states, self.merge_report, self.resolve_conflicts,

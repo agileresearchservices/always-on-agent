@@ -61,7 +61,7 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 | User message preempts, others queue, bursts batch | `submit_event` queues by priority; steering merges new user events into the in-flight step (`core.append_results`); batch window for background events |
 | Triggers: Slack, email, webhooks, routines | `server.py` webhooks (untrusted); routines are Temporal Schedules (`scheduling.py`); all use signal-with-start (`delivery.py`) |
 | Sleep/wake the computer; snapshot state | `sandbox.LocalSandbox` (tar snapshot); the workflow sleeps it after `AOA_IDLE_SLEEP` seconds idle |
-| Know when to be quiet | `notify.Notifier`: replies/questions/approvals/urgent always go; updates are held in a digest when too soon or in quiet hours |
+| Know when to be quiet | `notify.Notifier`: replies/questions/approvals/urgent always go; updates are held in a digest when too soon or in quiet hours, and a durable timer in `SessionWorkflow` (`digest_status` / `flush_digest` activities) delivers the digest when the spacing or quiet hours allow, even if nothing else happens |
 | Cheapest option first, ask the human last | `prompt.OPERATING_RULES` |
 | Files all the way down; profile, dated log, scratchpad, skills | `memory.py` |
 | Dynamic tool discovery (names only, schema on demand) | `tools.py`: core vs deferred, `tool_search`, `call_deferred` |
