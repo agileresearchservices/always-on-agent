@@ -17,24 +17,26 @@ RESOLVED_KEY = "aoa-resolved:"  # kv: aoa-resolved:<repo>#<n>@<sha> -> files aoa
 
 FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
 # outcomes after which clicking Merge again on the same card can succeed (same commit, state may change)
-RETRYABLE = {"checks_failed", "waited_too_long", "blocked", "draft", "error", "refused", "resolve_failed"}  # not needs_human / stale
+RETRYABLE = {"checks_failed", "waited_too_long", "blocked", "draft", "error", "refused", "resolve_failed",
+             "no_conflict", "auto_merge"}  # not needs_human / stale / tests_failed: the same click fails the same way
 
 
 def check_summary(status: dict[str, Any], check_runs: dict[str, Any]) -> tuple[list[str], list[str]]:
     """(failing, pending) check names for a commit, from the combined commit status and the check runs.
 
     The combined status reports "pending" when a commit has no statuses at all, so it only counts when
-    total_count > 0. A repo with no CI has neither, and nothing is failing or pending."""
+    total_count > 0. A repo with no CI has neither, and nothing is failing or pending. Names are raw: they
+    are escaped once, when report_text renders the reason."""
     failing, pending = [], []
     if status.get("total_count", 0) > 0:
         for s in status.get("statuses") or []:
-            name = slack_safe(str(s.get("context", "status")))[:80]
+            name = str(s.get("context", "status"))[:80]
             if s.get("state") in ("failure", "error"):
                 failing.append(name)
             elif s.get("state") == "pending":
                 pending.append(name)
     for c in check_runs.get("check_runs") or []:
-        name = slack_safe(str(c.get("name", "check")))[:80]
+        name = str(c.get("name", "check"))[:80]
         if c.get("status") != "completed":
             pending.append(name)
         elif c.get("conclusion") in FAILED_CONCLUSIONS:
@@ -74,7 +76,8 @@ def decide(pr: dict[str, Any], sha: str, failing: list[str], pending: list[str])
 
 
 def offer_head(offer: dict[str, Any]) -> str:
-    return f"[{slack_safe(offer['repo'])}#{offer['number']} {slack_safe(offer.get('title', ''))}]({offer['url']})"
+    return (f"[{slack_safe(offer['repo'], True)}#{offer['number']} {slack_safe(offer.get('title', ''), True)}]"
+            f"({offer['url']})")
 
 
 def report_text(offer: dict[str, Any], out: dict[str, Any]) -> str:
@@ -106,11 +109,16 @@ def report_text(offer: dict[str, Any], out: dict[str, Any]) -> str:
                  f"Files: {files}"]
         for f, s in list((out.get("summaries") or {}).items())[:10]:
             lines.append(f"• `{slack_safe(f)}`: {slack_safe(s)}")
-        lines.append(f"Tests: {slack_safe(out.get('tests', 'unknown'))}")
+        cmd = f" (`{slack_safe(out['test_cmd'])}`)" if out.get("test_cmd") else ""
+        lines.append(f"Tests: {slack_safe(out.get('tests', 'unknown'))}{cmd}")
         lines.append("The new commit will be reviewed again; merge it from the new card.")
         return "\n".join(lines)
     if status == "updated":
         return (f":arrows_counterclockwise: {head} was behind its base, so I updated the branch. The new commit "
                 "will be reviewed again and get its own Merge button.")
-    again = " Click Merge on the card to try again." if out.get("action") in RETRYABLE else ""
+    again = {"tests_failed": " Fix the tests on the branch (or resolve the conflicts by hand); the new commit gets "
+                             "its own review.",
+             "needs_human": " Resolve it by hand; the new commit gets its own review."}.get(out.get("action"), "")
+    if out.get("action") in RETRYABLE:
+        again = " Click Merge on the card to try again."
     return f":no_entry: *Not merged* {head}: {slack_safe(out.get('reason', 'unknown error'))}.{again}"

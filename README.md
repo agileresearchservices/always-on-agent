@@ -94,4 +94,4 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 - **Conflict resolution runs the repo's tests as your user.** After aoa resolves a PR's conflicts it runs the
   repo's test command on this machine (allowlisted env, throwaway HOME, clone outside the data dir), which is
   the repo's own code, as if you ran it. Only your own reviewed PRs get there, and the command comes from config
-  or the base branch, never the PR. Run it in a container before using this on code you do not trust.
+  or the base branch, never the PR. Running it in a container is #21; until then, do not use this on code you do not trust.

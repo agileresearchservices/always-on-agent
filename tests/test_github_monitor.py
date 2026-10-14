@@ -99,9 +99,19 @@ async def test_old_list_state_is_ignored_not_crashing(gh, tmp_path):
 
 
 def test_titles_cannot_ping_or_inject_markup():
-    assert slack_safe("<!channel> [click](http://evil) *bold* `x`") == "!channel click(http://evil) bold x"
-    pr = {"repo": f"{USER}/demo", "number": 3, "title": slack_safe("<!channel> hi"), "author": "o", "url": "https://github.com/x/pull/3", "why": "new"}
-    assert "<!channel>" not in notice_text([pr])
+    from aoa.slack_bridge import to_mrkdwn
+    # escaped, not stripped: no mention, no masked link, no broken code span
+    assert slack_safe("<!channel> [click](http://evil) `x`") == "&lt;!channel&gt; [click] (http://evil) 'x'"
+    assert "<http://evil|" not in to_mrkdwn(slack_safe("[click](http://evil)"))
+    for s, want in (("tool_choice", "tool_choice"), ("a & b", "a &amp; b"), ("<!here>", "&lt;!here&gt;"),
+                    ('pip install -e ".[dev]"', 'pip install -e ".[dev]"')):
+        assert slack_safe(s) == want
+    assert slack_safe("[WIP] x] y", label=True) == "(WIP) x) y"
+    pr = {"repo": f"{USER}/demo", "number": 3, "title": "<!channel> [WIP] fix tool_choice", "author": "o",
+          "url": "https://github.com/x/pull/3", "why": "new"}
+    out = to_mrkdwn(notice_text([pr]))
+    assert "<!channel>" not in out and "&lt;!channel&gt;" in out
+    assert "<https://github.com/x/pull/3|" in out and "(WIP) fix tool_choice>" in out  # the link survives
 
 
 async def test_bad_token_is_a_clear_error(gh, tmp_path):
