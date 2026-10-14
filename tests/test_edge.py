@@ -101,3 +101,20 @@ async def test_routines_only_from_user_started_turns(make_core):
     await handle_events(core2, "main2", [usr_event("schedule a daily inbox summary")])
     assert core2.scheduler.items[("main2", "daily")] == ("0 13 * * *", "summarise inbox")
     assert core2.store.routine_list("main2")[0]["name"] == "daily"
+
+
+def test_server_refuses_to_start_without_secrets(monkeypatch):
+    import pytest
+
+    for v in ("AOA_API_TOKEN", "AOA_WEBHOOK_SECRET", "AOA_ALLOW_INSECURE"):
+        monkeypatch.delenv(v, raising=False)
+    with pytest.raises(RuntimeError, match="AOA_API_TOKEN and AOA_WEBHOOK_SECRET"):
+        server.check_auth_configured()
+    monkeypatch.setenv("AOA_API_TOKEN", "t")
+    with pytest.raises(RuntimeError, match="AOA_WEBHOOK_SECRET"):
+        server.check_auth_configured()
+    monkeypatch.setenv("AOA_WEBHOOK_SECRET", "s")
+    server.check_auth_configured()
+    monkeypatch.delenv("AOA_API_TOKEN")
+    monkeypatch.setenv("AOA_ALLOW_INSECURE", "1")
+    server.check_auth_configured()

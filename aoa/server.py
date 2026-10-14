@@ -25,8 +25,21 @@ settings = Settings.from_env()
 store = Store(settings.db_path)
 
 
+def check_auth_configured() -> None:
+    """Refuse to start without both shared secrets unless insecure mode is explicitly requested."""
+    if os.environ.get("AOA_ALLOW_INSECURE") == "1":
+        return
+    missing = [v for v in ("AOA_API_TOKEN", "AOA_WEBHOOK_SECRET") if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError(
+            f"{' and '.join(missing)} not set, so the API would accept unauthenticated requests. "
+            "Set them, or set AOA_ALLOW_INSECURE=1 for local development only."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    check_auth_configured()
     app.state.client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
     yield
 

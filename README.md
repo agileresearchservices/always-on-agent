@@ -11,6 +11,7 @@ Python, Anthropic SDK, Temporal. Default model `claude-sonnet-5-5`, reviewer `cl
 ```bash
 python -m venv .venv && . .venv/bin/activate && pip install -e '.[dev]'
 export ANTHROPIC_API_KEY=...
+export AOA_ALLOW_INSECURE=1               # local dev only; otherwise set AOA_API_TOKEN and AOA_WEBHOOK_SECRET
 
 temporal server start-dev                 # terminal 1 (Temporal CLI)
 python -m aoa.worker                      # terminal 2
@@ -27,6 +28,14 @@ curl -XPOST localhost:8000/webhooks/email -H 'content-type: application/json' \
 
 Tests: `pytest` runs 47 tests with a scripted fake model and no server.
 `pytest -m temporal` runs the end-to-end tests once `temporal server start-dev` is up (they skip otherwise).
+
+## Configuration and secrets
+
+`.env.example` lists every variable. Nothing in aoa reads a `.env` file, so inject secrets through your
+host (systemd `EnvironmentFile`, Docker/Kubernetes secrets, a secrets manager) and never commit them.
+The API server refuses to start unless `AOA_API_TOKEN` and `AOA_WEBHOOK_SECRET` are set; export
+`AOA_ALLOW_INSECURE=1` to bypass that for local development only. For a real deployment you also need a
+production Temporal (not `start-dev`) and a persistent, absolute `AOA_DATA_DIR`.
 
 ## How the lecture maps to the code
 
@@ -61,6 +70,6 @@ Tests: `pytest` runs 47 tests with a scripted fake model and no server.
 - **Not implemented:** computer use (screenshots, accessibility tree), fact garbage collection beyond a size cap,
   voice, payments, real Slack/email connectors (`external_send` records instead of sending), eval/flywheel tooling.
 - **Single host.** Workers share one SQLite file. For several hosts, move `store.py` to Postgres.
-- **Auth is minimal** (optional shared secrets). Put it behind real auth before exposing it.
+- **Auth is minimal** (two shared secrets, required unless `AOA_ALLOW_INSECURE=1`). Put it behind real auth and TLS before exposing it.
 - `warm_cache` reliably warms the system and tool blocks; warming conversation history is best effort.
 - Routines inherit trust from whoever created them, so only a user-started turn may create one.
