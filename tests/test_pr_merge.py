@@ -106,10 +106,11 @@ class FakeGitHub:
     """Routes gh_call by (method, path prefix); records every call."""
 
     def __init__(self, routes):
-        self.routes, self.calls = routes, []
+        self.routes, self.calls, self.tokens = routes, [], []
 
-    async def __call__(self, method, path, json=None, accept=""):
+    async def __call__(self, method, path, json=None, accept="", token=None):
         self.calls.append((method, path, json))
+        self.tokens.append(token)
         for (m, prefix), resp in self.routes.items():
             if m == method and path.startswith(prefix):
                 resp = resp(json) if callable(resp) else resp
@@ -324,3 +325,30 @@ def test_check_names_are_escaped_exactly_once():
     action, reason = decide(ghpr(), SHA, failing, [])
     t = report_text(OFFER, {"status": "failed", "action": action, "reason": reason})
     assert "Lint &amp; Test" in t and "&amp;amp;" not in t
+
+
+async def test_reviewer_identity_posts_a_real_approval(acts, monkeypatch):
+    monkeypatch.setenv("AOA_REVIEWER_TOKEN", "ghs_reviewer")
+    fake = use(monkeypatch, FakeGitHub({("POST", "/repos/agileresearchservices/demo/pulls/7/reviews"): (200, {})}))
+    pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")} | {"author": "agileresearchservices"}
+    await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": '{"verdict": "approve", "summary": "Fine.", "findings": []}'})
+    assert fake.calls[0][2]["event"] == "APPROVE" and fake.tokens == ["ghs_reviewer"]
+    assert "recommendation" not in fake.calls[0][2]["body"] and fake.calls[0][2]["commit_id"] == SHA
+    card = acts.core.store.outbox_since("main")[-1]["payload"]
+    assert "Posted on GitHub as an approval" in card["text"] and card["merge_offer"]
+
+
+async def test_reviewer_identity_failure_falls_back_to_a_comment_review(acts, monkeypatch):
+    monkeypatch.setenv("AOA_REVIEWER_TOKEN", "ghs_reviewer")
+
+    def post(body):
+        return (422, {"message": "nope"}) if body["event"] != "COMMENT" else (200, {})
+
+    fake = use(monkeypatch, FakeGitHub({("POST", "/repos/agileresearchservices/demo/pulls/7/reviews"): post}))
+    pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")} | {"author": "agileresearchservices"}
+    bad = '{"verdict": "request_changes", "summary": "Bug.", "findings": []}'
+    await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": bad})
+    assert [c[2]["event"] for c in fake.calls] == ["REQUEST_CHANGES", "COMMENT"]
+    assert fake.tokens == ["ghs_reviewer", None]  # the fallback uses GITHUB_TOKEN
+    text = acts.core.store.outbox_since("main")[-1]["payload"]["text"]
+    assert "as a comment review" in text and "could not post (422)" in text

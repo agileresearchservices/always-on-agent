@@ -15,6 +15,7 @@ from .core import AgentCore
 from .delivery import deliver_event
 from .events import Event
 from . import github_monitor as gh
+from .gh_reviewer import forget as forget_reviewer_token, reviewer_token
 from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
 from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RESOLVED_KEY, RETRYABLE, check_summary, decide, report_text
 from .pr_resolve import AUTO_MERGE_ON, ResolveError, Resolver, resolve_root, with_heartbeat
@@ -89,19 +90,34 @@ class AgentActivities:
 
     @activity.defn(name="publish_pr_review")
     async def publish_pr_review(self, a: dict[str, Any]) -> dict[str, Any]:
-        """Validate the reviewer's answer, post it on GitHub as a comment review pinned to the reviewed
-        commit, and put a card in Slack. Idempotent: the card has a client key, and a repeat post is skipped."""
+        """Validate the reviewer's answer, post it on GitHub pinned to the reviewed commit (a real APPROVE /
+        REQUEST_CHANGES when a reviewer identity is configured, else a comment review), and put a card in Slack. Idempotent: the card has a client key, and a repeat post is skipped."""
         pr, session = a["pr"], a["session"]
         v = parse_verdict(a.get("review_text") or "")
-        posted, note = False, a.get("note", "")
+        posted, note, posted_as = False, a.get("note", ""), "a comment review"
         done_key = f"prreview-posted:{pr['repo']}#{pr['number']}@{pr['sha']}"
+        url = f"/repos/{pr['repo']}/pulls/{pr['number']}/reviews"
         if v is not None:
-            if self.core.store.kv_get(session, done_key):
+            if done := self.core.store.kv_get(session, done_key):
                 posted = True
-            else:
+                posted_as = done if isinstance(done, str) else posted_as
+            elif tok := await reviewer_token(pr["repo"]):  # #11: a real APPROVE / REQUEST_CHANGES
                 try:
-                    await gh.gh_call("POST", f"/repos/{pr['repo']}/pulls/{pr['number']}/reviews",
-                                     {"body": github_body(v), "event": "COMMENT", "commit_id": pr["sha"]})
+                    await gh.gh_call("POST", url, {"body": github_body(v, formal=True), "commit_id": pr["sha"],
+                                                   "event": "APPROVE" if v["verdict"] == "approve" else "REQUEST_CHANGES"},
+                                     token=tok)
+                    posted_as = "an approval" if v["verdict"] == "approve" else "a change request"
+                    self.core.store.kv_set(session, done_key, posted_as)
+                    posted = True
+                except (gh.GithubError, httpx.HTTPStatusError) as e:  # never lose the review: comment instead
+                    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500:
+                        raise
+                    forget_reviewer_token(pr["repo"])
+                    code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else str(e)[:120]
+                    note = f"The reviewer identity could not post ({code}), so this is a comment review. {note}".strip()
+            if not posted:
+                try:
+                    await gh.gh_call("POST", url, {"body": github_body(v), "event": "COMMENT", "commit_id": pr["sha"]})
                     self.core.store.kv_set(session, done_key, True)
                     posted = True
                 except gh.GithubError as e:  # 401/403/404: retrying will not help
@@ -111,7 +127,7 @@ class AgentActivities:
                         raise  # transient: let Temporal retry the activity
                     note = f"GitHub post failed: {e.response.status_code} {e.response.text[:150]}"
                 # other httpx errors (network) propagate and are retried too
-        card = slack_text(v, pr, posted, note)
+        card = slack_text(v, pr, posted, note, posted_as)
         payload = {"text": card, "repo": pr["repo"], "number": pr["number"], "sha": pr["sha"],
                    "url": pr["url"], "verdict": v["verdict"] if v else None}
         if v is not None and v["verdict"] == "approve":

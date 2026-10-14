@@ -164,14 +164,18 @@ def check_repo_in_scope(repo: str) -> str:
     return repo
 
 
-async def gh_call(method: str, path: str, json: Any = None, accept: str = "application/vnd.github+json") -> httpx.Response:
+async def gh_call(method: str, path: str, json: Any = None, accept: str = "application/vnd.github+json",
+                  token: str | None = None) -> httpx.Response:
+    """`token` is another identity (the reviewer's); default is GITHUB_TOKEN."""
     async with httpx.AsyncClient(timeout=30) as http:
         r = await http.request(
             method, f"{API}{path}", json=json,
-            headers={"Authorization": f"Bearer {token_provider()}", "Accept": accept,
+            headers={"Authorization": f"Bearer {token or token_provider()}", "Accept": accept,
                      "X-GitHub-Api-Version": "2022-11-28"},
         )
     if r.status_code in (401, 403, 404):
-        raise GithubError(f"GitHub returned {r.status_code} for {method} {path}: check the repo name and token permissions")
+        who = "the reviewer identity" if token else "GITHUB_TOKEN"
+        raise GithubError(f"GitHub returned {r.status_code} for {method} {path}: check the repo name and the "
+                          f"permissions of {who}")
     r.raise_for_status()
     return r
