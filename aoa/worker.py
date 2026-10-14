@@ -15,7 +15,9 @@ from .llm import AnthropicLLM
 from .memory import MemoryStore
 from .scheduling import TemporalScheduler, ensure_github_schedule
 from .store import Store
-from .workflows import GithubPollWorkflow, HelperWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow
+from .workflows import (
+    GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow,
+)
 
 
 async def build_worker(settings: Settings, client: Client, core: AgentCore | None = None) -> Worker:
@@ -28,7 +30,7 @@ async def build_worker(settings: Settings, client: Client, core: AgentCore | Non
     return Worker(
         client,
         task_queue=settings.task_queue,
-        workflows=[SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow],
+        workflows=[SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow],
         activities=acts.all(),
         max_concurrent_activities=20,
     )

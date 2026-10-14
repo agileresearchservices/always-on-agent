@@ -57,7 +57,10 @@ async def _run(client, s, script, session, events, expect_kinds, timeout=30):
             if len(kinds) >= expect_kinds:
                 break
             await asyncio.sleep(0.2)
-        await client.get_workflow_handle(f"session-{session}").signal("stop")
+        handle = client.get_workflow_handle(f"session-{session}")
+        await handle.signal("stop")
+        # let the in-flight turn finish before the worker shuts down (the stop is seen between turns)
+        await asyncio.wait_for(handle.result(), timeout=timeout)
     return store, llm
 
 
@@ -142,3 +145,62 @@ async def test_poll_starts_one_review_per_commit_and_publishes(client, env, monk
     assert posts == [("POST", "/repos/agileresearchservices/demo/pulls/7/reviews",
                       {"body": posts[0][2]["body"], "event": "COMMENT", "commit_id": pr["sha"]})]
     assert "off by one" in posts[0][2]["body"]
+
+
+async def test_merge_workflow_waits_for_checks_merges_and_closes_out(client, env, monkeypatch):
+    """[Merge] click -> MergePrWorkflow: wait while a check runs, squash-merge pinned to the reviewed commit,
+    delete the branch, see the linked issue close, report to the outbox for the card."""
+    import httpx
+
+    from aoa import github_monitor
+
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    sid, sha, repo = f"t-{uuid.uuid4().hex[:6]}", "abc123def4567890", "agileresearchservices/demo"
+    offer = {"repo": repo, "number": 7, "sha": sha, "title": "Tidy", "url": "https://github.com/x/pull/7",
+             "verdict": "approve", "card_text": "card"}
+    pr = {"state": "open", "merged": False, "draft": False, "mergeable": True, "mergeable_state": "clean",
+          "title": "Tidy", "head": {"sha": sha, "ref": "feat/x", "repo": {"full_name": repo}},
+          "base": {"ref": "main", "repo": {"full_name": repo, "default_branch": "main"}}}
+    seen = {"runs": 0, "issue": 0}
+    calls = []
+
+    async def fake_gh(method, path, json=None, accept=""):
+        calls.append((method, path))
+        if path.endswith("/check-runs?per_page=100"):
+            seen["runs"] += 1
+            st = "in_progress" if seen["runs"] == 1 else "completed"
+            body = {"check_runs": [{"name": "test", "status": st, "conclusion": "success" if st == "completed" else None}]}
+        elif path.endswith("/status"):
+            body = {"state": "pending", "total_count": 0}
+        elif path == "/graphql":
+            body = {"data": {"repository": {"pullRequest": {"closingIssuesReferences": {"nodes": [
+                {"number": 3, "state": "OPEN", "repository": {"nameWithOwner": repo}}]}}}}}
+        elif path.endswith("/issues/3"):
+            seen["issue"] += 1
+            body = {"state": "open" if seen["issue"] == 1 else "closed"}
+        elif method == "PUT" and path.endswith("/merge"):
+            assert json == {"merge_method": "squash", "sha": sha, "commit_title": "Tidy (#7)"}
+            body = {"merged": True, "sha": "m3rg3d0000"}
+        else:
+            body = pr if method == "GET" else None
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setattr(github_monitor, "gh_call", fake_gh)
+    store = Store(env.db_path)
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), FakeLLM([]), TemporalScheduler(client, env))
+    async with await build_worker(env, client, core):
+        out = await client.execute_workflow(
+            "MergePrWorkflow",
+            {"session": sid, "offer_id": "mrg-0123456789ab", "offer": offer, "card_ts": "9.9",
+             "poll_seconds": 0.2, "issue_poll_seconds": 0.2},
+            id=f"merge-{sid}", task_queue=env.task_queue,
+        )
+    assert out["status"] == "merged" and out["merge_sha"] == "m3rg3d0000"
+    assert out["branch"] == {"ref": "feat/x", "result": "deleted"}
+    assert out["issues"] == [{"repo": repo, "number": 3, "state": "CLOSED"}]
+    assert seen["runs"] == 2  # waited once for the running check
+    assert [c for c in calls if c[0] in ("PUT", "DELETE")] == [
+        ("PUT", f"/repos/{repo}/pulls/7/merge"), ("DELETE", f"/repos/{repo}/git/refs/heads/feat/x")]
+    (item,) = store.outbox_since(sid)
+    assert item["kind"] == "pr_merge" and item["payload"]["card_ts"] == "9.9" and not item["payload"]["retry"]
+    assert "Merged" in item["payload"]["text"] and "demo#3 closed" in item["payload"]["text"]

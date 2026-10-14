@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -15,10 +16,14 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from temporalio.client import Client
+from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from .config import Settings
 from .delivery import deliver_event, signal_typing
 from .events import Event, approval_event, user_event
+from .github_monitor import GithubError, check_repo_in_scope
+from .pr_merge import OFFER_ID_RE, OFFER_KEY
 from .store import Store
 
 settings = Settings.from_env()
@@ -129,6 +134,34 @@ async def decide(sid: str, approval_id: str, d: Decision) -> dict[str, Any]:
     summary = f"{act.get('tool')} to {act['channel']}" if act.get("channel") else f"{act.get('tool')} '{act.get('name')}'"
     await deliver_event(app.state.client, settings, sid, approval_event(approval_id, d.approve, summary).to_dict())
     return {"status": "approved" if d.approve else "denied"}
+
+
+class MergeRequest(BaseModel):
+    card_ts: str | None = Field(default=None, max_length=40)  # Slack ts of the card, so the result can update it
+
+
+@app.post("/sessions/{sid}/merges/{offer_id}", status_code=202, dependencies=[Depends(require_token)])
+async def merge(sid: str, offer_id: str, m: MergeRequest) -> dict[str, Any]:
+    """The person clicked [Merge]. Only a stored offer (an approved review of one PR at one commit) can be
+    merged; the click names it and nothing else. Idempotent while a merge runs: a second click gets 409."""
+    offer = store.kv_get(sid, OFFER_KEY + offer_id) if re.fullmatch(OFFER_ID_RE, offer_id) else None
+    if not offer or offer.get("verdict") != "approve":
+        raise HTTPException(404, "no such merge offer")
+    try:
+        check_repo_in_scope(offer["repo"])
+    except GithubError as e:
+        raise HTTPException(403, str(e)) from e
+    try:
+        await app.state.client.start_workflow(
+            "MergePrWorkflow",
+            {"session": sid, "offer_id": offer_id, "offer": offer, "card_ts": m.card_ts},
+            id=f"merge-{sid}-{offer_id}", task_queue=settings.task_queue,
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL,  # running: refuse the double click
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,  # finished: a retry may run (it re-checks GitHub)
+        )
+    except WorkflowAlreadyStartedError as e:
+        raise HTTPException(409, "a merge of this PR is already running") from e
+    return {"status": "started"}
 
 
 @app.get("/sessions/{sid}/state", dependencies=[Depends(require_token)])
