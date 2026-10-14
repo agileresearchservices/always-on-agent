@@ -13,7 +13,9 @@ Rules:
 """
 from __future__ import annotations
 
-from datetime import datetime
+import hashlib
+import json
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -29,6 +31,14 @@ def in_quiet_hours(now: datetime, start: int, end: int) -> bool:
     return (h >= start or h < end) if start > end else (start <= h < end)
 
 
+def quiet_end_after(t: datetime, start: int, end: int) -> datetime:
+    """The first moment at or after `t` that is not in quiet hours (t itself when it is not quiet)."""
+    if not in_quiet_hours(t, start, end):
+        return t
+    nxt = t.replace(hour=end, minute=0, second=0, microsecond=0)
+    return nxt if nxt > t else nxt + timedelta(days=1)
+
+
 class Notifier:
     def __init__(self, store: Store, settings: Settings):
         self.store = store
@@ -36,6 +46,33 @@ class Notifier:
 
     def digest_count(self, session: str) -> int:
         return len(self.store.kv_get(session, "digest", []))
+
+    def next_flush_at(self, session: str, now: datetime) -> float | None:
+        """Epoch seconds when the held digest may go out, or None when nothing is held. Never inside quiet
+        hours, never before the minimum spacing since the last send."""
+        if not self.store.kv_get(session, "digest", []):
+            return None
+        last = self.store.kv_get(session, "last_notified_ts", 0.0)
+        t = max(now.timestamp(), last + self.s.min_update_interval_seconds)
+        local = datetime.fromtimestamp(t, ZoneInfo(self.s.tz))
+        return quiet_end_after(local, self.s.quiet_start_hour, self.s.quiet_end_hour).timestamp()
+
+    def flush_digest(self, session: str, now: datetime) -> dict[str, Any]:
+        """Deliver held updates as one message once they are allowed out. Idempotent: the client key names the
+        exact digest, so a retry after a crash cannot send it twice."""
+        held = self.store.kv_get(session, "digest", [])
+        if not held:
+            return {"status": "empty", "flush_at": None}
+        due = self.next_flush_at(session, now)
+        if due is not None and due > now.timestamp():
+            return {"status": "not_due", "flush_at": due}
+        last = self.store.kv_get(session, "last_notified_ts", 0.0)
+        sig = hashlib.sha1(json.dumps(held).encode()).hexdigest()[:12]
+        body = "Held updates:\n" + "\n".join(f"- {h}" for h in held)
+        seq = self.store.outbox_push(session, "update", {"text": body}, client_key=f"digest:{last}:{sig}")
+        self.store.kv_set(session, "digest", [])
+        self.store.kv_set(session, "last_notified_ts", now.timestamp())
+        return {"status": "sent" if seq is not None else "duplicate", "flush_at": None}
 
     def send(self, session: str, kind: str, text: str, now: datetime, client_key: str | None = None) -> dict[str, Any]:
         if kind not in KINDS:

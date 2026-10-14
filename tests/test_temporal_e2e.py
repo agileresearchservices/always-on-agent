@@ -16,7 +16,7 @@ from temporalio.client import Client
 from aoa.config import Settings
 from aoa.core import AgentCore
 from aoa.delivery import deliver_event
-from aoa.events import user_event
+from aoa.events import Event, user_event
 from aoa.memory import MemoryStore
 from aoa.scheduling import TemporalScheduler
 from aoa.store import Store
@@ -250,3 +250,19 @@ async def test_merge_workflow_with_conflicts_resolves_and_marks_the_new_commit(c
     assert store.kv_get(sid, f"aoa-resolved:{repo}#7@n3wsha0000") == ["app.py"]
     (item,) = store.outbox_since(sid)
     assert item["payload"]["status"] == "resolved" and not item["payload"]["retry"]
+
+
+async def test_held_update_is_flushed_by_a_timer(client, env, monkeypatch):
+    """Two background updates in a row: the second is held for the spacing window, then a durable timer in
+    the workflow delivers it without any further message arriving."""
+    monkeypatch.setenv("AOA_MIN_UPDATE_INTERVAL", "3")
+    monkeypatch.setenv("AOA_QUIET_START", "0")
+    monkeypatch.setenv("AOA_QUIET_END", "0")  # start == end: never quiet
+    s = Settings.from_env()
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    ev = Event(source="webhook", text="news", dedupe_key=f"w:{sid}")
+    script = [[tool("send_user", kind="update", text="first")], [tool("send_user", kind="update", text="second")], text("done")]
+    store, _ = await _run(client, s, script, sid, [ev], 2, timeout=30)
+    outs = store.outbox_since(sid)
+    assert outs[0]["payload"]["text"] == "first"
+    assert outs[1]["kind"] == "update" and "second" in outs[1]["payload"]["text"]
