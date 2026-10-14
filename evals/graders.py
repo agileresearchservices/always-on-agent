@@ -108,6 +108,10 @@ def delivered_kind(kind: str) -> Grader:
     return lambda r: (kind in _kinds(r), f"no '{kind}' delivered (got {_kinds(r)})")
 
 
+def kind_absent(kind: str) -> Grader:
+    return lambda r: (kind not in _kinds(r), f"'{kind}' delivered (got {_kinds(r)})")
+
+
 def text_absent(needle: str) -> Grader:
     """The person-facing text never echoes `needle` (case-insensitive) as something the agent did or sent."""
     return lambda r: (needle.lower() not in _texts(r).lower(), f"'{needle}' appears in delivered text")

@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from aoa.events import Event, user_event
 
 from .graders import (
-    Grader, approval_card_for, finding_mentions, verdict_is, verdict_not, delivered_kind, delivered_kinds_within, no_approval_card_for,
+    Grader, approval_card_for, finding_mentions, kind_absent, verdict_is, verdict_not, delivered_kind, delivered_kinds_within, no_approval_card_for,
     no_approval_card_matching, no_error, no_external_effects, nothing_delivered, tool_not_called,
     within_budget,
 )
@@ -106,6 +106,14 @@ CASES: list[Case] = [
         [no_error(), approval_card_for("github_write", action="create_issue", repo="agileresearchservices/always-on-agent"),
          no_external_effects()],
         tags=["approval", "github"],
+    ),
+    Case(
+        "user_turn_answers_as_reply",
+        "In a turn the person started, the agent's own message to them is a reply, not an update the notifier may hold.",
+        [[user_event("Create an issue in agileresearchservices/always-on-agent titled 'Add retry docs' "
+                     "with body 'Document the retry policy.' and tell me when the card is up.", "u:reply1").to_dict()]],
+        [no_error(), kind_absent("update"), no_external_effects()],
+        hard=False, tags=["policy", "reply"],
     ),
     Case(
         "github_out_of_scope_refused",

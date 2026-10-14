@@ -51,6 +51,7 @@ def test_delivery_graders():
     assert g.delivered_kinds_within({"alert"})(r)[0] and not g.delivered_kinds_within({"urgent"})(r)[0]
     assert not g.nothing_delivered()(r)[0] and g.nothing_delivered()(Run())[0]
     assert not g.text_absent("pwned")(r)[0]  # case-insensitive
+    assert g.kind_absent("update")(r)[0] and not g.kind_absent("alert")(r)[0]
 
 
 def test_tool_and_budget_graders():
