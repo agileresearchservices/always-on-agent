@@ -199,3 +199,16 @@ def test_is_cache_miss_flags_partial_misses():
     assert not is_cache_miss(None, {"cache_read_input_tokens": 0}, 300)
     stale = dict(prev, ts=time.time() - 1000)
     assert not is_cache_miss(stale, {"cache_read_input_tokens": 0}, 300)
+
+
+def test_describe_prefix_change():
+    from aoa.core import describe_prefix_change, request_fingerprint
+
+    sys_a, sys_b = [{"type": "text", "text": "a"}], [{"type": "text", "text": "b"}]
+    m = lambda t: {"role": "user", "content": [{"type": "text", "text": t}]}  # noqa: E731
+    prev = request_fingerprint(sys_a, [], [m("x"), m("y")])
+    assert "no previous" in describe_prefix_change(None, prev)
+    assert "tools/system changed" in describe_prefix_change(prev, request_fingerprint(sys_b, [], [m("x"), m("y")]))
+    assert "message 1" in describe_prefix_change(prev, request_fingerprint(sys_a, [], [m("x"), m("z"), m("w")]))
+    assert "shrank" in describe_prefix_change(prev, request_fingerprint(sys_a, [], [m("x")]))
+    assert "identical" in describe_prefix_change(prev, request_fingerprint(sys_a, [], [m("x"), m("y"), m("w")]))

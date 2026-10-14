@@ -7,6 +7,8 @@ Each method that changes state is idempotent via Store.commit_step keyed by a st
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from datetime import datetime
@@ -28,6 +30,26 @@ log = logging.getLogger("aoa.core")
 
 
 MISS_FRACTION = 0.9
+
+
+def request_fingerprint(system: list[dict[str, Any]], tools: list[dict[str, Any]], messages: list[dict[str, Any]]):
+    """(hash of tools+system, per-message hashes): enough to say what changed between two requests."""
+    h = lambda o: hashlib.sha256(json.dumps(o, sort_keys=True, default=str).encode()).hexdigest()[:10]  # noqa: E731
+    return h([tools, system]), [h(m) for m in messages]
+
+
+def describe_prefix_change(prev: tuple[str, list[str]] | None, cur: tuple[str, list[str]]) -> str:
+    """Why a cache miss happened, from our side: what differs from the previous request in this conversation."""
+    if prev is None:
+        return "no previous request in this worker process (restart?)"
+    if prev[0] != cur[0]:
+        return "tools/system changed since the previous request"
+    for i, (a, b) in enumerate(zip(prev[1], cur[1])):
+        if a != b:
+            return f"message {i} of {len(prev[1])} changed since the previous request"
+    if len(cur[1]) < len(prev[1]):
+        return "history shrank (compaction?)"
+    return "our request prefix is identical to the previous one, so the miss is not caused by our request"
 
 
 def is_cache_miss(prev: dict[str, Any] | None, usage: dict[str, int], ttl: float) -> bool:
@@ -62,6 +84,7 @@ class AgentCore:
         self._sandboxes: dict[str, Sandbox] = {}
         self._sandbox_factory = sandbox_factory or (lambda sid: LocalSandbox(settings.sandbox_dir, sid))
         self._clock = clock
+        self._fp: dict[str, tuple[str, list[str]]] = {}
 
     # ---- helpers -------------------------------------------------------------
     def now(self) -> datetime:
@@ -133,10 +156,13 @@ class AgentCore:
         )
         content = resp.content or [{"type": "text", "text": "(no output)"}]
         cache_miss = is_cache_miss(prev, resp.usage, self.s.cache_ttl_seconds)
+        fp = request_fingerprint(system, tools, messages)
         if cache_miss:
             log.warning("cache miss in %s within TTL (read %s of ~%s cached tokens): treat as a bug (prefix changed?)",
                     conv, resp.usage.get("cache_read_input_tokens", 0),
                     prev["cache_read"] + prev["cache_write"])
+            log.warning("cache miss cause in %s: %s", conv, describe_prefix_change(self._fp.get(conv), fp))
+        self._fp[conv] = fp
         result = {
             "content": content,
             "stop_reason": resp.stop_reason,
