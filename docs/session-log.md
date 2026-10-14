@@ -124,3 +124,4 @@ planned eval flywheel).
 - Test fix: `test_temporal_e2e._run` stopped the worker as soon as the first outbox item appeared, racing the rest of the turn (flaky on main with the file-backed Temporal); it now waits for the session workflow to finish.
 - Tests: 131 pass (decision table, report text, activities on a fake GitHub incl. retry-after-merge, server endpoint, bridge click/result, Temporal e2e of the whole merge).
 - **Bug found live (issue #14):** the bot's re-review of #13's fix commit hit `max_tokens` (4096) in its final answer; truncated JSON -> no verdict -> nothing posted. Default `AOA_MAX_TOKENS` raised to 16000; a cut-off final answer is now `stop=max_tokens`, marked by HelperWorkflow, and named on the review card.
+- Stage 2 deployed (launchd services restarted on bce7534). Live test: PR for issue #15 merged from the Slack [Merge] button.
