@@ -91,3 +91,7 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 - **The API token is reachable from the sandbox.** Merges and approvals are triggered through the local API with
   `AOA_API_TOKEN`, and a non-isolated sandbox command could read `.env`. The command reviewer stands between the
   model and that; real isolation (above) is the fix.
+- **Conflict resolution runs the repo's tests as your user.** After aoa resolves a PR's conflicts it runs the
+  repo's test command on this machine (allowlisted env, throwaway HOME, clone outside the data dir), which is
+  the repo's own code, as if you ran it. Only your own reviewed PRs get there, and the command comes from config
+  or the base branch, never the PR. Run it in a container before using this on code you do not trust.

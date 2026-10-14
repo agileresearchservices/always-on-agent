@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import secrets
+import tempfile
 import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -254,14 +256,18 @@ class AgentActivities:
         repo = gh.check_repo_in_scope(a["repo"])
         if not a["same_repo"]:
             return {"status": "failed", "action": "conflict", "reason": "the PR comes from a fork; resolve the conflicts there"}
-        workdir = self.s.data_dir / "resolve" / uuid.uuid4().hex[:12]
+        # outside the data dir: the tests are repo code, and nothing should sit next to .env or the store
+        workdir = Path(tempfile.gettempdir()) / "aoa-resolve" / uuid.uuid4().hex[:12]
+        mark = lambda sha, files: self.core.store.kv_set(  # noqa: E731
+            a["session"], f"{RESOLVED_KEY}{repo}#{a['number']}@{sha}", files)
         r = Resolver(repo=repo, sha=a["sha"], head_ref=a["head_ref"], base_ref=a["base_ref"], workdir=workdir,
                      remote_url=a.get("remote_url") or f"https://github.com/{repo}.git", token=token_provider(),
                      llm=self.core.llm, model=self.s.helper_model, max_tokens=self.s.max_tokens,
-                     on_usage=lambda m, u: self.core.store.usage_add(f"resolve/{repo}#{a['number']}", m, u))
+                     on_usage=lambda m, u: self.core.store.usage_add(f"resolve/{repo}#{a['number']}", m, u),
+                     on_commit=mark)
         out = await with_heartbeat(r.run(), activity.heartbeat)
-        if out["status"] == "resolved" and not out.get("already"):
-            self.core.store.kv_set(a["session"], f"{RESOLVED_KEY}{repo}#{a['number']}@{out['new_sha']}", out["files"])
+        if out["status"] == "resolved":
+            mark(out["new_sha"], out["files"])  # also on a retry that found its earlier push
         return out
 
     @activity.defn(name="merge_report")

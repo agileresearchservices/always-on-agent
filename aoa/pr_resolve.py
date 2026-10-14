@@ -6,7 +6,10 @@ the repo's tests, and push to the PR branch without force. The new commit is the
 its own Merge button, so no AI-written resolution reaches the base branch without a second human click.
 
 Secrets: the GitHub token reaches git only through GIT_CONFIG_* environment variables (never argv, the
-remote URL or .git/config). Tests run with an allowlisted environment that holds no token or key.
+remote URL or .git/config). Tests run with an allowlisted environment (no token or key) and a throwaway
+HOME, in a clone outside the data dir. That is not isolation: the tests are the repo's own code running as
+your user, exactly as if you ran them, so only the owner's own reviewed PRs ever reach this (see README).
+The test command comes from config or the BASE branch, so a PR cannot weaken its own gate.
 """
 from __future__ import annotations
 
@@ -49,6 +52,10 @@ Call submit_resolution exactly once with the whole file."""
 class ResolveError(Exception):
     """A reason to stop without pushing; the message is shown to the person."""
 
+    def __init__(self, msg: str, action: str = "resolve_failed"):
+        super().__init__(msg)
+        self.action = action
+
 
 def safe_env() -> dict[str, str]:
     """For running repo code (tests): no tokens, keys or other secrets from the worker's environment."""
@@ -66,18 +73,17 @@ def git_env(token: str | None) -> dict[str, str]:
     return env
 
 
-def repo_test_command(repo: str, root: Path) -> str | None:
-    """AOA_TEST_COMMANDS (JSON {repo: cmd}, "" = none) > the repo's .aoa/test-command > a Python default
-    when the repo looks like a Python project with tests > none."""
+def repo_test_command(repo: str, root: Path, base_file: str | None = None) -> str | None:
+    """AOA_TEST_COMMANDS (JSON {repo: cmd}, "" = none) > .aoa/test-command as it is on the base branch
+    (`base_file`) > a Python default when the repo looks like a Python project with tests > none."""
     try:
         overrides = json.loads(os.environ.get("AOA_TEST_COMMANDS") or "{}")
     except json.JSONDecodeError:
         overrides = {}
     if repo in overrides:
         return overrides[repo] or None
-    f = root / REPO_TEST_FILE
-    if f.is_file():
-        return f.read_text().strip() or None
+    if base_file is not None:
+        return base_file.strip() or None
     if ((root / "pyproject.toml").exists() or (root / "setup.py").exists()) and any(
             (root / d).is_dir() for d in ("tests", "test")):
         return PY_DEFAULT_TEST
@@ -85,21 +91,30 @@ def repo_test_command(repo: str, root: Path) -> str | None:
 
 
 async def _run(args: list[str], cwd: Path, env: dict[str, str], timeout: float, shell: bool = False) -> tuple[int, str]:
+    code, out = await _run_bytes(args, cwd, env, timeout, shell)
+    return code, out.decode(errors="replace")
+
+
+async def _run_bytes(args: list[str], cwd: Path, env: dict[str, str], timeout: float, shell: bool = False,
+                     merge_stderr: bool = True) -> tuple[int, bytes]:
+    err = asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.DEVNULL
     if shell:
         p = await asyncio.create_subprocess_shell(args[0], cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE,
-                                                  stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+                                                  stderr=err, start_new_session=True)
     else:
         p = await asyncio.create_subprocess_exec(*args, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE,
-                                                 stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+                                                 stderr=err, start_new_session=True)
     try:
         out, _ = await asyncio.wait_for(p.communicate(), timeout)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
         try:
-            os.killpg(p.pid, 9)
+            os.killpg(p.pid, 9)  # the whole process group: test runners spawn children
         except ProcessLookupError:
             pass
-        return -9, f"timed out after {timeout:.0f}s"
-    return p.returncode or 0, out.decode(errors="replace")
+        if isinstance(e, asyncio.CancelledError):
+            raise
+        return -9, f"timed out after {timeout:.0f}s".encode()
+    return p.returncode or 0, out
 
 
 class Resolver:
@@ -107,10 +122,12 @@ class Resolver:
 
     def __init__(self, *, repo: str, sha: str, head_ref: str, base_ref: str, workdir: Path, remote_url: str,
                  token: str | None, llm: Any, model: str, max_tokens: int,
-                 on_usage: Callable[[str, dict[str, int]], None] = lambda m, u: None):
+                 on_usage: Callable[[str, dict[str, int]], None] = lambda m, u: None,
+                 on_commit: Callable[[str, list[str]], None] = lambda sha, files: None):
         self.repo, self.sha, self.head_ref, self.base_ref = repo, sha, head_ref, base_ref
         self.dir, self.remote_url, self.genv = workdir / "clone", remote_url, git_env(token)
         self.workdir, self.llm, self.model, self.max_tokens, self.on_usage = workdir, llm, model, max_tokens, on_usage
+        self.on_commit = on_commit
 
     async def git(self, *args: str, check: bool = True) -> str:
         code, out = await _run(["git", *args], self.dir, self.genv, GIT_TIMEOUT)
@@ -122,7 +139,7 @@ class Resolver:
         try:
             return await self._run()
         except ResolveError as e:
-            return {"status": "failed", "action": "resolve_failed", "reason": str(e)[:500]}
+            return {"status": "failed", "action": e.action, "reason": str(e)[:500]}
         finally:
             shutil.rmtree(self.workdir, ignore_errors=True)
 
@@ -137,52 +154,81 @@ class Resolver:
             parent = (await self.git("rev-parse", "origin/head^1", check=False)).strip()
             msg = await self.git("log", "-1", "--format=%B", "origin/head")
             if parent == self.sha and COMMIT_TAG in msg:  # an earlier attempt pushed and then the worker died
-                return {"status": "resolved", "new_sha": tip, "files": [], "tests": "see the earlier attempt",
+                m = re.search(r"^Resolved files: (.*)$", msg, re.MULTILINE)
+                files = [f for f in (m.group(1).split(", ") if m else []) if f and f != "none"]
+                return {"status": "resolved", "new_sha": tip, "files": files, "tests": "see the earlier attempt",
                         "already": True}
-            raise ResolveError("the PR branch moved since the review; the new commit gets its own review")
+            raise ResolveError("the PR branch moved since the review; the new commit gets its own review", "stale")
         await self.git("checkout", "-q", "--detach", self.sha)
         code, out = await _run(["git", *BOT, "merge", "--no-ff", "--no-commit", "origin/base"], self.dir, self.genv, GIT_TIMEOUT)
-        files = [f for f in (await self.git("diff", "--name-only", "--diff-filter=U")).splitlines() if f]
+        unmerged = await self._unmerged()
+        files = list(unmerged)
         if code != 0 and not files:
             raise ResolveError(f"git merge failed: {out.strip()[-300:]}")
         if len(files) > MAX_FILES:
             raise ResolveError(f"{len(files)} conflicted files; more than {MAX_FILES} needs a human")
         summaries = {}
         for f in files:
-            summaries[f] = await self._resolve_file(f)
-        if (await self.git("diff", "--name-only", "--diff-filter=U")).strip():
+            summaries[f] = await self._resolve_file(f, unmerged[f])
+        if await self._unmerged():
             raise ResolveError("conflicts remain after resolving")
         resolved = ", ".join(files) or "none"
         await self.git(*BOT, "commit", "-q", "-m",
                        f"Merge {self.base_ref} into {self.head_ref}: {COMMIT_TAG}\n\nResolved files: {resolved}")
         new_sha = (await self.git("rev-parse", "HEAD")).strip()
         tests, tail = await self._tests()
-        push_code, push_out = await _run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{self.head_ref}"],
+        self.on_commit(new_sha, files)  # before the push, so the poll can never see the commit unmarked
+        push_code, push_out = await _run(["git", "push", "-q", "origin", f"{new_sha}:refs/heads/{self.head_ref}"],
                                          self.dir, self.genv, GIT_TIMEOUT)
         if push_code != 0:
             if "non-fast-forward" in push_out or "rejected" in push_out:
-                raise ResolveError("the PR branch moved while resolving; nothing was pushed")
+                raise ResolveError("the PR branch moved while resolving; nothing was pushed", "stale")
             raise ResolveError(f"push failed: {push_out.strip()[-300:]}")
         return {"status": "resolved", "new_sha": new_sha, "files": files, "summaries": summaries,
                 "tests": tests, "test_tail": tail}
 
-    async def _resolve_file(self, path: str) -> str:
+    async def _unmerged(self) -> dict[str, dict[int, str]]:
+        """Unmerged paths -> {stage: file mode}, NUL-separated so odd file names survive."""
+        code, out = await _run_bytes(["git", "ls-files", "-u", "-z"], self.dir, self.genv, GIT_TIMEOUT)
+        if code != 0:
+            raise ResolveError("git ls-files failed")
+        entries: dict[str, dict[int, str]] = {}
+        for rec in out.split(b"\0"):
+            if not rec:
+                continue
+            meta, _, path = rec.partition(b"\t")
+            mode, _sha, stage = meta.decode().split(" ")
+            entries.setdefault(path.decode("utf-8", errors="surrogateescape"), {})[int(stage)] = mode
+        return entries
+
+    async def _resolve_file(self, path: str, modes: dict[int, str]) -> str:
         if path.startswith(".github/workflows/"):
             raise ResolveError(f"{path} is a workflow file; resolving it needs a human")
-        stages = {}
+        if set(modes) != {1, 2, 3}:
+            raise ResolveError(f"{path}: a side added, deleted or renamed it; that needs a human")
+        if any(m not in ("100644", "100755") for m in modes.values()):
+            raise ResolveError(f"{path} is a symlink or submodule; that needs a human")
+        target = (self.dir / path).resolve()
+        if not target.is_relative_to(self.dir.resolve()) or target.is_symlink() or not target.is_file():
+            raise ResolveError(f"{path} is not a regular file in the clone; that needs a human")
+        blobs = {}
         for n, name in ((1, "base"), (2, "ours"), (3, "theirs")):
-            code, text = await _run(["git", "show", f":{n}:{path}"], self.dir, self.genv, GIT_TIMEOUT)
+            code, blob = await _run_bytes(["git", "show", f":{n}:{path}"], self.dir, self.genv, GIT_TIMEOUT,
+                                          merge_stderr=False)
             if code != 0:
-                raise ResolveError(f"{path}: a side deleted or renamed it; that needs a human")
-            stages[name] = text
-        raw = (self.dir / path).read_bytes()
-        if b"\0" in raw or any("\0" in t for t in stages.values()):
+                raise ResolveError(f"{path}: could not read the {name} version")
+            blobs[name] = blob
+        blobs["conflicted"] = target.read_bytes()
+        if any(b"\0" in b for b in blobs.values()):
             raise ResolveError(f"{path} is binary; that needs a human")
-        if max(len(raw), *(len(t.encode()) for t in stages.values())) > MAX_FILE_BYTES:
+        if max(len(b) for b in blobs.values()) > MAX_FILE_BYTES:
             raise ResolveError(f"{path} is larger than {MAX_FILE_BYTES // 1000} KB; that needs a human")
+        try:
+            texts = {k: b.decode("utf-8") for k, b in blobs.items()}
+        except UnicodeDecodeError:
+            raise ResolveError(f"{path} is not UTF-8; that needs a human") from None
         prompt = (f"Repository {self.repo}; pull request branch {self.head_ref} merging in {self.base_ref}.\n"
-                  f"File: {path}\n\n" + "".join(f"<{k}>\n{v}\n</{k}>\n\n" for k, v in stages.items())
-                  + f"<conflicted>\n{raw.decode(errors='replace')}\n</conflicted>")
+                  f"File: {path}\n\n" + "".join(f"<{k}>\n{v}\n</{k}>\n\n" for k, v in texts.items()))
         resp = await self._call_model(prompt)
         if resp.stop_reason == "max_tokens":
             raise ResolveError(f"{path}: the model's answer was cut off")
@@ -192,7 +238,7 @@ class Resolver:
             raise ResolveError(f"{path}: the model did not submit a resolution")
         if MARKER.search(content):
             raise ResolveError(f"{path}: the resolution still has conflict markers")
-        (self.dir / path).write_text(content)
+        target.write_bytes(content.encode("utf-8"))
         await self.git("add", "--", path)
         return str(call["input"].get("summary", ""))[:300]
 
@@ -213,10 +259,13 @@ class Resolver:
                 await asyncio.sleep(2 ** attempt * 2)
 
     async def _tests(self) -> tuple[str, str]:
-        cmd = repo_test_command(self.repo, self.dir)
+        code, base_file = await _run(["git", "show", f"origin/base:{REPO_TEST_FILE}"], self.dir, self.genv, GIT_TIMEOUT)
+        cmd = repo_test_command(self.repo, self.dir, base_file if code == 0 else None)
         if not cmd:
             return "none (no test command for this repo)", ""
-        code, out = await _run([cmd], self.dir, safe_env(), TEST_TIMEOUT, shell=True)
+        home = self.workdir / "home"
+        home.mkdir(exist_ok=True)
+        code, out = await _run([cmd], self.dir, safe_env() | {"HOME": str(home)}, TEST_TIMEOUT, shell=True)
         tail = out.strip()[-1200:]
         if code != 0:
             raise ResolveError(f"tests failed after resolving, so nothing was pushed. Last output: {tail[-500:]}")
@@ -235,3 +284,7 @@ async def with_heartbeat(coro: Awaitable[Any], beat: Callable[[], None], every: 
         return await coro
     finally:
         t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass

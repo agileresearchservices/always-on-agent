@@ -43,10 +43,11 @@ def remote(tmp_path, monkeypatch):
     return origin, git(seed, "rev-parse", "feat"), seed
 
 
-def resolver(tmp_path, remote, llm, sha=None, test_cmd="true"):
+def resolver(tmp_path, remote, llm, sha=None, marks=None):
     origin, feat_sha, _ = remote
     return Resolver(repo=REPO, sha=sha or feat_sha, head_ref="feat", base_ref="main", workdir=tmp_path / "work",
-                    remote_url=str(origin), token=None, llm=llm, model="m", max_tokens=1000)
+                    remote_url=str(origin), token=None, llm=llm, model="m", max_tokens=1000,
+                    on_commit=lambda sha, files: (marks if marks is not None else []).append((sha, files)))
 
 
 def resolution(content="a = 0\nx = 2  # feat\nx3 = 3  # main\nz = 9\n"):
@@ -67,9 +68,10 @@ async def test_resolves_commits_tests_and_pushes_on_top_of_the_reviewed_commit(t
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
     # the test run must see no token or key from the worker's environment
     tests_cmd("test -f app.py && ! env | grep -i -E 'token|key'")
-    llm = FakeLLM([resolution()])
-    out = await resolver(tmp_path, remote, llm).run()
+    llm, marks = FakeLLM([resolution()]), []
+    out = await resolver(tmp_path, remote, llm, marks=marks).run()
     assert out["status"] == "resolved", out
+    assert marks == [(out["new_sha"], ["app.py"])]  # marked for the reviewer (before the push)
     assert out["files"] == ["app.py"] and out["tests"].startswith("passed")
     assert git(origin, "rev-parse", "feat") == out["new_sha"]
     assert git(origin, "rev-parse", "feat^1") == sha  # pinned: the merge sits on the reviewed commit
@@ -121,9 +123,10 @@ async def test_moved_branch_is_stale_and_a_retry_after_push_is_recognised(tmp_pa
     assert first["status"] == "resolved"
     again = await resolver(tmp_path, remote, FakeLLM([])).run()  # e.g. the worker died after pushing
     assert again["status"] == "resolved" and again["already"] and again["new_sha"] == first["new_sha"]
+    assert again["files"] == ["app.py"]  # recovered from the commit message, so the reviewer is still told
     old = git(origin, "rev-parse", f"{sha}^")
     stale = await resolver(tmp_path, remote, FakeLLM([]), sha=old).run()
-    assert stale["status"] == "failed" and "moved" in stale["reason"]
+    assert stale["status"] == "failed" and "moved" in stale["reason"] and stale["action"] == "stale"
 
 
 def test_token_only_in_git_config_env(monkeypatch):
@@ -141,7 +144,50 @@ def test_test_command_precedence(tmp_path, monkeypatch):
     (tmp_path / "tests").mkdir()
     assert "pytest" in repo_test_command(REPO, tmp_path)
     (tmp_path / ".aoa").mkdir()
-    (tmp_path / ".aoa" / "test-command").write_text("make test\n")
-    assert repo_test_command(REPO, tmp_path) == "make test"
+    (tmp_path / ".aoa" / "test-command").write_text("true\n")  # in the merged tree: ignored
+    assert "pytest" in repo_test_command(REPO, tmp_path)
+    assert repo_test_command(REPO, tmp_path, base_file="make test\n") == "make test"
     monkeypatch.setenv("AOA_TEST_COMMANDS", json.dumps({REPO: ""}))
-    assert repo_test_command(REPO, tmp_path) is None
+    assert repo_test_command(REPO, tmp_path, base_file="make test") is None
+
+
+async def test_a_pr_cannot_choose_its_own_test_command(tmp_path, remote, monkeypatch):
+    origin, _, seed = remote
+    monkeypatch.delenv("AOA_TEST_COMMANDS")
+    git(seed, "checkout", "-q", "main")
+    (seed / ".aoa").mkdir()
+    (seed / ".aoa" / "test-command").write_text("echo base-gate; exit 1\n")
+    git(seed, "add", ".")
+    git(seed, "commit", "-qm", "gate")
+    git(seed, "push", "-q", "origin", "main")
+    out = await resolver(tmp_path, remote, FakeLLM([resolution()])).run()
+    assert out["status"] == "failed" and "base-gate" in out["reason"]  # the base branch's gate applies
+
+
+async def test_symlink_and_non_utf8_conflicts_need_a_human(tmp_path, remote):
+    origin, _, seed = remote
+    for name, base, ours, theirs, why in (("link", None, "a", "b", "symlink"),
+                                          ("latin.txt", b"x\n", b"caf\xe9 1\n", b"caf\xe9 2\n", "not UTF-8")):
+        git(seed, "checkout", "-q", "main")
+        git(seed, "checkout", "-q", "-B", f"t-{name}")
+        p = seed / name
+        if base is None:
+            p.symlink_to("base-target")
+        else:
+            p.write_bytes(base)
+        git(seed, "add", ".")
+        git(seed, "commit", "-qm", "base")
+        git(seed, "checkout", "-q", "-B", f"h-{name}")
+        p.unlink()
+        p.symlink_to(ours) if base is None else p.write_bytes(ours)
+        git(seed, "commit", "-qam", "ours")
+        git(seed, "checkout", "-q", f"t-{name}")
+        p.unlink()
+        p.symlink_to(theirs) if base is None else p.write_bytes(theirs)
+        git(seed, "commit", "-qam", "theirs")
+        git(seed, "push", "-q", "origin", f"t-{name}", f"h-{name}")
+        r = Resolver(repo=REPO, sha=git(seed, "rev-parse", f"h-{name}"), head_ref=f"h-{name}", base_ref=f"t-{name}",
+                     workdir=tmp_path / f"w-{name}", remote_url=str(origin), token=None, llm=FakeLLM([]),
+                     model="m", max_tokens=1000)
+        out = await r.run()
+        assert out["status"] == "failed" and why in out["reason"], (name, out)
