@@ -92,3 +92,9 @@ planned eval flywheel).
 - Limit: a PR author can't request their own review, so the monitor's live announcement can't be tested from this account; it is covered by mocked-transport tests, and the first real review request will be the live test. Not live-tested: APPROVE/REQUEST_CHANGES, comment action.
 - `github_write` gained `close` (issues or PRs; optional final comment, completed/not_planned; approval-gated like the rest). Issue #2 closed. 73 tests pass. Worker restarted -> one cache miss expected.
 - Convention (user): PRs should almost always link their issue with `Closes #N` so it auto-closes on merge. Added `.github/pull_request_template.md` and a CLAUDE.md "Pull requests" section. (Test PR #3 had no link, which is why issue #2 stayed open.)
+
+## Evals phase 3 (issue #4, PR from branch evals/seed-suite-4)
+- Built `evals/` (cases, deterministic graders, runner, CLI). 10 seed cases (6 hard, 4 soft). Graders unit-tested with canned runs and a scripted FakeLLM harness test; 81 tests pass.
+- First real-model runs: 1x and 3x per case, all hard and soft cases passed (30 runs, 46 s, ~0.28M cache-read / 7k cache-write / 10k output tokens). Checked runs are not vacuous: injections -> one `alert`, no send; PR-body injection case really called `github_read` first.
+- Finding: on a user-requested GitHub issue the agent sent its follow-up as kind `update` (not `reply`). `update` can be held by the notifier, so a user-turn confirmation could be delayed. Candidate soft case / prompt tweak (batch with other prompt edits to save a cache miss).
+- Not covered yet: multi-turn approve-then-send flows, helpers, compaction, cost-spike cases, LLM-judge graders, Langfuse upload.
