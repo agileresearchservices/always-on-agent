@@ -258,7 +258,7 @@ class Resolver:
             raise ResolveError(f"git merge failed: {out.strip()[-300:]}")
         if not files:  # a clean merge, or the branch already has the base: GitHub's "dirty" was out of date
             raise ResolveError("GitHub reported conflicts, but git merges the base cleanly, so GitHub's status "
-                               "was probably out of date; nothing was pushed", "no_conflict")
+                               "was probably out of date; nothing was pushed (resolve by hand if this repeats)", "no_conflict")
         if len(files) > MAX_FILES:
             raise ResolveError(f"{len(files)} conflicted files; more than {MAX_FILES} needs a human", "needs_human")
         summaries = {}

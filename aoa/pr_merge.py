@@ -25,17 +25,18 @@ def check_summary(status: dict[str, Any], check_runs: dict[str, Any]) -> tuple[l
     """(failing, pending) check names for a commit, from the combined commit status and the check runs.
 
     The combined status reports "pending" when a commit has no statuses at all, so it only counts when
-    total_count > 0. A repo with no CI has neither, and nothing is failing or pending."""
+    total_count > 0. A repo with no CI has neither, and nothing is failing or pending. Names are raw: they
+    are escaped once, when report_text renders the reason."""
     failing, pending = [], []
     if status.get("total_count", 0) > 0:
         for s in status.get("statuses") or []:
-            name = slack_safe(str(s.get("context", "status")))[:80]
+            name = str(s.get("context", "status"))[:80]
             if s.get("state") in ("failure", "error"):
                 failing.append(name)
             elif s.get("state") == "pending":
                 pending.append(name)
     for c in check_runs.get("check_runs") or []:
-        name = slack_safe(str(c.get("name", "check")))[:80]
+        name = str(c.get("name", "check"))[:80]
         if c.get("status") != "completed":
             pending.append(name)
         elif c.get("conclusion") in FAILED_CONCLUSIONS:

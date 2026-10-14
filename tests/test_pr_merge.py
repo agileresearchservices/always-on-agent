@@ -317,3 +317,10 @@ async def test_resolve_refuses_while_auto_merge_is_on(acts, monkeypatch):
                                         "protected_refs": ["main"]})
     assert out["action"] == "auto_merge" and "auto-merge is on" in out["reason"]
     assert [c[0] for c in fake.calls] == ["GET"]  # stopped before cloning anything
+
+
+def test_check_names_are_escaped_exactly_once():
+    failing, _ = check_summary({}, {"check_runs": [{"name": "Lint & Test", "status": "completed", "conclusion": "failure"}]})
+    action, reason = decide(ghpr(), SHA, failing, [])
+    t = report_text(OFFER, {"status": "failed", "action": action, "reason": reason})
+    assert "Lint &amp; Test" in t and "&amp;amp;" not in t
