@@ -37,6 +37,14 @@ The API server refuses to start unless `AOA_API_TOKEN` and `AOA_WEBHOOK_SECRET` 
 `AOA_ALLOW_INSECURE=1` to bypass that for local development only. For a real deployment you also need a
 production Temporal (not `start-dev`) and a persistent, absolute `AOA_DATA_DIR`.
 
+## Running it as services (macOS)
+
+`deploy/install-launchd.sh install` writes four launchd user agents (`com.aoa.temporal`, `worker`, `server`,
+`slack-bridge`) that start at login and restart on failure, reading `.env` through `deploy/run.sh`. Logs go to
+`<AOA_DATA_DIR>/logs/`. Temporal runs `start-dev` with a file database (`<AOA_DATA_DIR>/temporal.db`) so
+workflows and schedules survive restarts; it is still a dev server, not a production cluster. Stop any
+hand-started aoa processes first (they hold ports 7233 and 8000). `status` and `uninstall` subcommands exist.
+
 ## Slack client
 
 `python -m aoa.slack_bridge` (needs `pip install -e '.[slack]'`) connects a private Slack channel to a
