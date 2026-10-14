@@ -254,8 +254,9 @@ class AgentActivities:
         """Merge the base into the reviewed commit in a throwaway clone, let a model resolve the conflicted
         files, run the repo's tests and push (no force). Long-running: heartbeats while it works."""
         repo = gh.check_repo_in_scope(a["repo"])
-        if not a["same_repo"]:
-            return {"status": "failed", "action": "conflict", "reason": "the PR comes from a fork; resolve the conflicts there"}
+        if not a["same_repo"] or a["head_ref"] in a.get("protected_refs", []):
+            return {"status": "failed", "action": "needs_human",
+                    "reason": "the PR comes from a fork or its head is a base/default branch; resolve the conflicts by hand"}
         # outside the data dir: the tests are repo code, and nothing should sit next to .env or the store
         workdir = Path(tempfile.gettempdir()) / "aoa-resolve" / uuid.uuid4().hex[:12]
         mark = lambda sha, files: self.core.store.kv_set(  # noqa: E731
@@ -263,6 +264,7 @@ class AgentActivities:
         r = Resolver(repo=repo, sha=a["sha"], head_ref=a["head_ref"], base_ref=a["base_ref"], workdir=workdir,
                      remote_url=a.get("remote_url") or f"https://github.com/{repo}.git", token=token_provider(),
                      llm=self.core.llm, model=self.s.helper_model, max_tokens=self.s.max_tokens,
+                     protected_refs=tuple(a.get("protected_refs", [])),
                      on_usage=lambda m, u: self.core.store.usage_add(f"resolve/{repo}#{a['number']}", m, u),
                      on_commit=mark)
         out = await with_heartbeat(r.run(), activity.heartbeat)

@@ -339,7 +339,8 @@ class MergePrWorkflow:
                     "resolve_conflicts",
                     {"session": inp["session"], "repo": pr["repo"], "number": pr["number"], "sha": pr["sha"],
                      "head_ref": st["head_ref"],
-                     "base_ref": st["base_ref"], "same_repo": st["same_repo"]},
+                     "base_ref": st["base_ref"], "same_repo": st["same_repo"],
+                     "protected_refs": st.get("protected_refs", [])},
                     start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
                     retry_policy=RetryPolicy(maximum_attempts=2, non_retryable_error_types=["GithubError"]),
                 )

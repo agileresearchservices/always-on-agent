@@ -17,7 +17,7 @@ RESOLVED_KEY = "aoa-resolved:"  # kv: aoa-resolved:<repo>#<n>@<sha> -> files aoa
 
 FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
 # outcomes after which clicking Merge again on the same card can succeed (same commit, state may change)
-RETRYABLE = {"checks_failed", "waited_too_long", "blocked", "draft", "error", "refused", "resolve_failed"}
+RETRYABLE = {"checks_failed", "waited_too_long", "blocked", "draft", "error", "refused", "resolve_failed"}  # not needs_human / stale
 
 
 def check_summary(status: dict[str, Any], check_runs: dict[str, Any]) -> tuple[list[str], list[str]]:

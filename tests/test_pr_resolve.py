@@ -114,7 +114,7 @@ async def test_modify_delete_conflict_needs_a_human(tmp_path, remote):
     git(seed, "push", "-q", "origin", "main")
     llm = FakeLLM([])
     out = await resolver(tmp_path, remote, llm).run()
-    assert out["status"] == "failed" and "needs a human" in out["reason"] and not llm.calls
+    assert out["action"] == "needs_human" and "needs a human" in out["reason"] and not llm.calls
 
 
 async def test_moved_branch_is_stale_and_a_retry_after_push_is_recognised(tmp_path, remote):
@@ -191,3 +191,14 @@ async def test_symlink_and_non_utf8_conflicts_need_a_human(tmp_path, remote):
                      model="m", max_tokens=1000)
         out = await r.run()
         assert out["status"] == "failed" and why in out["reason"], (name, out)
+
+
+async def test_never_pushes_onto_a_protected_head_and_rejects_gutted_resolutions(tmp_path, remote):
+    origin, sha, _ = remote
+    r = resolver(tmp_path, remote, FakeLLM([]))
+    r.protected_refs.add("feat")
+    out = await r.run()
+    assert out["action"] == "needs_human" and "base or default branch" in out["reason"]
+    out = await resolver(tmp_path, remote, FakeLLM([resolution("x\n")])).run()
+    assert out["status"] == "failed" and "much shorter" in out["reason"]
+    assert git(origin, "rev-parse", "feat") == sha

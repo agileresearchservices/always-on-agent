@@ -124,13 +124,14 @@ class Resolver:
     """One resolution attempt in its own work directory (deleted afterwards)."""
 
     def __init__(self, *, repo: str, sha: str, head_ref: str, base_ref: str, workdir: Path, remote_url: str,
-                 token: str | None, llm: Any, model: str, max_tokens: int,
+                 token: str | None, llm: Any, model: str, max_tokens: int, protected_refs: tuple[str, ...] = (),
                  on_usage: Callable[[str, dict[str, int]], None] = lambda m, u: None,
                  on_commit: Callable[[str, list[str]], None] = lambda sha, files: None):
         self.repo, self.sha, self.head_ref, self.base_ref = repo, sha, head_ref, base_ref
         self.dir, self.remote_url, self.genv = workdir / "clone", remote_url, git_env(token, workdir / "home")
         self.workdir, self.llm, self.model, self.max_tokens, self.on_usage = workdir, llm, model, max_tokens, on_usage
         self.on_commit = on_commit
+        self.protected_refs = {base_ref, *protected_refs}
 
     async def git(self, *args: str, check: bool = True) -> str:
         code, out = await _run(["git", *args], self.dir, self.genv, GIT_TIMEOUT)
@@ -147,6 +148,9 @@ class Resolver:
             shutil.rmtree(self.workdir, ignore_errors=True)
 
     async def _run(self) -> dict[str, Any]:
+        if self.head_ref in self.protected_refs:  # never push a model-written merge onto a base/default branch
+            raise ResolveError(f"the PR's head branch {self.head_ref} is a base or default branch; that needs a human",
+                               "needs_human")
         self.dir.mkdir(parents=True, exist_ok=True)
         await self.git("init", "-q")
         await self.git("remote", "add", "origin", self.remote_url)
@@ -169,7 +173,7 @@ class Resolver:
         if code != 0 and not files:
             raise ResolveError(f"git merge failed: {out.strip()[-300:]}")
         if len(files) > MAX_FILES:
-            raise ResolveError(f"{len(files)} conflicted files; more than {MAX_FILES} needs a human")
+            raise ResolveError(f"{len(files)} conflicted files; more than {MAX_FILES} needs a human", "needs_human")
         summaries = {}
         for f in files:
             summaries[f] = await self._resolve_file(f, unmerged[f])
@@ -206,14 +210,14 @@ class Resolver:
 
     async def _resolve_file(self, path: str, modes: dict[int, str]) -> str:
         if path.startswith(".github/workflows/"):
-            raise ResolveError(f"{path} is a workflow file; resolving it needs a human")
+            raise ResolveError(f"{path} is a workflow file; resolving it needs a human", "needs_human")
         if set(modes) != {1, 2, 3}:
-            raise ResolveError(f"{path}: a side added, deleted or renamed it; that needs a human")
+            raise ResolveError(f"{path}: a side added, deleted or renamed it; that needs a human", "needs_human")
         if any(m not in ("100644", "100755") for m in modes.values()):
-            raise ResolveError(f"{path} is a symlink or submodule; that needs a human")
+            raise ResolveError(f"{path} is a symlink or submodule; that needs a human", "needs_human")
         target = (self.dir / path).resolve()
         if not target.is_relative_to(self.dir.resolve()) or target.is_symlink() or not target.is_file():
-            raise ResolveError(f"{path} is not a regular file in the clone; that needs a human")
+            raise ResolveError(f"{path} is not a regular file in the clone; that needs a human", "needs_human")
         blobs = {}
         for n, name in ((1, "base"), (2, "ours"), (3, "theirs")):
             code, blob = await _run_bytes(["git", "show", f":{n}:{path}"], self.dir, self.genv, GIT_TIMEOUT,
@@ -223,13 +227,13 @@ class Resolver:
             blobs[name] = blob
         blobs["conflicted"] = target.read_bytes()
         if any(b"\0" in b for b in blobs.values()):
-            raise ResolveError(f"{path} is binary; that needs a human")
+            raise ResolveError(f"{path} is binary; that needs a human", "needs_human")
         if max(len(b) for b in blobs.values()) > MAX_FILE_BYTES:
-            raise ResolveError(f"{path} is larger than {MAX_FILE_BYTES // 1000} KB; that needs a human")
+            raise ResolveError(f"{path} is larger than {MAX_FILE_BYTES // 1000} KB; that needs a human", "needs_human")
         try:
             texts = {k: b.decode("utf-8") for k, b in blobs.items()}
         except UnicodeDecodeError:
-            raise ResolveError(f"{path} is not UTF-8; that needs a human") from None
+            raise ResolveError(f"{path} is not UTF-8; that needs a human", "needs_human") from None
         prompt = (f"Repository {self.repo}; pull request branch {self.head_ref} merging in {self.base_ref}.\n"
                   f"File: {path}\n\n" + "".join(f"<{k}>\n{v}\n</{k}>\n\n" for k, v in texts.items()))
         resp = await self._call_model(prompt)
@@ -241,6 +245,8 @@ class Resolver:
             raise ResolveError(f"{path}: the model did not submit a resolution")
         if MARKER.search(content):
             raise ResolveError(f"{path}: the resolution still has conflict markers")
+        if len(content.strip()) < 0.5 * min(len(texts["ours"].strip()), len(texts["theirs"].strip())):
+            raise ResolveError(f"{path}: the resolution is much shorter than either side, so it was not trusted")
         target.write_bytes(content.encode("utf-8"))
         await self.git("add", "--", path)
         return str(call["input"].get("summary", ""))[:300]
