@@ -335,8 +335,17 @@ async def h_github_write(ctx: ToolContext, a: dict[str, Any]) -> str:
         if act == "review":
             action["review_event"] = event
         card = f"{event if act == 'review' else 'Comment'} on {repo}#{a['number']}?\n\n{a['body']}"
+    elif act == "close":
+        if not a.get("number"):
+            raise ToolError("close needs number")
+        reason = a.get("close_reason", "completed")
+        if reason not in ("completed", "not_planned"):
+            raise ToolError("close_reason must be completed or not_planned")
+        action = {"tool": "github_write", "action": act, "repo": repo, "number": int(a["number"]),
+                  "body": a.get("body", ""), "close_reason": reason}
+        card = f"Close {repo}#{a['number']} as {reason}?" + (f"\n\nWith comment:\n{a['body']}" if a.get("body") else "")
     else:
-        raise ToolError("action must be create_issue, comment or review")
+        raise ToolError("action must be create_issue, comment, review or close")
     held = await _approval_gate(ctx, action, a.get("approval_id"), card, "posted")
     if held:
         return held
@@ -345,6 +354,11 @@ async def h_github_write(ctx: ToolContext, a: dict[str, Any]) -> str:
             r = await gh.gh_call("POST", f"/repos/{repo}/issues", {"title": action["title"], "body": action["body"]})
         elif act == "comment":
             r = await gh.gh_call("POST", f"/repos/{repo}/issues/{action['number']}/comments", {"body": action["body"]})
+        elif act == "close":
+            if action["body"]:
+                await gh.gh_call("POST", f"/repos/{repo}/issues/{action['number']}/comments", {"body": action["body"]})
+            r = await gh.gh_call("PATCH", f"/repos/{repo}/issues/{action['number']}",
+                                 {"state": "closed", "state_reason": action["close_reason"]})
         else:
             r = await gh.gh_call("POST", f"/repos/{repo}/pulls/{action['number']}/reviews",
                                  {"body": action["body"], "event": action["review_event"]})
@@ -455,13 +469,15 @@ def _tools() -> list[ToolSpec]:
         ),
         ToolSpec(
             "github_write",
-            "Create an issue, comment, or submit a PR review (COMMENT/APPROVE/REQUEST_CHANGES) on the person's own "
+            "Create an issue, comment, close an issue or PR (optionally with a final comment), or submit a PR review "
+            "(COMMENT/APPROVE/REQUEST_CHANGES) on the person's own "
             "GitHub repos. Needs approval: the first call files a card showing exactly what will be posted; call "
             "again with the approval_id once they approve.",
-            _obj({"action": {"type": "string", "enum": ["create_issue", "comment", "review"]},
+            _obj({"action": {"type": "string", "enum": ["create_issue", "comment", "review", "close"]},
                   "repo": {"type": "string", "description": "owner/name"}, "number": {"type": "integer"},
                   "title": {"type": "string"}, "body": {"type": "string"},
                   "review_event": {"type": "string", "enum": ["COMMENT", "APPROVE", "REQUEST_CHANGES"]},
+                  "close_reason": {"type": "string", "enum": ["completed", "not_planned"]},
                   "approval_id": {"type": "string"}}, ["action", "repo"]),
             h_github_write, core=False, helper_ok=False, irreversible=True,
             tags=["github", "issue", "pr", "pull request", "review", "comment", "post"],

@@ -192,3 +192,31 @@ async def test_github_write_scope_approval_and_post(make_core, monkeypatch):
     assert calls == [("POST", "/repos/agileresearchservices/demo/issues", {"title": "Bug", "body": "details"})]
     with pytest.raises(ToolError, match="review_event"):
         await h(ctx, {"action": "review", "repo": "agileresearchservices/demo", "number": 2, "body": "b", "review_event": "MERGE"})
+
+
+async def test_github_write_close_posts_comment_then_closes(make_core, monkeypatch):
+    import httpx
+    import pytest
+    from aoa.tools import REGISTRY, ToolError
+
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    calls = []
+
+    async def fake(method, path, json=None, accept=""):
+        calls.append((method, path, json))
+        return httpx.Response(200, json={"html_url": "https://github.com/x/y/issues/2"})
+
+    monkeypatch.setattr("aoa.github_monitor.gh_call", fake)
+    core, _ = make_core([text("ok")])
+    ctx = core._ctx("main", "main", "main", 0, True)
+    h = REGISTRY["github_write"].handler
+    args = {"action": "close", "repo": "agileresearchservices/demo", "number": 2, "body": "done", "close_reason": "not_planned"}
+    assert "approval requested" in await h(ctx, args)
+    card = core.store.outbox_since("main")[0]["payload"]
+    assert "not_planned" in card["text"] and "done" in card["text"] and calls == []
+    core.store.approval_resolve(card["approval_id"], True)
+    assert "done" in await h(ctx, {**args, "approval_id": card["approval_id"]})
+    assert calls == [("POST", "/repos/agileresearchservices/demo/issues/2/comments", {"body": "done"}),
+                     ("PATCH", "/repos/agileresearchservices/demo/issues/2", {"state": "closed", "state_reason": "not_planned"})]
+    with pytest.raises(ToolError, match="close_reason"):
+        await h(ctx, {**args, "close_reason": "whatever"})
