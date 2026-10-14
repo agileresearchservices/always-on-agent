@@ -75,6 +75,22 @@ def test_report_failure_offers_retry_only_when_it_can_help():
     assert "try again" not in report_text(OFFER, {"status": "failed", "action": "stale", "reason": "new commits"})
 
 
+def test_report_resolved_lists_files_tests_and_next_step():
+    out = {"status": "resolved", "new_sha": "1234567890", "files": ["app.py"], "summaries": {"app.py": "kept both"},
+           "tests": "passed (`pytest`)"}
+    t = report_text(OFFER, out)
+    assert "Resolved merge conflicts" in t and "`1234567`" in t and "not merged" in t
+    assert "app.py" in t and "kept both" in t and "Tests: passed" in t and "new card" in t
+
+
+def test_reviewer_is_told_about_an_aoa_resolution():
+    from aoa.pr_review import build_task
+
+    pr = {"repo": OFFER["repo"], "number": 7, "sha": SHA}
+    assert "resolved by a model" not in build_task(pr)
+    assert "resolved by a model (files: app.py)" in build_task(pr | {"resolved_files": ["app.py"]})
+
+
 def test_report_escapes_titles():
     t = report_text(OFFER | {"title": "<!channel> *boom*"}, {"status": "updated"})
     assert "<!channel>" not in t and "*boom*" not in t

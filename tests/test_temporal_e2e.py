@@ -204,3 +204,49 @@ async def test_merge_workflow_waits_for_checks_merges_and_closes_out(client, env
     (item,) = store.outbox_since(sid)
     assert item["kind"] == "pr_merge" and item["payload"]["card_ts"] == "9.9" and not item["payload"]["retry"]
     assert "Merged" in item["payload"]["text"] and "demo#3 closed" in item["payload"]["text"]
+
+
+async def test_merge_workflow_with_conflicts_resolves_and_marks_the_new_commit(client, env, monkeypatch):
+    """Conflict -> resolve_conflicts (resolver faked; the git side is tested in test_pr_resolve.py) -> report
+    'resolved' with no retry, and the new commit is marked so its review is told about the resolution."""
+    import httpx
+
+    from aoa import activities, github_monitor
+
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    monkeypatch.setenv("GITHUB_TOKEN", "fake")
+    sid, sha, repo = f"t-{uuid.uuid4().hex[:6]}", "abc123def4567890", "agileresearchservices/demo"
+    offer = {"repo": repo, "number": 7, "sha": sha, "title": "Tidy", "url": "https://github.com/x/pull/7",
+             "verdict": "approve", "card_text": "card"}
+    pr = {"state": "open", "merged": False, "draft": False, "mergeable": False, "mergeable_state": "dirty",
+          "title": "Tidy", "head": {"sha": sha, "ref": "feat/x", "repo": {"full_name": repo}},
+          "base": {"ref": "main", "repo": {"full_name": repo, "default_branch": "main"}}}
+
+    async def fake_gh(method, path, json=None, accept=""):
+        assert method == "GET", (method, path)  # nothing is merged or deleted
+        body = {"check_runs": []} if "check-runs" in path else {"total_count": 0} if path.endswith("/status") else pr
+        return httpx.Response(200, json=body)
+
+    seen = {}
+
+    class FakeResolver:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        async def run(self):
+            return {"status": "resolved", "new_sha": "n3wsha0000", "files": ["app.py"], "summaries": {}, "tests": "passed"}
+
+    monkeypatch.setattr(github_monitor, "gh_call", fake_gh)
+    monkeypatch.setattr(activities, "Resolver", FakeResolver)
+    store = Store(env.db_path)
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), FakeLLM([]), TemporalScheduler(client, env))
+    async with await build_worker(env, client, core):
+        out = await client.execute_workflow(
+            "MergePrWorkflow", {"session": sid, "offer_id": "mrg-0123456789ab", "offer": offer, "card_ts": "9.9"},
+            id=f"merge-{sid}", task_queue=env.task_queue,
+        )
+    assert out["status"] == "resolved" and seen["sha"] == sha and seen["head_ref"] == "feat/x" and seen["base_ref"] == "main"
+    assert seen["token"] == "fake" and seen["remote_url"] == f"https://github.com/{repo}.git"
+    assert store.kv_get(sid, f"aoa-resolved:{repo}#7@n3wsha0000") == ["app.py"]
+    (item,) = store.outbox_since(sid)
+    assert item["payload"]["status"] == "resolved" and not item["payload"]["retry"]
