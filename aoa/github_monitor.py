@@ -82,3 +82,33 @@ async def poll_once(http: httpx.AsyncClient, store: Store, session: str, user: s
     # forget PRs no longer awaiting review, so a closed-then-reopened request can be announced again
     store.kv_set(session, SEEN_KEY, sorted((seen & current) | {pr_key(p) for p in new}))
     return [pr_event(p) for p in new]
+
+
+# ---- agent tools (github_read / github_write) ---------------------------------------------------
+def owner_user() -> str:
+    u = os.environ.get("AOA_GITHUB_USER")
+    if not u:
+        raise GithubError("AOA_GITHUB_USER is not set")
+    return u
+
+
+def check_repo_in_scope(repo: str) -> str:
+    """Only repos owned by the configured user; org/client repos the token can see are off limits."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo or ""):
+        raise GithubError(f"'{repo}' is not an owner/name repo")
+    if repo.split("/")[0].lower() != owner_user().lower():
+        raise GithubError(f"{repo} is outside the allowed scope (only {owner_user()}/* repos)")
+    return repo
+
+
+async def gh_call(method: str, path: str, json: Any = None, accept: str = "application/vnd.github+json") -> httpx.Response:
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.request(
+            method, f"{API}{path}", json=json,
+            headers={"Authorization": f"Bearer {token_provider()}", "Accept": accept,
+                     "X-GitHub-Api-Version": "2022-11-28"},
+        )
+    if r.status_code in (401, 403, 404):
+        raise GithubError(f"GitHub returned {r.status_code} for {method} {path}: check the repo name and token permissions")
+    r.raise_for_status()
+    return r

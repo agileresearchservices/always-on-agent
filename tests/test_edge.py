@@ -160,3 +160,35 @@ async def test_routine_turn_can_still_reply_and_a_user_turn_can_ask_to_create(ma
                                 arguments={"name": "d", "cron": "0 13 * * *", "prompt": "p"})], text("ok")])
     await handle_events(core2, "main2", [usr_event("schedule it")])
     assert [o["kind"] for o in core2.store.outbox_since("main2")] == ["approval"]  # reaches the approval step
+
+
+async def test_github_write_scope_approval_and_post(make_core, monkeypatch):
+    import httpx
+    import pytest
+    from aoa.tools import REGISTRY, ToolError
+
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    calls = []
+
+    async def fake(method, path, json=None, accept=""):
+        calls.append((method, path, json))
+        return httpx.Response(201, json={"html_url": "https://github.com/x/y/issues/9"})
+
+    monkeypatch.setattr("aoa.github_monitor.gh_call", fake)
+    core, _ = make_core([[tool("tool_search", query="github")], text("ok")])
+    ctx = core._ctx("main", "main", "main", 0, True)
+    h = REGISTRY["github_write"].handler
+    with pytest.raises(ToolError, match="outside the allowed scope"):  # client repo: no card is even filed
+        await h(ctx, {"action": "comment", "repo": "nasuni/hyrule", "number": 1, "body": "x"})
+    assert core.store.outbox_since("main") == []
+    args = {"action": "create_issue", "repo": "agileresearchservices/demo", "title": "Bug", "body": "details"}
+    assert "approval requested" in await h(ctx, args)
+    aid = core.store.outbox_since("main")[0]["payload"]["approval_id"]
+    assert calls == []
+    with pytest.raises(ToolError):  # a changed title cannot ride on the approval
+        await h(ctx, {**args, "title": "Other", "approval_id": aid})
+    core.store.approval_resolve(aid, True)
+    assert "done" in await h(ctx, {**args, "approval_id": aid})
+    assert calls == [("POST", "/repos/agileresearchservices/demo/issues", {"title": "Bug", "body": "details"})]
+    with pytest.raises(ToolError, match="review_event"):
+        await h(ctx, {"action": "review", "repo": "agileresearchservices/demo", "number": 2, "body": "b", "review_event": "MERGE"})
