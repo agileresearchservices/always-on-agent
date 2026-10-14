@@ -207,7 +207,11 @@ class Bridge:
         if offer_id in self._merging:
             return
         self._merging.add(offer_id)
-        r = await self.http.post(f"/sessions/{self.cfg.session}/merges/{offer_id}", json={"card_ts": ts})
+        try:
+            r = await self.http.post(f"/sessions/{self.cfg.session}/merges/{offer_id}", json={"card_ts": ts})
+        except Exception:
+            self._merging.discard(offer_id)  # never leave the button dead until a restart
+            raise
         if r.status_code == 409:
             return  # already running; its result will arrive
         if r.status_code >= 400:

@@ -146,6 +146,7 @@ class AgentActivities:
         return {
             "action": action, "reason": reason, "title": pr.get("title", ""),
             "head_ref": head.get("ref", ""),
+            "protected_refs": [r for r in (base.get("ref"), (base.get("repo") or {}).get("default_branch")) if r],
             "same_repo": ((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower(),
             "default_base": base.get("ref") == (base.get("repo") or {}).get("default_branch"),
             "merge_sha": pr.get("merge_commit_sha") if pr.get("merged") else None,
@@ -212,6 +213,8 @@ class AgentActivities:
         repo, ref = gh.check_repo_in_scope(a["repo"]), a["ref"]
         if not a["same_repo"] or not ref:
             return {"ref": ref, "result": "left alone (it lives in a fork)"}
+        if ref in a.get("protected_refs", []):
+            return {"ref": ref, "result": "left alone (it is the base or default branch)"}
         try:
             await gh.gh_call("DELETE", f"/repos/{repo}/git/refs/heads/{quote(ref, safe='/')}")
             return {"ref": ref, "result": "deleted"}
@@ -229,7 +232,8 @@ class AgentActivities:
         out = []
         for i in issues:
             try:
-                st = (await gh.gh_call("GET", f"/repos/{i['repo']}/issues/{i['number']}")).json().get("state", "")
+                repo = gh.check_repo_in_scope(i["repo"])
+                st = (await gh.gh_call("GET", f"/repos/{repo}/issues/{i['number']}")).json().get("state", "")
                 out.append({**i, "state": st.upper()})
             except (gh.GithubError, httpx.HTTPStatusError):
                 out.append({**i, "state": "UNKNOWN"})

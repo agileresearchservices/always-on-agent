@@ -204,6 +204,16 @@ async def test_merge_click_that_the_server_rejects_says_so(tmp_path):
     assert "mrg-1" not in bridge._merging  # a later click may try again
 
 
+async def test_merge_click_network_error_does_not_jam_the_button(tmp_path):
+    def handler(req):
+        raise httpx.ConnectError("down")
+
+    bridge, _ = make_bridge(tmp_path, handler)
+    with pytest.raises(httpx.ConnectError):
+        await bridge.handle_interactive(action(action_id="aoa_merge", value="mrg-1") | {"message": {"ts": "9.9"}})
+    assert "mrg-1" not in bridge._merging
+
+
 async def test_merge_result_posts_notice_and_updates_the_card(tmp_path):
     state = {"calls": 0}
     results = [

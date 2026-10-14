@@ -128,6 +128,7 @@ async def test_inspect_collects_checks_and_linked_issues(acts, monkeypatch):
     }))
     st = await acts.merge_inspect({"repo": OFFER["repo"], "number": 7, "sha": SHA})
     assert st["action"] == "merge" and st["head_ref"] == "feat/x" and st["same_repo"] and st["default_base"]
+    assert st["protected_refs"] == ["main", "main"]
     assert st["issues"] == [{"repo": "agileresearchservices/demo", "number": 3, "state": "OPEN"}]
 
 
@@ -201,7 +202,15 @@ async def test_delete_branch(acts, monkeypatch):
     assert (await acts.merge_delete_branch(a | {"ref": "feat/x#y"}))["result"] == "deleted"
     assert (await acts.merge_delete_branch(a | {"ref": "gone"}))["result"] == "deleted"
     assert "fork" in (await acts.merge_delete_branch(a | {"ref": "x", "same_repo": False}))["result"]
+    assert "base" in (await acts.merge_delete_branch(a | {"ref": "main", "protected_refs": ["main"]}))["result"]
     assert len(fake.calls) == 2
+
+
+async def test_issue_states_stay_in_scope(acts, monkeypatch):
+    fake = use(monkeypatch, FakeGitHub({("GET", "/repos/agileresearchservices/demo/issues/3"): (200, {"state": "closed"})}))
+    got = await acts.merge_issue_states([{"repo": "agileresearchservices/demo", "number": 3, "state": "OPEN"},
+                                         {"repo": "nasuni/hyrule", "number": 9, "state": "OPEN"}])
+    assert [i["state"] for i in got] == ["CLOSED", "UNKNOWN"] and len(fake.calls) == 1
 
 
 async def test_publish_approve_creates_one_stable_merge_offer(acts, monkeypatch):

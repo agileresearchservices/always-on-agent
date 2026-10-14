@@ -338,9 +338,14 @@ class MergePrWorkflow:
                     out |= {"action": "refused", "reason": res["reason"]}
                 else:
                     out |= {"status": "merged", "merge_sha": res["merge_sha"]}
-                    out["branch"] = await self._act(
-                        "merge_delete_branch", {"repo": pr["repo"], "ref": st["head_ref"], "same_repo": st["same_repo"]})
-                    out |= await self._closeout_issues(st, inp.get("issue_poll_seconds", 5))
+                    try:  # the merge is done; a close-out failure must not hide that
+                        out["branch"] = await self._act("merge_delete_branch", {
+                            "repo": pr["repo"], "ref": st["head_ref"], "same_repo": st["same_repo"],
+                            "protected_refs": st.get("protected_refs", [])})
+                        out |= await self._closeout_issues(st, inp.get("issue_poll_seconds", 5))
+                    except ActivityError as e:
+                        out["note"] = (f"Close-out failed ({type(e.cause).__name__ if e.cause else 'error'}): "
+                                       "check the branch and linked issues by hand.")
         except ActivityError as e:
             out |= {"action": "error", "reason": f"a GitHub step failed ({type(e.cause).__name__ if e.cause else 'error'})"}
         await workflow.execute_activity(
