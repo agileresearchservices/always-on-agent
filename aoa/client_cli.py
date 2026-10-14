@@ -27,6 +27,12 @@ RENDER = {
 }
 
 
+AUTH_HINT = (
+    "server rejected the request (401). Set AOA_API_TOKEN to the server's value, e.g. "
+    "`set -a; . ./.env; set +a`, then restart the client."
+)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--session", default="main")
@@ -36,6 +42,8 @@ def main() -> None:
     http = httpx.Client(base_url=args.server, headers=headers, timeout=70)
     stop = threading.Event()
     last_typing = [0.0]
+
+    warned = [False]
 
     def poll() -> None:
         after = 0
@@ -49,6 +57,11 @@ def main() -> None:
                     tag = RENDER.get(item["kind"], item["kind"])
                     extra = f"  [/approve {p['approval_id']} | /deny {p['approval_id']}]" if item["kind"] == "approval" else ""
                     print(f"\n{tag}: {p.get('text', '')}{extra}\n> ", end="", flush=True)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 401 and not warned[0]:
+                    warned[0] = True
+                    print(f"\n{AUTH_HINT}\n> ", end="", flush=True)
+                time.sleep(2)
             except httpx.HTTPError:
                 time.sleep(2)
 
@@ -71,7 +84,14 @@ def main() -> None:
             r = http.post(f"/sessions/{args.session}/approvals/{aid}", json={"approve": cmd == "/approve"})
             print(r.json())
             continue
-        http.post(f"/sessions/{args.session}/messages", json={"text": line, "message_id": uuid.uuid4().hex})
+        try:
+            r = http.post(f"/sessions/{args.session}/messages", json={"text": line, "message_id": uuid.uuid4().hex})
+            if r.status_code == 401:
+                print(AUTH_HINT)
+            else:
+                r.raise_for_status()
+        except httpx.HTTPError as e:
+            print(f"could not send ({type(e).__name__}: {e}). Is the server up at {args.server}?")
     stop.set()
 
 
