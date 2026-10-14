@@ -46,6 +46,7 @@ class ToolContext:
     llm: LLM
     scheduler: Scheduler
     now: Callable[[], datetime]
+    trigger: str = "background"  # "user" | "routine" | an external source name; see core.turn_trigger
 
 
 class ToolError(Exception):
@@ -198,14 +199,24 @@ async def h_web_fetch(ctx: ToolContext, a: dict[str, Any]) -> str:
     return wrap_untrusted(a["url"], f"HTTP {r.status_code}\n{body}")
 
 
-async def h_schedule_routine(ctx: ToolContext, a: dict[str, Any]) -> str:
-    if not ctx.trigger_user:
-        # A routine is a persistent trigger that later runs with trust. Only the person may create one;
-        # otherwise a poisoned email or webhook could plant a standing instruction.
+def _require_person_turn(ctx: ToolContext, verb: str) -> None:
+    """Routines are standing instructions that later run with trust, so only a turn the person started may
+    change them. A routine's own turn may read content from outside, so it must not plant or remove routines."""
+    if ctx.trigger == "routine":
         raise ToolError(
-            "routines can only be created during a turn the person started. Ask them (send_user, kind "
-            "'question') and create it once they confirm."
+            f"a routine's turn cannot {verb} routines, because it may have read untrusted content. Tell the "
+            "person (send_user, kind 'question') and let them ask for it in a message."
         )
+    if not ctx.trigger_user:
+        # Otherwise a poisoned email or webhook could plant a standing instruction.
+        raise ToolError(
+            f"routines can only be changed during a turn the person started. Ask them (send_user, kind "
+            f"'question') and {verb} it once they confirm."
+        )
+
+
+async def h_schedule_routine(ctx: ToolContext, a: dict[str, Any]) -> str:
+    _require_person_turn(ctx, "create")
     cron = a["cron"].strip()
     if len(cron.split()) != 5:
         raise ToolError("cron must have 5 fields: minute hour day-of-month month day-of-week (UTC)")
@@ -220,6 +231,7 @@ async def h_list_routines(ctx: ToolContext, a: dict[str, Any]) -> str:
 
 
 async def h_delete_routine(ctx: ToolContext, a: dict[str, Any]) -> str:
+    _require_person_turn(ctx, "delete")
     gone = await ctx.scheduler.delete(ctx.session, a["name"])
     ctx.store.routine_delete(ctx.session, a["name"])
     return "deleted" if gone else "no such routine"

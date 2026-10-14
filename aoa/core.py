@@ -32,6 +32,15 @@ log = logging.getLogger("aoa.core")
 MISS_FRACTION = 0.9
 
 
+def turn_trigger(events: list[dict[str, Any]]) -> str:
+    """Who started this turn: "user" (the person acted: a message or an approval decision), "routine"
+    (a standing instruction the person wrote earlier, but nobody is present now) or an external source."""
+    trusted = [e for e in events if e.get("trusted")]
+    if any(e["source"] != "routine" for e in trusted):
+        return "user"
+    return "routine" if trusted else events[0]["source"]
+
+
 def request_fingerprint(system: list[dict[str, Any]], tools: list[dict[str, Any]], messages: list[dict[str, Any]]):
     """(hash of tools+system, per-message hashes): enough to say what changed between two requests."""
     h = lambda o: hashlib.sha256(json.dumps(o, sort_keys=True, default=str).encode()).hexdigest()[:10]  # noqa: E731
@@ -108,6 +117,7 @@ class AgentCore:
             session=session, conv_id=conv, role=role, depth=depth, trigger_user=trigger_user,
             settings=self.s, store=self.store, memory=self.memory, sandbox=self.sandbox(session),
             notifier=self.notifier, llm=self.llm, scheduler=self.scheduler, now=self.now,
+            trigger=self.store.kv_get(session, "turn_trigger", "background"),
         )
 
     # ---- turn preparation ---------------------------------------------------------
@@ -125,7 +135,8 @@ class AgentCore:
         if not fresh:
             return {"added": 0, "dropped": len(events)}
         now = self.now()
-        trigger = "user" if any(e.get("trusted") for e in fresh) else fresh[0]["source"]
+        trigger = turn_trigger(fresh)
+        self.store.kv_set(session, "turn_trigger", trigger)  # tools read it to apply per-trigger limits
         blocks: list[dict[str, Any]] = [
             volatile_context_block(
                 now, trigger, self.memory.scratch_active(now), self.memory.recent_log(now),
@@ -135,7 +146,7 @@ class AgentCore:
         for ev in fresh:
             blocks.append({"type": "text", "text": render_event_text(ev)})
             self.memory.append_log(f"event from {ev['source']}: {ev['text'][:90]!r}", now)
-        result = {"added": len(fresh), "dropped": len(events) - len(fresh), "trigger_user": trigger == "user"}
+        result = {"added": len(fresh), "dropped": len(events) - len(fresh), "trigger_user": trigger in ("user", "routine")}
         self.store.commit_step(conv, f"prep:{turn_key}", result, role="user", content=blocks)
         return result
 
