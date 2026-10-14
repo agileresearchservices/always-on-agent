@@ -75,7 +75,7 @@ class AgentActivities:
             prs = await poll_once(http, self.core.store, a["session"], a["user"], token_provider())
         if prs:
             self.core.store.outbox_push(a["session"], "update", {"text": notice_text(prs)}, client_key=notice_key(prs))
-        return {"announced": len(prs), "review": reviews_to_start(prs, a["user"])}
+        return {"announced": len(prs), "review": reviews_to_start(self.core.store, a["session"], prs, a["user"])}
 
     @activity.defn(name="publish_pr_review")
     async def publish_pr_review(self, a: dict[str, Any]) -> dict[str, Any]:
@@ -94,8 +94,13 @@ class AgentActivities:
                                      {"body": github_body(v), "event": "COMMENT", "commit_id": pr["sha"]})
                     self.core.store.kv_set(session, done_key, True)
                     posted = True
-                except (gh.GithubError, httpx.HTTPError) as e:
+                except gh.GithubError as e:  # 401/403/404: retrying will not help
                     note = f"GitHub post failed: {str(e)[:200]}"
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code >= 500:
+                        raise  # transient: let Temporal retry the activity
+                    note = f"GitHub post failed: {e.response.status_code} {e.response.text[:150]}"
+                # other httpx errors (network) propagate and are retried too
         self.core.store.outbox_push(
             session, "pr_review",
             {"text": slack_text(v, pr, posted, note), "repo": pr["repo"], "number": pr["number"], "sha": pr["sha"],

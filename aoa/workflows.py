@@ -256,6 +256,8 @@ class GithubPollWorkflow:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=5)),
         )
+        if isinstance(res, int):  # recorded by a pre-review worker before a deploy: replay it as-is
+            return res
         for pr in res["review"]:
             wid = f"pr-review-{inp['session']}-{pr['repo'].replace('/', '-')}-{pr['number']}-{pr['sha'][:12]}"
             try:

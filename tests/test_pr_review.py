@@ -56,7 +56,31 @@ def test_task_names_the_pr_and_marks_content_untrusted():
     assert "UNTRUSTED" in t and '"verdict"' in t
 
 
-def test_only_owner_authored_prs_are_reviewed_and_capped():
+def test_only_owner_authored_prs_are_reviewed_capped_and_the_rest_queued(tmp_path):
+    from aoa.store import Store
+
+    store = Store(tmp_path / "s.sqlite3")
     prs = [{**PR, "number": n, "author": "AgileResearchServices" if n != 2 else "stranger"} for n in range(1, 7)]
-    picked = reviews_to_start(prs, "agileresearchservices")
-    assert [p["number"] for p in picked] == [1, 3, 4]
+    assert [p["number"] for p in reviews_to_start(store, "main", prs, "agileresearchservices")] == [1, 3, 4]
+    # the next poll announces nothing new, but the overflow still gets reviewed
+    assert [p["number"] for p in reviews_to_start(store, "main", [], "agileresearchservices")] == [5, 6]
+    assert reviews_to_start(store, "main", [], "agileresearchservices") == []
+    # a newer commit on a queued PR replaces the queued one rather than reviewing both
+    store.kv_set("main", "github_review_queue", [{**PR, "number": 9, "sha": "old"}])
+    got = reviews_to_start(store, "main", [{**PR, "number": 9, "sha": "new"}], "agileresearchservices")
+    assert [(p["number"], p["sha"]) for p in got] == [(9, "new")]
+
+
+def test_high_severity_finding_forces_request_changes():
+    v = parse_verdict('{"verdict": "approve", "summary": "fine", "findings": [{"severity": "high", "comment": "leaks key"}]}')
+    assert v["verdict"] == "request_changes"
+
+
+def test_links_and_slack_syntax_from_the_model_are_defanged():
+    v = {"verdict": "approve", "summary": "see [docs](http://evil.example) and <http://x|label> ![img](http://t/p.png)",
+         "findings": [{"severity": "low", "file": "`< !channel>`\nx.py", "line": 1, "comment": "ok"}]}
+    v = parse_verdict(json.dumps(v))
+    body, card = github_body(v), slack_text(v, PR, posted=True)
+    assert "](http" not in body and "docs (http://evil.example)" in body
+    assert "<http://x|label>" not in card and "&lt;http://x|label&gt;" in card and "](http://evil" not in card
+    assert "channel" in card and "<!channel>" not in card and "`< !" not in card

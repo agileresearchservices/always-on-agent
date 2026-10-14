@@ -53,14 +53,27 @@ def parse_verdict(text: str) -> dict[str, Any] | None:
         line = f.get("line")
         findings.append({
             "severity": f.get("severity") if f.get("severity") in SEVERITIES else "low",
-            "file": str(f.get("file") or "")[:200],
+            "file": re.sub(r"[`\s<>|]", "", str(f.get("file") or ""))[:200],
             "line": line if isinstance(line, int) and line > 0 else None,
             "comment": str(f["comment"])[:600],
         })
     order = {s: i for i, s in enumerate(SEVERITIES)}
     findings.sort(key=lambda f: order[f["severity"]])
-    return {"verdict": obj["verdict"], "summary": str(obj.get("summary") or "")[:1200],
+    verdict = obj["verdict"]
+    if any(f["severity"] == "high" for f in findings):
+        verdict = "request_changes"  # enforced here, not just asked for in the prompt
+    return {"verdict": verdict, "summary": str(obj.get("summary") or "")[:1200],
             "findings": findings[:MAX_FINDINGS]}
+
+
+def defang_links(s: str) -> str:
+    """Model-written markdown links/images become plain "label (url)" text: nothing clickable it chose."""
+    return re.sub(r"!?\[([^\]]*)\]\(([^)\s]*)\)", r"\1 (\2)", s)
+
+
+def _slack_plain(s: str) -> str:
+    """Model-written text for a Slack card: no links, no mentions, Slack's special characters escaped."""
+    return no_mentions(defang_links(s)).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def no_mentions(s: str) -> str:
@@ -85,7 +98,7 @@ def github_body(v: dict[str, Any]) -> str:
         lines += ["", "**Findings**"] + [f"- **{f['severity']}** {_where(f)}{f['comment']}" for f in v["findings"]]
     lines += ["", "_Automated review by the aoa reviewer sub-agent. Posted as a comment review: GitHub does not "
                   "let the PR author's account approve or request changes._"]
-    return no_mentions("\n".join(lines))
+    return no_mentions(defang_links("\n".join(lines)))
 
 
 def slack_text(v: dict[str, Any] | None, pr: dict[str, Any], posted: bool, note: str = "") -> str:
@@ -95,9 +108,9 @@ def slack_text(v: dict[str, Any] | None, pr: dict[str, Any], posted: bool, note:
     if v is None:
         return f"Review failed for {head}: the reviewer did not return a usable verdict. Nothing was posted. {note}".strip()
     icon = ":white_check_mark:" if v["verdict"] == "approve" else ":x:"
-    lines = [f"{icon} *{_label(v['verdict'])}*: {head}", no_mentions(v["summary"])]
+    lines = [f"{icon} *{_label(v['verdict'])}*: {head}", _slack_plain(v["summary"])]
     for f in v["findings"][:5]:
-        lines.append(f"• *{f['severity']}* {_where(f)}{no_mentions(f['comment'])}")
+        lines.append(f"• *{f['severity']}* {_slack_plain(_where(f) + f['comment'])}")
     if len(v["findings"]) > 5:
         lines.append(f"…{len(v['findings']) - 5} more on GitHub")
     lines.append("_Posted on GitHub as a comment review._" if posted else f"_Not posted on GitHub. {note}_")
