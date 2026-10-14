@@ -344,7 +344,8 @@ def _tools() -> list[ToolSpec]:
         ),
         ToolSpec(
             "external_send",
-            "Send a message to an external channel (email/Slack). Irreversible: requires the person's approval.",
+            "Ask to send a message to an external channel (email/Slack). Requires the person's approval. "
+            "Prototype: approved sends are recorded, not delivered. Tell the person that plainly.",
             _obj({"channel": {"type": "string"}, "text": {"type": "string"}, "approval_id": {"type": "string"}},
                  ["channel", "text"]),
             h_external_send, core=False, helper_ok=False, irreversible=True,
