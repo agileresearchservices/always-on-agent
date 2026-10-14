@@ -27,7 +27,8 @@ from typing import Any, Awaitable, Callable
 
 MAX_FILES = 10
 MAX_FILE_BYTES = 40_000
-TEST_TIMEOUT = 1200  # AOA_RESOLVE_TEST_TIMEOUT overrides; the activity's start-to-close is 30 min
+TEST_TIMEOUT = 1200  # AOA_RESOLVE_TEST_TIMEOUT overrides; always capped by the time the activity has left
+MIN_TEST_SECONDS = 60
 GIT_TIMEOUT = 300
 TIMED_OUT = -1000  # _run's exit code for "killed at the timeout" (a real SIGKILL is -9)
 STALE_WORKDIR_SECONDS = 3600
@@ -127,6 +128,17 @@ async def _run_bytes(args: list[str], cwd: Path, env: dict[str, str], timeout: f
     return p.returncode or 0, out
 
 
+def test_timeout() -> float:
+    """AOA_RESOLVE_TEST_TIMEOUT, or TEST_TIMEOUT when unset or not a positive number."""
+    try:
+        t = float(os.environ.get("AOA_RESOLVE_TEST_TIMEOUT") or TEST_TIMEOUT)
+    except ValueError:
+        t = TEST_TIMEOUT
+    if t <= 0:
+        t = TEST_TIMEOUT
+    return t
+
+
 def resolve_root() -> Path:
     """Where work dirs live: outside the data dir (the tests are repo code; nothing should sit next to .env
     or the store). One function for creating and cleaning, so both agree on TMPDIR."""
@@ -194,6 +206,8 @@ def finish_resolution(content: str, texts: dict[str, str]) -> str:
     pos = 0
     for chunk in conflict_context(texts["conflicted"]):
         i = lf.find(_lf(chunk), pos)
+        while i > 0 and lf[i - 1] != "\n":  # chunks are whole lines: match at a line start only
+            i = lf.find(_lf(chunk), i + 1)
         if i < 0:
             first = _lf(chunk).strip().splitlines()[:1]
             raise ResolveError("the resolution changed text outside the conflicting regions"
@@ -209,12 +223,13 @@ class Resolver:
                  token: str | None, llm: Any, model: str, max_tokens: int, protected_refs: tuple[str, ...] = (),
                  on_usage: Callable[[str, dict[str, int]], None] = lambda m, u: None,
                  on_commit: Callable[[str, list[str]], None] = lambda sha, files: None,
-                 before_push: Callable[[], Awaitable[None]] | None = None):
+                 before_push: Callable[[], Awaitable[None]] | None = None, deadline: float | None = None):
         self.repo, self.sha, self.head_ref, self.base_ref = repo, sha, head_ref, base_ref
         self.dir, self.remote_url, self.genv = workdir / "clone", remote_url, git_env(token, workdir / "home")
         self.workdir, self.llm, self.model, self.max_tokens, self.on_usage = workdir, llm, model, max_tokens, on_usage
         self.on_commit, self.before_push = on_commit, before_push  # before_push raises ResolveError to stop
         self.test_cmd = ""
+        self.deadline = deadline  # time.monotonic() by which the push must be done (the activity's timeout)
         self.protected_refs = {base_ref, *protected_refs}
 
     async def git(self, *args: str, check: bool = True) -> str:
@@ -373,7 +388,13 @@ class Resolver:
         self.test_cmd = cmd
         home = self.workdir / "home"
         home.mkdir(exist_ok=True)
-        timeout = float(os.environ.get("AOA_RESOLVE_TEST_TIMEOUT") or TEST_TIMEOUT)
+        timeout = test_timeout()
+        if self.deadline is not None:  # end before the activity's own timeout would cut the run off unreported
+            left = self.deadline - time.monotonic() - 60  # a minute kept for the push
+            if left < MIN_TEST_SECONDS:
+                raise ResolveError("too little time was left for the tests (slow clone or model calls), so "
+                                   "nothing was pushed")
+            timeout = min(timeout, left)
         code, out = await _run([cmd], self.dir, safe_env() | {"HOME": str(home)}, timeout, shell=True)
         tail = out.strip()[-1200:]
         if code == TIMED_OUT:  # maybe a cold install: worth another click (or a bigger AOA_RESOLVE_TEST_TIMEOUT)

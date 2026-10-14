@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import secrets
+import time
 import uuid
+from datetime import timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -282,6 +284,8 @@ class AgentActivities:
         except ResolveError as e:
             return {"status": "failed", "action": e.action, "reason": str(e)}
         workdir = resolve_root() / uuid.uuid4().hex[:12]
+        limit = activity.info().start_to_close_timeout or timedelta(minutes=30)
+        deadline = time.monotonic() + limit.total_seconds() - 60
         mark = lambda sha, files: self.core.store.kv_set(  # noqa: E731
             a["session"], f"{RESOLVED_KEY}{repo}#{a['number']}@{sha}", files)
         r = Resolver(repo=repo, sha=a["sha"], head_ref=a["head_ref"], base_ref=a["base_ref"], workdir=workdir,
@@ -289,7 +293,7 @@ class AgentActivities:
                      llm=self.core.llm, model=self.s.helper_model, max_tokens=self.s.max_tokens,
                      protected_refs=tuple(a.get("protected_refs", [])),
                      on_usage=lambda m, u: self.core.store.usage_add(f"resolve/{repo}#{a['number']}", m, u),
-                     on_commit=mark, before_push=auto_merge_off)
+                     on_commit=mark, before_push=auto_merge_off, deadline=deadline)
         out = await with_heartbeat(r.run(), activity.heartbeat)
         if out["status"] == "resolved":
             mark(out["new_sha"], out["files"])  # also on a retry that found its earlier push
