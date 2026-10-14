@@ -156,9 +156,10 @@ planned eval flywheel).
   - Reviews then post as a real APPROVE / REQUEST_CHANGES, falling back to a comment review on any failure.
   - It stays off until the App exists. Setup steps are in the PR #25 comment (pre-filled App-creation link).
   - The owner's other project (`pr-sweep`) posts as the `gh` account, which only works for other people's PRs.
-- **#21:** real isolation for the resolver's test run (container), split out as a design decision.
+- **#21:** real isolation for the resolver's test run (container). Closed as not planned: the resolver only handles the owner's own PRs.
 - **#27 (fixes #26):**
   - The new soft eval `user_turn_answers_as_reply` reproduced the live finding (4/5): the agent sometimes sends user-turn confirmations as `update`, which the notifier may hold.
   - Fixed in code: `send_user` turns `update` into `reply` when `trigger_user`.
   - Full eval suite 3/3 on all 15 cases.
 - Both Merge buttons (#24, #25) were clicked at once. The two runs merged one after the other with no conflict, and the combined main passed 167 tests. Services restarted on `fe3891e`.
+- **#27 merged** (`77a714c`); services restarted, 168 tests pass. The GitHub App setup and key-rotation reminders were dropped at the owner's request. The only open issue is #1 (eval flywheel / Langfuse).

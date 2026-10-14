@@ -94,7 +94,7 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 - **Conflict resolution runs the repo's tests as your user.** After aoa resolves a PR's conflicts it runs the
   repo's test command on this machine (allowlisted env, throwaway HOME, clone outside the data dir), which is
   the repo's own code, as if you ran it. Only your own reviewed PRs get there, and the command comes from config
-  or the base branch, never the PR. Running it in a container is #21; until then, do not use this on code you do not trust.
+  or the base branch, never the PR. Container isolation was considered (#21) and deliberately skipped; do not use this on code you do not trust.
 - **The reviewer App's private key is a file your user can read**, like `.env`, so a non-isolated sandbox command
   could read it too. The installation tokens minted from it are scoped to one repo and `pull_requests: write`,
   but the key itself can mint tokens for every repo the App is installed on.
