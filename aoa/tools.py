@@ -271,6 +271,8 @@ async def _approval_gate(
         raise ToolError("the request differs from what was approved; request a new approval")
     if rec["status"] == "pending":
         return "still waiting for the person to decide. Do not proceed."
+    if rec["status"] == "expired":
+        return "this approval lapsed unanswered, so the action was NOT done. Do not proceed. Ask the person again if it still matters."
     if rec["status"] == "denied":
         return "the person denied this. Do not proceed. Ask what they would prefer."
     return None

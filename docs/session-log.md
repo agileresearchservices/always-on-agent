@@ -168,3 +168,4 @@ planned eval flywheel).
 
 - Review of Temporal/Anthropic features produced six work items (issues below). Order: timers, replay tests + search attributes, 1h cache TTL, thinking blocks, native tool search + structured outputs, batch evals.
 - **#28 digest flush timer:** `Notifier.next_flush_at` / `flush_digest`; `SessionWorkflow` waits with `min(idle_sleep, time to flush)` and flushes held updates when quiet hours end or the spacing passes (previously they waited for the next message).
+- **#30 approval expiry:** `approvals_next` / `approvals_tick` activities; `SessionWorkflow` wakes at the earliest nudge/expiry, nudges once (4h) and expires (24h), telling the person via an `alert`. The tool tells the model it lapsed; a late click gets 409 "expired".

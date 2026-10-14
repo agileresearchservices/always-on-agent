@@ -54,6 +54,14 @@ class AgentActivities:
     async def maybe_compact(self, a: dict[str, Any]) -> str:
         return await self.core.maybe_compact(a["session"], a["conv"])
 
+    @activity.defn(name="approvals_next")
+    async def approvals_next(self, session: str) -> float | None:
+        return await self.core.approvals_next(session)
+
+    @activity.defn(name="approvals_tick")
+    async def approvals_tick(self, session: str) -> dict[str, Any]:
+        return await self.core.approvals_tick(session)
+
     @activity.defn(name="digest_status")
     async def digest_status(self, session: str) -> float | None:
         return await self.core.digest_status(session)
@@ -322,7 +330,7 @@ class AgentActivities:
     def all(self) -> list:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
-            self.maybe_compact, self.digest_status, self.flush_digest, self.sandbox_sleep, self.warm_cache, self.report_failure,
+            self.maybe_compact, self.digest_status, self.flush_digest, self.approvals_next, self.approvals_tick, self.sandbox_sleep, self.warm_cache, self.report_failure,
             self.deliver_routine_event, self.poll_github, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
             self.merge_issue_states, self.merge_report, self.resolve_conflicts,

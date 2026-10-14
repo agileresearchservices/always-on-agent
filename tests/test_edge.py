@@ -220,3 +220,78 @@ async def test_github_write_close_posts_comment_then_closes(make_core, monkeypat
                      ("PATCH", "/repos/agileresearchservices/demo/issues/2", {"state": "closed", "state_reason": "not_planned"})]
     with pytest.raises(ToolError, match="close_reason"):
         await h(ctx, {**args, "close_reason": "whatever"})
+
+
+async def test_approval_nudge_then_expiry(make_core):
+    from conftest import AFTERNOON
+    from aoa.tools import REGISTRY
+
+    core, _ = make_core([text("ok")])
+    st, now = core.store, AFTERNOON.timestamp()
+
+    def put(aid, age):
+        st.approval_request(aid, "main", {"tool": "external_send", "channel": "email:bob", "text": "x"})
+        with st._conn() as c:
+            c.execute("UPDATE approvals SET ts=? WHERE id=?", (now - age, aid))
+
+    put("apr-new", 60)
+    put("apr-4h", 5 * 3600)
+    put("apr-old", 25 * 3600)
+    assert await core.approvals_next("main") == now - 25 * 3600 + core.s.approval_nudge_seconds  # already due
+    res = await core.approvals_tick("main")
+    assert res["nudged"] == ["apr-4h"] and res["expired"] == ["apr-old"]
+    assert st.approval_get("apr-old")["status"] == "expired"
+    assert st.approval_get("apr-4h")["status"] == "pending" and st.approval_get("apr-new")["status"] == "pending"
+    texts = [o["payload"]["text"] for o in st.outbox_since("main")]
+    assert any("apr-old" in t and "lapsed" in t for t in texts) and any("apr-4h" in t and "Still waiting" in t for t in texts)
+    again = await core.approvals_tick("main")  # idempotent: no second nudge, nothing left to expire
+    assert again["nudged"] == [] and again["expired"] == []
+    assert again["next"] == min(now - 5 * 3600 + core.s.approval_expire_seconds,
+                                now - 60 + core.s.approval_nudge_seconds)
+    # the tool tells the model it lapsed, and a lapsed approval cannot be approved late
+    ctx = core._ctx("main", "main", "main", 0, True)
+    out = await REGISTRY["external_send"].handler(
+        ctx, {"channel": "email:bob", "text": "x", "approval_id": "apr-old"})
+    assert "lapsed" in out and "NOT done" in out
+    assert st.approval_resolve("apr-old", True) is False
+
+
+def test_late_click_on_an_expired_approval_is_409_with_a_clear_message(api):
+    client, _ = api
+    server.store.approval_request("apr-x", "main", {"tool": "external_send", "channel": "email:bob", "text": "x"})
+    assert server.store.approval_expire("apr-x")
+    r = client.post("/sessions/main/approvals/apr-x", json={"approve": True})
+    assert r.status_code == 409 and "expired" in r.json()["detail"]
+
+
+def test_click_past_the_lifetime_expires_even_if_the_timer_has_not_run(api):
+    client, _ = api
+    server.store.approval_request("apr-y", "main", {"tool": "external_send", "channel": "email:bob", "text": "x"})
+    with server.store._conn() as c:
+        c.execute("UPDATE approvals SET ts=? WHERE id=?", (1.0, "apr-y"))  # created long ago
+    r = client.post("/sessions/main/approvals/apr-y", json={"approve": True})
+    assert r.status_code == 409 and "expired" in r.json()["detail"]
+    assert server.store.approval_get("apr-y")["status"] == "expired"
+
+
+async def test_after_a_lapse_the_model_can_ask_again_with_a_fresh_approval(make_core):
+    from aoa.tools import REGISTRY
+
+    core, _ = make_core([text("ok")])
+    ctx = core._ctx("main", "main", "main", 0, True)
+    h, args = REGISTRY["external_send"].handler, {"channel": "email:bob", "text": "x"}
+    assert "approval requested" in await h(ctx, args)
+    old = core.store.outbox_since("main")[0]["payload"]["approval_id"]
+    core.store.approval_expire(old)
+    assert "lapsed" in await h(ctx, args | {"approval_id": old})
+    assert "approval requested" in await h(ctx, args)  # no id: a brand-new request
+    ids = [o["payload"]["approval_id"] for o in core.store.outbox_since("main") if o["kind"] == "approval"]
+    assert len(set(ids)) == 2 and core.store.approval_get(ids[1])["status"] == "pending"
+
+
+def test_approval_settings_are_sane(monkeypatch):
+    from aoa.config import Settings
+    monkeypatch.setenv("AOA_APPROVAL_NUDGE", "0")
+    monkeypatch.setenv("AOA_APPROVAL_EXPIRE", "-5")
+    s = Settings.from_env()
+    assert s.approval_nudge_seconds >= 1 and s.approval_expire_seconds > s.approval_nudge_seconds

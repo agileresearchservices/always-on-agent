@@ -71,7 +71,7 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 | Compact inside the warm window | `compaction.py`: summariser reuses the exact cached prefix |
 | Long output goes to a file | `sandbox._spill`, `core._cap` |
 | Auto-review of commands by a second model | `safety.py`: denylist, then reviewer model, fail closed |
-| Untrusted input is data; irreversible actions need approval | `events.render_event_text`, `safety.wrap_untrusted`, `external_send` approval flow |
+| Untrusted input is data; irreversible actions need approval | `events.render_event_text`, `safety.wrap_untrusted`, `external_send` approval flow; a pending approval is nudged once after `AOA_APPROVAL_NUDGE` (4h) and lapses after `AOA_APPROVAL_EXPIRE` (24h) via workflow timers |
 | Errors written for agents | `ToolError` messages say what to do next |
 | Watch, review, merge (PR flow) | `github_monitor.py` announces PRs; `PrReviewWorkflow` runs a reviewer sub-agent and posts its review (`pr_review.py`): a real APPROVE / REQUEST_CHANGES when a reviewer identity is configured (`gh_reviewer.py`, a GitHub App with per-repo tokens), else a comment review with a stated recommendation; an approved card gets a Slack [Merge] button that starts `MergePrWorkflow` (`pr_merge.py`): wait for checks, squash-merge pinned to the reviewed commit, delete the branch, confirm linked issues closed. On conflicts the click instead has `pr_resolve.py` resolve them in a throwaway clone (model per file, validated), run the repo's tests with no secrets in the environment, and push; the new commit is reviewed again and needs a second click. The model never has a merge tool |
 
