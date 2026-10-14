@@ -11,7 +11,7 @@ from .config import Settings
 from .core import AgentCore
 from .delivery import deliver_event
 from .events import Event
-from .github_monitor import poll_once, token_provider
+from .github_monitor import notice_key, notice_text, poll_once, token_provider
 
 
 class AgentActivities:
@@ -67,11 +67,12 @@ class AgentActivities:
 
     @activity.defn(name="poll_github")
     async def poll_github(self, a: dict[str, Any]) -> int:
+        """Announce PRs ready for review straight to the outbox (no agent turn, no model call)."""
         async with httpx.AsyncClient(timeout=20) as http:
-            events = await poll_once(http, self.core.store, a["session"], a["user"], token_provider())
-        for ev in events:
-            await deliver_event(self.client, self.s, a["session"], ev.to_dict())
-        return len(events)
+            prs = await poll_once(http, self.core.store, a["session"], a["user"], token_provider())
+        if prs:
+            self.core.store.outbox_push(a["session"], "update", {"text": notice_text(prs)}, client_key=notice_key(prs))
+        return len(prs)
 
     def all(self) -> list:
         return [
