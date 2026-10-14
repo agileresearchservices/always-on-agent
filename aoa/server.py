@@ -19,12 +19,14 @@ from pydantic import BaseModel, Field
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from .config import Settings
 from .delivery import deliver_event, signal_typing
 from .events import Event, approval_event, user_event
 from .github_monitor import GithubError, check_repo_in_scope
 from .pr_merge import OFFER_ID_RE, OFFER_KEY
+from .search_attrs import ensure_registered, pr_attrs
 from .store import Store
 
 settings = Settings.from_env()
@@ -47,6 +49,7 @@ def check_auth_configured() -> None:
 async def lifespan(app: FastAPI):
     check_auth_configured()
     app.state.client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
+    await ensure_registered(app.state.client)
     yield
 
 
@@ -158,13 +161,22 @@ async def merge(sid: str, offer_id: str, m: MergeRequest) -> dict[str, Any]:
     except GithubError as e:
         raise HTTPException(403, str(e)) from e
     try:
-        await app.state.client.start_workflow(
-            "MergePrWorkflow",
-            {"session": sid, "offer_id": offer_id, "offer": offer, "card_ts": m.card_ts},
+        args = dict(
             id=f"merge-{sid}-{offer_id}", task_queue=settings.task_queue,
             id_conflict_policy=WorkflowIDConflictPolicy.FAIL,  # running: refuse the double click
             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,  # finished: a retry may run (it re-checks GitHub)
         )
+        inp = {"session": sid, "offer_id": offer_id, "offer": offer, "card_ts": m.card_ts}
+        try:
+            attrs = pr_attrs(offer["repo"], offer["number"], offer["sha"], sid)
+        except (KeyError, TypeError, ValueError):  # an odd stored offer: the merge itself must still start
+            attrs = None
+        try:
+            await app.state.client.start_workflow("MergePrWorkflow", inp, **({"search_attributes": attrs} if attrs else {}), **args)
+        except RPCError as e:  # the server does not know the attributes yet: a merge must not depend on them
+            if attrs is None or e.status != RPCStatusCode.INVALID_ARGUMENT:
+                raise
+            await app.state.client.start_workflow("MergePrWorkflow", inp, **args)
     except WorkflowAlreadyStartedError as e:
         raise HTTPException(409, "a merge of this PR is already running") from e
     return {"status": "started"}

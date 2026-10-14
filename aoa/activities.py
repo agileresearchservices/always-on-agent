@@ -17,6 +17,7 @@ from .core import AgentCore
 from .delivery import deliver_event
 from .events import Event
 from . import github_monitor as gh
+from . import search_attrs
 from .gh_reviewer import forget as forget_reviewer_token, reviewer_token
 from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
 from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RESOLVED_KEY, RETRYABLE, check_summary, decide, report_text
@@ -104,7 +105,7 @@ class AgentActivities:
             files = self.core.store.kv_get(a["session"], f"{RESOLVED_KEY}{pr['repo']}#{pr['number']}@{pr['sha']}")
             if files is not None:
                 pr["resolved_files"] = files
-        return {"announced": len(prs), "review": review}
+        return {"announced": len(prs), "review": review, "search_attrs": search_attrs.registered()}
 
     @activity.defn(name="publish_pr_review")
     async def publish_pr_review(self, a: dict[str, Any]) -> dict[str, Any]:

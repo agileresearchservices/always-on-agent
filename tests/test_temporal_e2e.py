@@ -284,3 +284,24 @@ async def test_pending_approval_is_nudged_then_expires(client, env, monkeypatch)
     assert any("lapsed" in t for t in texts)
     aid = next(o["payload"]["approval_id"] for o in store.outbox_since(sid) if o["kind"] == "approval")
     assert store.approval_get(aid)["status"] == "expired"
+
+
+async def test_pr_workflows_are_findable_by_search_attributes(client, env):
+    from aoa.search_attrs import ensure_registered, pr_attrs
+
+    assert await ensure_registered(client) and await ensure_registered(client)  # idempotent
+    repo, sha = f"agileresearchservices/demo-{uuid.uuid4().hex[:6]}", "d" * 40
+    handle = await client.start_workflow(
+        "MergePrWorkflow", {"session": "main", "offer_id": "x", "offer": {}}, id=f"merge-test-{uuid.uuid4().hex[:6]}",
+        task_queue=env.task_queue, search_attributes=pr_attrs(repo, 4242, sha, "main"),
+    )  # no worker: it just sits there, which is all the visibility query needs
+    try:
+        found = []
+        for _ in range(30):  # visibility is eventually consistent
+            found = [w.id async for w in client.list_workflows(f'Repo = "{repo}" AND PrNumber = 4242 AND Sha = "{sha}"')]
+            if found:
+                break
+            await asyncio.sleep(0.5)
+        assert found == [handle.id]
+    finally:
+        await handle.terminate("test done")
