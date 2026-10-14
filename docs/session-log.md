@@ -88,3 +88,5 @@ planned eval flywheel).
 - Live: schedule `aoa-monitor-github` created by worker, manual trigger ran `GithubPollWorkflow` OK (0 new PRs, scoped). Agent filed an approval card, user clicked Approve in Slack, real issue #2 created, agent reported it correctly. Tests: 72 pass.
 - Note: new tools = one prompt-cache miss after restart. Test issue #2 left open (safe to close).
 - Not yet live-tested: github_read on a real PR, the monitor announcing a real review request, review/comment actions.
+- Live: `github_read` on real PR #3 (diff read, correct one-line summary) and `github_write` COMMENT review (card -> Slack approve -> review posted, text identical to card). PR closed unmerged, branch deleted; test issue #2 left open.
+- Limit: a PR author can't request their own review, so the monitor's live announcement can't be tested from this account; it is covered by mocked-transport tests, and the first real review request will be the live test. Not live-tested: APPROVE/REQUEST_CHANGES, comment action.
