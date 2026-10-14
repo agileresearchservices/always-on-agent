@@ -109,6 +109,7 @@ class Bridge:
     def __init__(self, cfg: BridgeConfig, web: Any, http: httpx.AsyncClient, cursor_path: Path):
         self.cfg, self.web, self.http, self.cursor_path = cfg, web, http, cursor_path
         self._decided: set[str] = set()  # Slack can deliver one click twice; act on each approval once
+        self._cards: dict[str, tuple[str, str]] = {}  # approval_id -> (message ts, text) of its posted card
 
     # ---- Slack -> agent --------------------------------------------------------------
     async def handle_event(self, event: dict[str, Any]) -> None:
@@ -127,17 +128,10 @@ class Bridge:
         if parsed is None:
             return
         aid, approved = parsed
-        await self._decide(aid, approved)
         msg = payload.get("message") or {}
-        try:  # replace the buttons so they cannot be clicked twice
-            await self.web.chat_update(
-                channel=self.cfg.channel, ts=msg.get("ts"), text=msg.get("text", ""),
-                blocks=resolved_blocks(msg.get("text", ""), approved),
-            )
-        except Exception:  # noqa: BLE001 - cosmetic only
-            log.warning("could not update approval message", exc_info=True)
+        await self._decide(aid, approved, card=(msg.get("ts"), msg.get("text", "")))
 
-    async def _decide(self, approval_id: str, approved: bool) -> None:
+    async def _decide(self, approval_id: str, approved: bool, card: tuple[str | None, str] | None = None) -> None:
         if approval_id in self._decided:
             return
         self._decided.add(approval_id)
@@ -146,8 +140,19 @@ class Bridge:
         )
         if r.status_code == 409:
             await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{approval_id} was already decided._")
-        else:
-            self._check(r, "decide approval")
+            return
+        self._check(r, "decide approval")
+        if r.status_code >= 400:
+            return
+        ts, text = self._cards.pop(approval_id, None) or card or (None, "")
+        if not ts:
+            return  # a card from before this bridge started and a typed reply: nothing to update
+        try:  # replace the buttons, whether the decision was clicked or typed
+            await self.web.chat_update(
+                channel=self.cfg.channel, ts=ts, text=text, blocks=resolved_blocks(text, approved),
+            )
+        except Exception:  # noqa: BLE001 - cosmetic only
+            log.warning("could not update approval message", exc_info=True)
 
     def _check(self, r: httpx.Response, what: str) -> None:
         if r.status_code == 401:
@@ -184,7 +189,11 @@ class Bridge:
                     kw: dict[str, Any] = {"channel": self.cfg.channel, "text": text}
                     if blocks:
                         kw["blocks"] = blocks
-                    await self.web.chat_postMessage(**kw)
+                    resp = await self.web.chat_postMessage(**kw)
+                    aid = item["payload"].get("approval_id") if item["kind"] == "approval" else None
+                    ts = resp.get("ts") if resp is not None and hasattr(resp, "get") else None
+                    if aid and ts:
+                        self._cards[aid] = (ts, text)
                     after = item["seq"]
                     self._save_cursor(after)  # after posting: a crash re-sends at most one item
             except httpx.HTTPError:

@@ -59,6 +59,7 @@ class FakeWeb:
 
     async def chat_postMessage(self, **kw):
         self.posted.append(kw)
+        return {"ts": f"t{len(self.posted)}"}
 
     async def chat_update(self, **kw):
         self.updated.append(kw)
@@ -133,3 +134,33 @@ async def test_duplicate_click_is_applied_once(tmp_path):
     await asyncio.gather(bridge.handle_interactive(payload), bridge.handle_interactive(payload))
     assert calls == ["/sessions/main/approvals/apr-1"]
     assert not web.posted  # no "already decided" noise
+
+
+async def test_typed_decision_updates_the_remembered_card(tmp_path):
+    def handler(req):
+        return httpx.Response(200, json={"status": "approved"})
+
+    bridge, web = make_bridge(tmp_path, handler)
+    bridge._cards["apr-1"] = ("5.5", "Send?")
+    await bridge.handle_event(msg(text="deny apr-1"))
+    assert web.updated[0]["ts"] == "5.5" and "Denied" in str(web.updated[0]["blocks"])
+    assert "apr-1" not in bridge._cards
+
+
+async def test_pump_remembers_the_card_it_posts(tmp_path):
+    state = {"calls": 0}
+
+    async def handler(req):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return httpx.Response(200, json={"items": []})
+        if state["calls"] == 2:
+            item = {"seq": 1, "kind": "approval", "payload": {"text": "Send?", "approval_id": "apr-9"}}
+            return httpx.Response(200, json={"items": [item]})
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={"items": []})
+
+    bridge, web = make_bridge(tmp_path, handler)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(bridge.pump_outbox(), timeout=0.4)
+    assert bridge._cards["apr-9"][0] == "t1"
