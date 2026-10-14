@@ -28,7 +28,8 @@ TEST_TIMEOUT = 600
 GIT_TIMEOUT = 300
 MARKER = re.compile(r"^(<{7}|>{7})(\s|$)", re.MULTILINE)  # a lone ======= is a legit RST/Markdown underline
 COMMIT_TAG = "conflicts resolved by aoa"
-BOT = ["-c", "user.name=aoa agent", "-c", "user.email=aoa-agent@users.noreply.github.com"]
+BOT_EMAIL = "aoa-agent@users.noreply.github.com"
+BOT = ["-c", "user.name=aoa agent", "-c", f"user.email={BOT_EMAIL}"]
 REPO_TEST_FILE = ".aoa/test-command"
 PY_DEFAULT_TEST = ('python3 -m venv .aoa-venv && (.aoa-venv/bin/pip install -q -e ".[dev]" || '
                    '.aoa-venv/bin/pip install -q -e .) && .aoa-venv/bin/pip install -q pytest && '
@@ -64,8 +65,10 @@ def safe_env() -> dict[str, str]:
     return env
 
 
-def git_env(token: str | None) -> dict[str, str]:
+def git_env(token: str | None, home: Path | None = None) -> dict[str, str]:
     env = safe_env() | {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    if home is not None:
+        env["HOME"] = str(home)  # no ~/.gitconfig even on a git too old for GIT_CONFIG_GLOBAL
     if token:
         basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
         env |= {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
@@ -125,7 +128,7 @@ class Resolver:
                  on_usage: Callable[[str, dict[str, int]], None] = lambda m, u: None,
                  on_commit: Callable[[str, list[str]], None] = lambda sha, files: None):
         self.repo, self.sha, self.head_ref, self.base_ref = repo, sha, head_ref, base_ref
-        self.dir, self.remote_url, self.genv = workdir / "clone", remote_url, git_env(token)
+        self.dir, self.remote_url, self.genv = workdir / "clone", remote_url, git_env(token, workdir / "home")
         self.workdir, self.llm, self.model, self.max_tokens, self.on_usage = workdir, llm, model, max_tokens, on_usage
         self.on_commit = on_commit
 
@@ -152,8 +155,8 @@ class Resolver:
         tip = (await self.git("rev-parse", "origin/head")).strip()
         if tip != self.sha:
             parent = (await self.git("rev-parse", "origin/head^1", check=False)).strip()
-            msg = await self.git("log", "-1", "--format=%B", "origin/head")
-            if parent == self.sha and COMMIT_TAG in msg:  # an earlier attempt pushed and then the worker died
+            msg = await self.git("log", "-1", "--format=%ce%n%B", "origin/head")
+            if parent == self.sha and msg.startswith(BOT_EMAIL + "\n") and COMMIT_TAG in msg:  # an earlier attempt pushed and then the worker died
                 m = re.search(r"^Resolved files: (.*)$", msg, re.MULTILINE)
                 files = [f for f in (m.group(1).split(", ") if m else []) if f and f != "none"]
                 return {"status": "resolved", "new_sha": tip, "files": files, "tests": "see the earlier attempt",
@@ -181,7 +184,7 @@ class Resolver:
         push_code, push_out = await _run(["git", "push", "-q", "origin", f"{new_sha}:refs/heads/{self.head_ref}"],
                                          self.dir, self.genv, GIT_TIMEOUT)
         if push_code != 0:
-            if "non-fast-forward" in push_out or "rejected" in push_out:
+            if "non-fast-forward" in push_out or "fetch first" in push_out:
                 raise ResolveError("the PR branch moved while resolving; nothing was pushed", "stale")
             raise ResolveError(f"push failed: {push_out.strip()[-300:]}")
         return {"status": "resolved", "new_sha": new_sha, "files": files, "summaries": summaries,
