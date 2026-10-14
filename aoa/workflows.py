@@ -17,11 +17,12 @@ from datetime import timedelta
 from typing import Any
 
 from temporalio import workflow
-from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ChildWorkflowError
+from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
+from temporalio.exceptions import ActivityError, ChildWorkflowError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from .loop import run_agent_loop
+    from .pr_review import build_task
 
 LLM_RETRY = RetryPolicy(
     maximum_attempts=6, initial_interval=timedelta(seconds=2), maximum_interval=timedelta(seconds=60),
@@ -245,9 +246,50 @@ class RoutineWorkflow:
 
 @workflow.defn(name="GithubPollWorkflow")
 class GithubPollWorkflow:
+    """Fired by the monitor schedule. Polls, then starts one PrReviewWorkflow per PR to review. The reviews
+    are abandoned children: they outlive this run, so a slow review never blocks the next poll."""
+
     @workflow.run
     async def run(self, inp: dict[str, Any]) -> int:
-        return await workflow.execute_activity(
-            "poll_github", inp, start_to_close_timeout=timedelta(seconds=60),
+        res = await workflow.execute_activity(
+            "poll_github", {"session": inp["session"], "user": inp["user"]},
+            start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=5)),
+        )
+        if isinstance(res, int):  # recorded by a pre-review worker before a deploy: replay it as-is
+            return res
+        for pr in res["review"]:
+            wid = f"pr-review-{inp['session']}-{pr['repo'].replace('/', '-')}-{pr['number']}-{pr['sha'][:12]}"
+            try:
+                await workflow.start_child_workflow(
+                    "PrReviewWorkflow", {"session": inp["session"], "cfg": inp["cfg"], "pr": pr}, id=wid,
+                    parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+                    id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                )
+            except WorkflowAlreadyStartedError:
+                pass  # this commit was already reviewed (or is being reviewed)
+        return res["announced"]
+
+
+@workflow.defn(name="PrReviewWorkflow")
+class PrReviewWorkflow:
+    """One review of one PR at one commit: the reviewer sub-agent (HelperWorkflow), then publish."""
+
+    @workflow.run
+    async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
+        pr, session = inp["pr"], inp["session"]
+        text, note = "", ""
+        try:
+            text = await workflow.execute_child_workflow(
+                "HelperWorkflow",
+                {"session": session, "cfg": inp["cfg"], "depth": 1,
+                 "parent_conv": f"prreview/{pr['repo']}#{pr['number']}@{pr['sha'][:12]}",
+                 "tool_use": {"id": "review", "name": "spawn_helper", "input": {"task": build_task(pr)}}},
+                id=f"{workflow.info().workflow_id}-reviewer",
+            )
+        except ChildWorkflowError as e:
+            note = f"Reviewer failed: {type(e.cause).__name__ if e.cause else 'error'}."
+        return await workflow.execute_activity(
+            "publish_pr_review", {"session": session, "pr": pr, "review_text": text, "note": note},
+            start_to_close_timeout=timedelta(seconds=60), retry_policy=STATE_RETRY,
         )

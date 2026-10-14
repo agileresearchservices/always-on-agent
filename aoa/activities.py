@@ -11,7 +11,9 @@ from .config import Settings
 from .core import AgentCore
 from .delivery import deliver_event
 from .events import Event
-from .github_monitor import notice_key, notice_text, poll_once, token_provider
+from . import github_monitor as gh
+from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
+from .pr_review import github_body, parse_verdict, slack_text
 
 
 class AgentActivities:
@@ -66,17 +68,50 @@ class AgentActivities:
         await deliver_event(self.client, self.s, a["session"], ev.to_dict())
 
     @activity.defn(name="poll_github")
-    async def poll_github(self, a: dict[str, Any]) -> int:
-        """Announce PRs ready for review straight to the outbox (no agent turn, no model call)."""
+    async def poll_github(self, a: dict[str, Any]) -> dict[str, Any]:
+        """Announce PRs ready for review straight to the outbox (no agent turn, no model call), and return
+        the ones the workflow should start a review for."""
         async with httpx.AsyncClient(timeout=20) as http:
             prs = await poll_once(http, self.core.store, a["session"], a["user"], token_provider())
         if prs:
             self.core.store.outbox_push(a["session"], "update", {"text": notice_text(prs)}, client_key=notice_key(prs))
-        return len(prs)
+        return {"announced": len(prs), "review": reviews_to_start(self.core.store, a["session"], prs, a["user"])}
+
+    @activity.defn(name="publish_pr_review")
+    async def publish_pr_review(self, a: dict[str, Any]) -> dict[str, Any]:
+        """Validate the reviewer's answer, post it on GitHub as a comment review pinned to the reviewed
+        commit, and put a card in Slack. Idempotent: the card has a client key, and a repeat post is skipped."""
+        pr, session = a["pr"], a["session"]
+        v = parse_verdict(a.get("review_text") or "")
+        posted, note = False, a.get("note", "")
+        done_key = f"prreview-posted:{pr['repo']}#{pr['number']}@{pr['sha']}"
+        if v is not None:
+            if self.core.store.kv_get(session, done_key):
+                posted = True
+            else:
+                try:
+                    await gh.gh_call("POST", f"/repos/{pr['repo']}/pulls/{pr['number']}/reviews",
+                                     {"body": github_body(v), "event": "COMMENT", "commit_id": pr["sha"]})
+                    self.core.store.kv_set(session, done_key, True)
+                    posted = True
+                except gh.GithubError as e:  # 401/403/404: retrying will not help
+                    note = f"GitHub post failed: {str(e)[:200]}"
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code >= 500:
+                        raise  # transient: let Temporal retry the activity
+                    note = f"GitHub post failed: {e.response.status_code} {e.response.text[:150]}"
+                # other httpx errors (network) propagate and are retried too
+        self.core.store.outbox_push(
+            session, "pr_review",
+            {"text": slack_text(v, pr, posted, note), "repo": pr["repo"], "number": pr["number"], "sha": pr["sha"],
+             "url": pr["url"], "verdict": v["verdict"] if v else None},
+            client_key=f"prreview:{pr['repo']}#{pr['number']}@{pr['sha']}",
+        )
+        return {"verdict": v["verdict"] if v else None, "posted": posted}
 
     def all(self) -> list:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
             self.maybe_compact, self.sandbox_sleep, self.warm_cache, self.report_failure,
-            self.deliver_routine_event, self.poll_github,
+            self.deliver_routine_event, self.poll_github, self.publish_pr_review,
         ]

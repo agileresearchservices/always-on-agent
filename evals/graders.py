@@ -29,6 +29,7 @@ class Run:
     cache_read: int = 0
     cache_write: int = 0
     error: str | None = None
+    verdict: dict[str, Any] | None = None  # review mode: the parsed reviewer answer
 
 
 Grader = Callable[[Run], tuple[bool, str]]
@@ -116,4 +117,25 @@ def within_budget(max_steps: int, max_output_tokens: int) -> Grader:
     def g(r: Run) -> tuple[bool, str]:
         return (r.steps <= max_steps and r.output_tokens <= max_output_tokens,
                 f"{r.steps} steps / {r.output_tokens} output tokens (limits {max_steps} / {max_output_tokens})")
+    return g
+
+
+def verdict_is(v: str) -> Grader:
+    return lambda r: (bool(r.verdict) and r.verdict["verdict"] == v,
+                      f"verdict {r.verdict['verdict'] if r.verdict else 'unparseable'} (wanted {v})")
+
+
+def verdict_not(v: str) -> Grader:
+    """Must produce a usable verdict, and not this one."""
+    return lambda r: (bool(r.verdict) and r.verdict["verdict"] != v,
+                      f"verdict {r.verdict['verdict'] if r.verdict else 'unparseable'} (must not be {v})")
+
+
+def finding_mentions(*needles: str) -> Grader:
+    """Some finding (or the summary) names the problem; any needle matches, case-insensitive."""
+    def g(r: Run) -> tuple[bool, str]:
+        if not r.verdict:
+            return False, "no verdict"
+        hay = (r.verdict["summary"] + " " + " ".join(f["comment"] + " " + f["file"] for f in r.verdict["findings"])).lower()
+        return any(n.lower() in hay for n in needles), f"no finding mentions any of {needles}"
     return g

@@ -20,6 +20,8 @@ API = "https://api.github.com"
 MAX_PRS = 50  # open PRs inspected per poll
 MAX_LISTED = 15  # PRs named in one notice; the rest are counted
 SEEN_KEY = "github_seen"
+MAX_REVIEWS_PER_POLL = 3
+QUEUE_KEY = "github_review_queue"
 
 
 class GithubError(RuntimeError):
@@ -102,12 +104,26 @@ async def poll_once(http: httpx.AsyncClient, store: Store, session: str, user: s
         sha = await head_sha(http, token, pr)
         seen[key] = {"sha": sha, "updated": pr["updated"]}
         if prev is None:
-            announce.append({**pr, "why": "new"})
+            announce.append({**pr, "sha": sha, "why": "new"})
         elif prev["sha"] != sha:
-            announce.append({**pr, "why": "new commits"})
+            announce.append({**pr, "sha": sha, "why": "new commits"})
     # PRs that closed, merged or went back to draft drop out, so a later re-ready is announced again
     store.kv_set(session, SEEN_KEY, seen)
     return announce
+
+
+def reviews_to_start(store: Store, session: str, prs: list[dict[str, Any]], user: str,
+                     cap: int = MAX_REVIEWS_PER_POLL) -> list[dict[str, Any]]:
+    """Only the owner's own PRs are auto-reviewed: others' PR content is attacker-controllable, and the
+    review is published. At most `cap` per poll to bound cost; the rest wait in a persisted queue (the
+    seen-state already counts them as announced, so they would otherwise never be reviewed)."""
+    queue = store.kv_get(session, QUEUE_KEY, [])
+    for p in prs:
+        if p["author"].lower() == user.lower():
+            queue = [q for q in queue if pr_key(q) != pr_key(p)] + [p]  # a newer commit replaces an older one
+    take, rest = queue[:cap], queue[cap:]
+    store.kv_set(session, QUEUE_KEY, rest)
+    return take
 
 
 def notice_text(prs: list[dict[str, Any]]) -> str:
@@ -123,7 +139,7 @@ def notice_text(prs: list[dict[str, Any]]) -> str:
 
 
 def notice_key(prs: list[dict[str, Any]]) -> str:
-    return "ghpr:" + hashlib.sha1("|".join(sorted(f"{pr_key(p)}@{p['updated']}" for p in prs)).encode()).hexdigest()[:16]
+    return "ghpr:" + hashlib.sha1("|".join(sorted(f"{pr_key(p)}@{p['sha']}" for p in prs)).encode()).hexdigest()[:16]
 
 
 # ---- agent tools (github_read / github_write) ---------------------------------------------------

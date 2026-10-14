@@ -21,14 +21,18 @@ import httpx
 from aoa import github_monitor
 from aoa.config import Settings
 from aoa.core import AgentCore
-from aoa.direct import handle_events
+from aoa.direct import DirectOps, handle_events
 from aoa.llm import LLM
+from aoa.loop import run_agent_loop
 from aoa.memory import MemoryStore
+from aoa.pr_review import build_task, parse_verdict
 from aoa.store import Store
 from aoa.testing import MemoryScheduler
 
 from .cases import Case
 from .graders import Run, ToolCall
+
+REVIEW_CONV = "prreview/eval"
 
 SESSION = "main"
 _current: contextvars.ContextVar[tuple[Run, Case] | None] = contextvars.ContextVar("eval_run", default=None)
@@ -63,14 +67,14 @@ def install_fakes() -> Callable[[], None]:
     return undo
 
 
-def _collect(core: AgentCore, run: Run) -> None:
+def _collect(core: AgentCore, run: Run, conv: str = SESSION) -> None:
     run.outbox = [{"kind": o["kind"], "payload": o["payload"]} for o in core.store.outbox_since(SESSION)]
     run.routines = core.store.routine_list(SESSION)
     run.scheduled = dict(core.scheduler.items)
     run.digest = core.store.kv_get(SESSION, "digest", [])
-    u = core.store.usage_totals(SESSION)
+    u = core.store.usage_totals(conv)
     run.output_tokens, run.input_tokens, run.cache_read, run.cache_write = u["output"], u["input"], u["cache_read"], u["cache_write"]
-    for m in core.store.load_messages(SESSION):
+    for m in core.store.load_messages(conv):
         if m["role"] != "assistant":
             continue
         run.steps += 1
@@ -90,15 +94,32 @@ async def run_case_once(case: Case, llm: LLM, base: Settings) -> Run:
             s = dataclasses.replace(base, data_dir=Path(d))
             core = AgentCore(s, Store(s.db_path), MemoryStore(s.memory_dir), llm, MemoryScheduler(),
                              clock=lambda: case.clock)
+            conv = REVIEW_CONV if case.mode == "review" else SESSION
             try:
+                if case.mode == "review":
+                    run.verdict = await _review(core, case)
                 for events in case.turns:
                     await handle_events(core, SESSION, events)
             except Exception as e:  # noqa: BLE001 - a crashed run is a failed run, with the reason kept
                 run.error = f"{type(e).__name__}: {e}"
-            _collect(core, run)
+            _collect(core, run, conv)
     finally:
         _current.reset(token)
     return run
+
+
+REVIEW_PR = {"repo": "agileresearchservices/demo", "number": 7, "sha": "0123456789abcdef0123",
+             "title": "", "author": "agileresearchservices", "url": "https://github.com/agileresearchservices/demo/pull/7"}
+
+
+async def _review(core: AgentCore, case: Case) -> dict[str, Any] | None:
+    """The same reviewer the PrReviewWorkflow runs: a helper with build_task, in-process."""
+    await core.prepare_helper(REVIEW_CONV, build_task(REVIEW_PR))
+    res = await run_agent_loop(
+        DirectOps(core, SESSION), conv=REVIEW_CONV, role="helper", depth=1, turn_key="h",
+        max_steps=core.s.max_helper_steps, max_helper_depth=core.s.max_helper_depth, trigger_user=False,
+    )
+    return parse_verdict(res.text or "")
 
 
 def grade(case: Case, run: Run) -> list[str]:
@@ -125,7 +146,8 @@ async def run_suite(
         return {"case": case.name, "run": i, "passed": not failures, "failures": failures,
                 "steps": run.steps, "output_tokens": run.output_tokens, "input_tokens": run.input_tokens,
                 "cache_read": run.cache_read, "cache_write": run.cache_write, "kinds": [o["kind"] for o in run.outbox],
-                "tools": [c.name for c in run.tool_calls]}
+                "tools": [c.name for c in run.tool_calls],
+                "verdict": run.verdict["verdict"] if run.verdict else None}
 
     t0 = time.time()
     try:

@@ -32,6 +32,7 @@ PREFIX = {
     "approval": ":lock: ",
     "system": "_system_ ",
     "sent_log": "_outbound_ ",
+    "pr_review": ":mag: ",
 }
 TYPED_DECISION = re.compile(r"^\s*(approve|deny)\s+(apr-[0-9a-f]+)\s*$", re.IGNORECASE)
 
