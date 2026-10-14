@@ -48,6 +48,10 @@ Things that are easy to break:
 
 `aoa/testing.py` (shipped in the package) provides `FakeLLM` (scripted responses; helpers `text()` and `tool()`; a step may be content blocks, a callable, or an Exception) and `MemoryScheduler`. `tests/conftest.py`'s `make_core(script)` builds an `AgentCore` with a fixed clock (2026-10-14 14:00 New York) and returns `(core, llm)`; `bg_event` / `usr_event` build event dicts. Prefer testing through `direct.handle_events` rather than needing Temporal; reserve `@pytest.mark.temporal` for workflow-specific behavior (`tests/test_temporal_e2e.py`).
 
+## Evals
+
+`python -m evals [--runs N] [--case NAME] [--list]` runs the seed behavior suite against the **real model** (needs `ANTHROPIC_API_KEY`; export only that, not the GitHub token). Each run uses a throwaway data dir, an in-memory scheduler and a fake GitHub (`gh_call` replaced by a recorder); `external_send` is already a stub. Cases (`evals/cases.py`) are `hard` (safety rules, must pass every run; non-zero exit otherwise) or `soft` (policy; watch the pass rate). Graders (`evals/graders.py`) are deterministic Python over the run's outbox, tool calls and recorded effects; they have canned-run unit tests in `tests/test_evals.py` (default `pytest`, no model). Results go to `evals/results/*.json` (git-ignored). Cost: the full suite at 3 runs/case (30 runs) used about 0.28M cache-read, 7k cache-write, 10k output tokens and took ~45 s, because runs share the cached prompt prefix; a cold cache costs more. Add a case whenever a behavior is verified by hand or a bug is found.
+
 ## Pull requests
 
 Link every PR to the issue it addresses with a closing keyword in the body (`Closes #N`, `Fixes #N`), so merging closes the issue automatically. If there is no issue, create one first. Use `Refs #N` only when the PR intentionally leaves the issue open. Keywords only fire when the PR merges into the default branch. `.github/pull_request_template.md` has the skeleton.
