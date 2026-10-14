@@ -8,7 +8,16 @@ scope names below are from memory; check them against Slack's current docs if so
 1. Create a free workspace for yourself (or use one you own).
 2. Create a **private** channel, e.g. `#aoa-agent`.
 
-## 2. Create the app (api.slack.com/apps -> Create New App -> From scratch)
+## 2. Create the app
+
+Fastest: api.slack.com/apps -> Create New App -> **From a manifest**, pick your workspace, and paste:
+
+```json
+{"display_information":{"name":"aoa agent"},"features":{"bot_user":{"display_name":"aoa","always_online":true}},"oauth_config":{"scopes":{"bot":["chat:write","groups:history"]}},"settings":{"event_subscriptions":{"bot_events":["message.groups"]},"interactivity":{"is_enabled":true},"org_deploy_enabled":false,"socket_mode_enabled":true,"token_rotation_enabled":false}}
+```
+
+That sets the scopes, event, Socket Mode and interactivity for you. You still need to generate the app-level
+token (Basic Information -> App-Level Tokens, scope `connections:write`) and install the app. The manual steps:
 1. **Socket Mode:** enable it. Create an app-level token with the `connections:write` scope.
    Copy it (starts with `xapp-`) -> `SLACK_APP_TOKEN`.
 2. **OAuth & Permissions -> Bot Token Scopes:** `chat:write`, `groups:history`.
