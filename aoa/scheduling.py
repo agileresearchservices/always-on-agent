@@ -46,3 +46,28 @@ class TemporalScheduler:
             if e.status == RPCStatusCode.NOT_FOUND:
                 return False
             raise
+
+
+GITHUB_SCHEDULE_ID = "aoa-monitor-github"
+
+
+async def ensure_github_schedule(client: Client, settings: Settings) -> None:
+    """Create (or update) the GitHub PR poll schedule. Interval and user come from env at worker start."""
+    import os
+    from datetime import timedelta
+
+    from temporalio.client import ScheduleIntervalSpec
+
+    session = os.environ.get("AOA_SESSION", "main")
+    every = int(os.environ.get("AOA_GITHUB_POLL_SECONDS", "600"))
+    schedule = Schedule(
+        action=ScheduleActionStartWorkflow(
+            "GithubPollWorkflow", {"session": session, "user": os.environ["AOA_GITHUB_USER"]},
+            id=f"{GITHUB_SCHEDULE_ID}-run", task_queue=settings.task_queue,
+        ),
+        spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(seconds=every))]),
+    )
+    try:
+        await client.create_schedule(GITHUB_SCHEDULE_ID, schedule)
+    except ScheduleAlreadyRunningError:
+        await client.get_schedule_handle(GITHUB_SCHEDULE_ID).update(lambda _: ScheduleUpdate(schedule=schedule))

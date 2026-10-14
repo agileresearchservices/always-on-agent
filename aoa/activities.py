@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 from temporalio import activity
 from temporalio.client import Client
 
@@ -10,6 +11,7 @@ from .config import Settings
 from .core import AgentCore
 from .delivery import deliver_event
 from .events import Event
+from .github_monitor import poll_once, token_provider
 
 
 class AgentActivities:
@@ -63,9 +65,17 @@ class AgentActivities:
         )
         await deliver_event(self.client, self.s, a["session"], ev.to_dict())
 
+    @activity.defn(name="poll_github")
+    async def poll_github(self, a: dict[str, Any]) -> int:
+        async with httpx.AsyncClient(timeout=20) as http:
+            events = await poll_once(http, self.core.store, a["session"], a["user"], token_provider())
+        for ev in events:
+            await deliver_event(self.client, self.s, a["session"], ev.to_dict())
+        return len(events)
+
     def all(self) -> list:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
             self.maybe_compact, self.sandbox_sleep, self.warm_cache, self.report_failure,
-            self.deliver_routine_event,
+            self.deliver_routine_event, self.poll_github,
         ]

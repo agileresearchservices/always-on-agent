@@ -241,3 +241,13 @@ class RoutineWorkflow:
              "dedupe_key": f"routine:{workflow.info().workflow_id}"},  # id includes the scheduled time
             start_to_close_timeout=timedelta(seconds=60), retry_policy=STATE_RETRY,
         )
+
+
+@workflow.defn(name="GithubPollWorkflow")
+class GithubPollWorkflow:
+    @workflow.run
+    async def run(self, inp: dict[str, Any]) -> int:
+        return await workflow.execute_activity(
+            "poll_github", inp, start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=5)),
+        )

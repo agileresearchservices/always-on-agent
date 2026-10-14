@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from temporalio.client import Client
 from temporalio.worker import Worker
@@ -12,9 +13,9 @@ from .config import Settings
 from .core import AgentCore
 from .llm import AnthropicLLM
 from .memory import MemoryStore
-from .scheduling import TemporalScheduler
+from .scheduling import TemporalScheduler, ensure_github_schedule
 from .store import Store
-from .workflows import HelperWorkflow, RoutineWorkflow, SessionWorkflow
+from .workflows import GithubPollWorkflow, HelperWorkflow, RoutineWorkflow, SessionWorkflow
 
 
 async def build_worker(settings: Settings, client: Client, core: AgentCore | None = None) -> Worker:
@@ -27,7 +28,7 @@ async def build_worker(settings: Settings, client: Client, core: AgentCore | Non
     return Worker(
         client,
         task_queue=settings.task_queue,
-        workflows=[SessionWorkflow, HelperWorkflow, RoutineWorkflow],
+        workflows=[SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow],
         activities=acts.all(),
         max_concurrent_activities=20,
     )
@@ -38,6 +39,8 @@ async def main() -> None:
     settings = Settings.from_env()
     client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
     worker = await build_worker(settings, client)
+    if os.environ.get("GITHUB_TOKEN") and os.environ.get("AOA_GITHUB_USER"):
+        await ensure_github_schedule(client, settings)
     logging.info("worker up on queue %s (data dir %s)", settings.task_queue, settings.data_dir)
     await worker.run()
 
