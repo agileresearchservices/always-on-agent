@@ -89,6 +89,8 @@ async def h_send_user(ctx: ToolContext, a: dict[str, Any]) -> str:
     kind = a.get("kind", "reply" if ctx.trigger_user else "update")
     if kind == "reply" and not ctx.trigger_user:
         kind = "update"  # a background turn is never a reply to a live person
+    elif kind == "update" and ctx.trigger_user:
+        kind = "reply"  # the person (or their own routine) started this turn: never hold the answer (eval user_turn_answers_as_reply)
     res = ctx.notifier.send(ctx.session, kind, a.get("text", ""), ctx.now(), client_key=a.get("client_key"))
     if res["status"] == "error":
         raise ToolError(res["error"])

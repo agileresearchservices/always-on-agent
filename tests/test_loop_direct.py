@@ -26,6 +26,12 @@ async def test_reply_goes_through_send_user_only(make_core):
     assert _roles(core.store.load_messages("main")) == ["user", "assistant", "user", "assistant"]
 
 
+async def test_update_in_a_user_turn_is_sent_as_a_reply(make_core):
+    core, _ = make_core([[tool("send_user", text="card is up", kind="update")], text(".")])
+    await handle_events(core, "main", [usr_event("file it and tell me")])
+    assert [o["kind"] for o in core.store.outbox_since("main")] == ["reply"]  # not held by the notifier
+
+
 async def test_duplicate_event_is_dropped(make_core):
     core, llm = make_core([text("ok")])
     ev = bg_event("same", key="k1")
