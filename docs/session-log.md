@@ -141,3 +141,24 @@ planned eval flywheel).
 - **Stage 3 (conflicts, two clicks):** #16 conflicted with main in `docs/session-log.md` after #17 merged. The first attempt failed safely (forced `tool_choice` rejected, #19, fixed in #20). Retry: resolved by the model (put the line in the stage-2 section and kept stage 3 intact), the base branch's `.aoa/test-command` passed, pushed `3826197` as "aoa agent". Re-review approved, told which file was model-resolved. The second click merged `cdc7632` and closed #15.
 - Cosmetic: `slack_safe` strips `_ [ ] & *` from text it cleans, so titles and the test command show mangled in Slack notices ("toolchoice", "pip install -e .dev"). Added to #18.
 - Follow-ups: #18 (conflict-resolution hardening), #11 (a reviewer identity for real APPROVE/REQUEST_CHANGES).
+
+## Hardening and reviewer identity — 2026-10-14 (evening)
+- **#22 (closes #18), conflict-resolution hardening:**
+  - Resolution is refused while GitHub auto-merge is on. This is checked in the activity before cloning and again just before the push, through a `before_push` hook.
+  - A clean local merge returns `no_conflict` (retryable; nothing pushed).
+  - `finish_resolution`: every line outside the conflict hunks must survive verbatim, in order and at line starts. CRLF and the trailing newline follow the two sides.
+  - `tests_failed` and a cut-off answer (`needs_human`) don't bring the Merge button back.
+  - Stale `aoa-resolve` dirs are removed at worker start. Model calls retry 408/409.
+  - `slack_safe` now escapes `& < >` and keeps `_ [ ]`. Link labels turn brackets into parentheses, and check names are escaped only once.
+  - Bot review: APPROVE with two medium findings (bad or oversized `AOA_RESOLVE_TEST_TIMEOUT`, and the test timeout ignoring the activity's 30 min). The fix commit was pushed seconds after the person's Merge click had already merged the reviewed commit. The click correctly merged only what was reviewed, and the fix went in as **#24** (closes #23): the timeout is parsed defensively and capped by the activity's remaining time.
+- **#25 (closes #11), reviewer identity:**
+  - `gh_reviewer.py` mints GitHub App installation tokens, each scoped to one repo with only `pull_requests: write`, and caches them. `AOA_REVIEWER_TOKEN` (second account) is the alternative.
+  - Reviews then post as a real APPROVE / REQUEST_CHANGES, falling back to a comment review on any failure.
+  - It stays off until the App exists. Setup steps are in the PR #25 comment (pre-filled App-creation link).
+  - The owner's other project (`pr-sweep`) posts as the `gh` account, which only works for other people's PRs.
+- **#21:** real isolation for the resolver's test run (container), split out as a design decision.
+- **#27 (fixes #26):**
+  - The new soft eval `user_turn_answers_as_reply` reproduced the live finding (4/5): the agent sometimes sends user-turn confirmations as `update`, which the notifier may hold.
+  - Fixed in code: `send_user` turns `update` into `reply` when `trigger_user`.
+  - Full eval suite 3/3 on all 15 cases.
+- Both Merge buttons (#24, #25) were clicked at once. The two runs merged one after the other with no conflict, and the combined main passed 167 tests. Services restarted on `fe3891e`.
