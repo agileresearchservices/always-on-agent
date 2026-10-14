@@ -48,6 +48,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         sonnet = os.environ.get("AOA_MODEL", "claude-sonnet-5-5")
+        nudge = max(1, _int("AOA_APPROVAL_NUDGE", 4 * 3600))  # expiry must come after the nudge
         return cls(
             data_dir=Path(os.environ.get("AOA_DATA_DIR", "./data")).resolve(),
             model=sonnet,
@@ -71,8 +72,8 @@ class Settings:
             quiet_start_hour=_int("AOA_QUIET_START", 22),
             quiet_end_hour=_int("AOA_QUIET_END", 7),
             shell_timeout_seconds=_int("AOA_SHELL_TIMEOUT", 60),
-            approval_nudge_seconds=_int("AOA_APPROVAL_NUDGE", 4 * 3600),
-            approval_expire_seconds=_int("AOA_APPROVAL_EXPIRE", 24 * 3600),
+            approval_nudge_seconds=nudge,
+            approval_expire_seconds=max(nudge + 1, _int("AOA_APPROVAL_EXPIRE", 24 * 3600)),
         )
 
     # Derived paths -------------------------------------------------------

@@ -9,6 +9,7 @@ import asyncio
 import hmac
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -128,6 +129,8 @@ async def decide(sid: str, approval_id: str, d: Decision) -> dict[str, Any]:
     rec = store.approval_get(approval_id)
     if rec is None or rec["session"] != sid:
         raise HTTPException(404, "no such approval")
+    if rec["status"] == "pending" and time.time() >= rec["ts"] + settings.approval_expire_seconds:
+        store.approval_expire(approval_id)  # past its lifetime but the workflow timer has not run yet
     if not store.approval_resolve(approval_id, d.approve):
         status = (store.approval_get(approval_id) or rec)["status"]  # re-read: it may have lapsed just now
         if status == "expired":

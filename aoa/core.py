@@ -280,19 +280,21 @@ class AgentCore:
         for a in self.store.approvals_pending(session):
             what = a["action"].get("tool", "action")
             if now.timestamp() >= a["ts"] + self.s.approval_expire_seconds:
+                # tell first: the client key makes a retried send a no-op, whereas expiring first would let a
+                # failed send leave the person never told
+                self.notifier.send(
+                    session, "alert", f"Approval {a['id']} ({what}) lapsed after "
+                    f"{self.s.approval_expire_seconds // 3600}h without an answer, so it was NOT done. "
+                    "Ask me again if you still want it.", now, client_key=f"apr-expired:{a['id']}")
                 if self.store.approval_expire(a["id"]):
-                    self.notifier.send(
-                        session, "alert", f"Approval {a['id']} ({what}) lapsed after "
-                        f"{self.s.approval_expire_seconds // 3600}h without an answer, so it was NOT done. "
-                        "Ask me again if you still want it.", now, client_key=f"apr-expired:{a['id']}")
                     done["expired"].append(a["id"])
             elif now.timestamp() >= a["ts"] + self.s.approval_nudge_seconds:
                 if not self.store.kv_get(session, f"apr_nudged:{a['id']}", False):
-                    self.store.kv_set(session, f"apr_nudged:{a['id']}", True)
                     self.notifier.send(
                         session, "alert", f"Still waiting on your decision for approval {a['id']} ({what}). "
                         f"It lapses after {self.s.approval_expire_seconds // 3600}h.", now,
                         client_key=f"apr-nudge:{a['id']}")
+                    self.store.kv_set(session, f"apr_nudged:{a['id']}", True)
                     done["nudged"].append(a["id"])
         return done | {"next": await self.approvals_next(session)}
 

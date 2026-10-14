@@ -138,6 +138,12 @@ class SessionWorkflow:
         await self._arm_timers(session)  # items held / pending before a continue-as-new still need their timers
 
         while not self._stop:
+            if self._apr_at is not None and workflow.time() >= self._apr_at:
+                # due even while events keep arriving (the wait below is skipped when there is work)
+                res = await workflow.execute_activity(
+                    "approvals_tick", session, start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
+                )
+                self._apr_at = res.get("next")
             if not self._should_wake():
                 idle = None if self._asleep else float(cfg["idle_sleep"])
                 nxt = [t for t in (self._flush_at, self._apr_at) if t is not None]
