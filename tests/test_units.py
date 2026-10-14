@@ -186,3 +186,16 @@ def test_compaction_index_math(settings):
     assert [m["content"][0]["text"] for m in msgs] == ["SUMMARY", "m4", "m5"]
     st.append_message("c", "assistant", [{"type": "text", "text": "next"}])  # indices keep growing correctly
     assert len(st.load_messages("c")) == 4
+
+
+def test_is_cache_miss_flags_partial_misses():
+    import time
+    from aoa.core import is_cache_miss
+
+    prev = {"ts": time.time(), "cache_read": 2800, "cache_write": 180, "input_tokens": 2}
+    assert not is_cache_miss(prev, {"cache_read_input_tokens": 2980}, 300)
+    assert is_cache_miss(prev, {"cache_read_input_tokens": 1509}, 300)  # partial: only system+tools hit
+    assert is_cache_miss(prev, {"cache_read_input_tokens": 0}, 300)
+    assert not is_cache_miss(None, {"cache_read_input_tokens": 0}, 300)
+    stale = dict(prev, ts=time.time() - 1000)
+    assert not is_cache_miss(stale, {"cache_read_input_tokens": 0}, 300)

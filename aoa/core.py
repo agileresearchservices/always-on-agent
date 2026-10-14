@@ -27,6 +27,21 @@ from .tools import Scheduler, ToolContext, ToolError, core_tool_definitions, dis
 log = logging.getLogger("aoa.core")
 
 
+MISS_FRACTION = 0.9
+
+
+def is_cache_miss(prev: dict[str, Any] | None, usage: dict[str, int], ttl: float) -> bool:
+    """True if a call inside the cache TTL read back clearly less than the previous call cached.
+
+    Everything the previous call read or wrote is a prefix of this request, so a healthy call reads
+    about that many tokens. Catches partial misses (e.g. only system+tools hit), not just read == 0.
+    """
+    if not prev or (time.time() - prev["ts"]) >= ttl:
+        return False
+    cached = prev["cache_read"] + prev["cache_write"]
+    return cached > 0 and usage.get("cache_read_input_tokens", 0) < MISS_FRACTION * cached
+
+
 class AgentCore:
     def __init__(
         self,
@@ -117,13 +132,11 @@ class AgentCore:
             model=model, system=system, messages=messages, tools=tools, max_tokens=self.s.max_tokens
         )
         content = resp.content or [{"type": "text", "text": "(no output)"}]
-        cache_miss = bool(
-            prev and (time.time() - prev["ts"]) < self.s.cache_ttl_seconds
-            and (prev["cache_read"] + prev["cache_write"]) > 0
-            and resp.usage.get("cache_read_input_tokens", 0) == 0
-        )
+        cache_miss = is_cache_miss(prev, resp.usage, self.s.cache_ttl_seconds)
         if cache_miss:
-            log.warning("cache miss in %s within TTL: treat as a bug (prefix changed?)", conv)
+            log.warning("cache miss in %s within TTL (read %s of ~%s cached tokens): treat as a bug (prefix changed?)",
+                    conv, resp.usage.get("cache_read_input_tokens", 0),
+                    prev["cache_read"] + prev["cache_write"])
         result = {
             "content": content,
             "stop_reason": resp.stop_reason,
