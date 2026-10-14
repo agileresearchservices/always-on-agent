@@ -22,6 +22,8 @@ uvicorn aoa.server:app --port 8000
 python -m aoa.client_cli --session main
 ```
 
+**Running for real (local, always-on):** the four services run as launchd user agents (`com.aoa.temporal|worker|server|slack-bridge`, installed by `deploy/install-launchd.sh install`, KeepAlive, logs in `data/logs/`, Temporal history in `data/temporal.db`). They run whatever is checked out in this repo, so after changing code on `main` restart the affected service: `launchctl kickstart -k gui/$(id -u)/com.aoa.worker` (same for `server`, `slack-bridge`). Do not start hand-run copies alongside them (ports 7233/8000). Status: `deploy/install-launchd.sh status`. An activity's result shape change must stay replay-compatible with in-flight workflows (see `GithubPollWorkflow`).
+
 All configuration is env vars read in `aoa/config.py` (`Settings.from_env`, all prefixed `AOA_`). Tests redirect state with `AOA_DATA_DIR` (see the `settings` fixture in `tests/conftest.py`).
 
 ## Architecture
