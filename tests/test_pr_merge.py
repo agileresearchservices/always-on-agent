@@ -293,6 +293,8 @@ def test_merge_endpoint_starts_one_workflow_for_a_stored_offer(api):
     assert call["arg"]["offer"]["sha"] == SHA and call["arg"]["card_ts"] == "17.5"
     assert call["id_conflict_policy"] == WorkflowIDConflictPolicy.FAIL
     assert call["id_reuse_policy"] == WorkflowIDReusePolicy.ALLOW_DUPLICATE
+    sa = {p.key.name: p.value for p in call["search_attributes"]}
+    assert sa == {"Repo": OFFER["repo"], "PrNumber": OFFER["number"], "Sha": SHA, "Session": "main"}
     assert client.post("/sessions/main/merges/mrg-0123456789ab", json={}).status_code == 409  # double click
 
 
@@ -352,3 +354,20 @@ async def test_reviewer_identity_failure_falls_back_to_a_comment_review(acts, mo
     assert fake.tokens == ["ghs_reviewer", None]  # the fallback uses GITHUB_TOKEN
     text = acts.core.store.outbox_since("main")[-1]["payload"]["text"]
     assert "as a comment review" in text and "could not post (422)" in text
+
+
+def test_merge_still_starts_when_the_server_does_not_know_the_search_attributes(api):
+    from temporalio.service import RPCError, RPCStatusCode
+
+    client, fake, store = api
+    real = fake.start_workflow
+
+    async def picky(workflow, arg, **kw):
+        if "search_attributes" in kw:
+            raise RPCError("Namespace default has no mapping defined for search attribute Repo", RPCStatusCode.INVALID_ARGUMENT, b"")
+        return await real(workflow, arg, **kw)
+
+    fake.start_workflow = picky
+    store.kv_set("main", "merge-offer:mrg-0123456789ab", OFFER)
+    assert client.post("/sessions/main/merges/mrg-0123456789ab", json={}).status_code == 202
+    assert fake.started[0]["workflow"] == "MergePrWorkflow" and "search_attributes" not in fake.started[0]

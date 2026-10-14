@@ -259,6 +259,12 @@ class AgentCore:
             self.memory.append_log(f"compacted conversation ({mode}, ~{tokens} tokens before)", self.now())
         return mode if ok else "none"
 
+    @staticmethod
+    def _dur(seconds: int) -> str:
+        if seconds >= 3600 and seconds % 3600 == 0:
+            return f"{seconds // 3600}h"
+        return f"{seconds // 60}m" if seconds >= 120 else f"{seconds}s"
+
     def _approval_times(self, a: dict[str, Any], nudged: bool) -> list[float]:
         out = [a["ts"] + self.s.approval_expire_seconds]
         if not nudged:
@@ -284,7 +290,7 @@ class AgentCore:
                 # failed send leave the person never told
                 self.notifier.send(
                     session, "alert", f"Approval {a['id']} ({what}) lapsed after "
-                    f"{self.s.approval_expire_seconds // 3600}h without an answer, so it was NOT done. "
+                    f"{self._dur(self.s.approval_expire_seconds)} without an answer, so it was NOT done. "
                     "Ask me again if you still want it.", now, client_key=f"apr-expired:{a['id']}")
                 if self.store.approval_expire(a["id"]):
                     done["expired"].append(a["id"])
@@ -292,7 +298,7 @@ class AgentCore:
                 if not self.store.kv_get(session, f"apr_nudged:{a['id']}", False):
                     self.notifier.send(
                         session, "alert", f"Still waiting on your decision for approval {a['id']} ({what}). "
-                        f"It lapses after {self.s.approval_expire_seconds // 3600}h.", now,
+                        f"It lapses after {self._dur(self.s.approval_expire_seconds)}.", now,
                         client_key=f"apr-nudge:{a['id']}")
                     self.store.kv_set(session, f"apr_nudged:{a['id']}", True)
                     done["nudged"].append(a["id"])

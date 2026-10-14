@@ -15,6 +15,7 @@ from .llm import AnthropicLLM
 from .memory import MemoryStore
 from .pr_resolve import clean_stale_workdirs
 from .scheduling import TemporalScheduler, ensure_github_schedule
+from .search_attrs import ensure_registered
 from .store import Store
 from .workflows import (
     GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow,
@@ -28,6 +29,7 @@ async def build_worker(settings: Settings, client: Client, core: AgentCore | Non
             TemporalScheduler(client, settings),
         )
     acts = AgentActivities(core, client, settings)
+    await ensure_registered(client)  # the PR workflows set Repo/PrNumber/Sha/Session; the server must know them
     return Worker(
         client,
         task_queue=settings.task_queue,

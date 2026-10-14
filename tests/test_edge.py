@@ -295,3 +295,8 @@ def test_approval_settings_are_sane(monkeypatch):
     monkeypatch.setenv("AOA_APPROVAL_EXPIRE", "-5")
     s = Settings.from_env()
     assert s.approval_nudge_seconds >= 1 and s.approval_expire_seconds > s.approval_nudge_seconds
+
+
+def test_durations_in_approval_notices_read_correctly():
+    from aoa.core import AgentCore
+    assert [AgentCore._dur(x) for x in (5, 90, 5400, 14400, 86400)] == ["5s", "90s", "90m", "4h", "24h"]

@@ -23,6 +23,7 @@ from temporalio.exceptions import ActivityError, ChildWorkflowError, WorkflowAlr
 with workflow.unsafe.imports_passed_through():
     from .loop import run_agent_loop
     from .pr_review import build_task
+    from .search_attrs import pr_attrs
 
 LLM_RETRY = RetryPolicy(
     maximum_attempts=6, initial_interval=timedelta(seconds=2), maximum_interval=timedelta(seconds=60),
@@ -306,11 +307,14 @@ class GithubPollWorkflow:
             return res
         for pr in res["review"]:
             wid = f"pr-review-{inp['session']}-{pr['repo'].replace('/', '-')}-{pr['number']}-{pr['sha'][:12]}"
+            attrs = ({"search_attributes": pr_attrs(pr["repo"], pr["number"], pr["sha"], inp["session"])}
+                     if workflow.patched("pr-search-attrs") else {})
             try:
                 await workflow.start_child_workflow(
                     "PrReviewWorkflow", {"session": inp["session"], "cfg": inp["cfg"], "pr": pr}, id=wid,
                     parent_close_policy=workflow.ParentClosePolicy.ABANDON,
                     id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                    **attrs,
                 )
             except WorkflowAlreadyStartedError:
                 pass  # this commit was already reviewed (or is being reviewed)
