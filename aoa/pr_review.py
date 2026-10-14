@@ -98,16 +98,20 @@ def _label(verdict: str) -> str:
     return "APPROVE" if verdict == "approve" else "REQUEST CHANGES"
 
 
-def github_body(v: dict[str, Any]) -> str:
-    lines = [f"**aoa review: recommendation {_label(v['verdict'])}**", "", v["summary"]]
+def github_body(v: dict[str, Any], formal: bool = False) -> str:
+    """formal: posted by the reviewer identity as a real APPROVE / REQUEST_CHANGES (#11)."""
+    head = f"**aoa review: {_label(v['verdict'])}**" if formal else f"**aoa review: recommendation {_label(v['verdict'])}**"
+    lines = [head, "", v["summary"]]
     if v["findings"]:
         lines += ["", "**Findings**"] + [f"- **{f['severity']}** {_where(f)}{f['comment']}" for f in v["findings"]]
-    lines += ["", "_Automated review by the aoa reviewer sub-agent. Posted as a comment review: GitHub does not "
-                  "let the PR author's account approve or request changes._"]
+    lines += ["", "_Automated review by the aoa reviewer sub-agent._" if formal else
+              "_Automated review by the aoa reviewer sub-agent. Posted as a comment review: GitHub does not "
+              "let the PR author's account approve or request changes._"]
     return no_mentions(defang_links("\n".join(lines)))
 
 
-def slack_text(v: dict[str, Any] | None, pr: dict[str, Any], posted: bool, note: str = "") -> str:
+def slack_text(v: dict[str, Any] | None, pr: dict[str, Any], posted: bool, note: str = "",
+               posted_as: str = "a comment review") -> str:
     from .github_monitor import slack_safe
 
     head = f"[{slack_safe(pr['repo'], True)}#{pr['number']} {slack_safe(pr['title'], True)}]({pr['url']})"
@@ -119,5 +123,6 @@ def slack_text(v: dict[str, Any] | None, pr: dict[str, Any], posted: bool, note:
         lines.append(f"• *{f['severity']}* {_slack_plain(_where(f) + f['comment'])}")
     if len(v["findings"]) > 5:
         lines.append(f"…{len(v['findings']) - 5} more on GitHub")
-    lines.append("_Posted on GitHub as a comment review._" if posted else f"_Not posted on GitHub. {note}_")
+    lines.append(f"_Posted on GitHub as {posted_as}.{' ' + note if note else ''}_" if posted
+                 else f"_Not posted on GitHub. {note}_")
     return "\n".join(lines)

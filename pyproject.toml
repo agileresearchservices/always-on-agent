@@ -12,7 +12,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "pyjwt[crypto]"]
+github-app = ["pyjwt[crypto]"]
 slack = ["slack_sdk", "aiohttp"]
 
 [tool.setuptools]

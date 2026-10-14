@@ -15,6 +15,13 @@ from aoa.testing import FakeLLM, MemoryScheduler
 AFTERNOON = datetime(2026, 10, 14, 14, 0, tzinfo=ZoneInfo("America/New_York"))
 
 
+@pytest.fixture(autouse=True)
+def _no_reviewer_identity(monkeypatch):
+    """A developer shell's reviewer App/token must not change what PR-review tests post."""
+    for k in ("AOA_REVIEWER_TOKEN", "AOA_REVIEWER_APP_ID", "AOA_REVIEWER_APP_KEY_FILE"):
+        monkeypatch.delenv(k, raising=False)
+
+
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
     monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))

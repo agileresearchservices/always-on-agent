@@ -73,7 +73,7 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 | Auto-review of commands by a second model | `safety.py`: denylist, then reviewer model, fail closed |
 | Untrusted input is data; irreversible actions need approval | `events.render_event_text`, `safety.wrap_untrusted`, `external_send` approval flow |
 | Errors written for agents | `ToolError` messages say what to do next |
-| Watch, review, merge (PR flow) | `github_monitor.py` announces PRs; `PrReviewWorkflow` runs a reviewer sub-agent and posts a comment review (`pr_review.py`); an approved card gets a Slack [Merge] button that starts `MergePrWorkflow` (`pr_merge.py`): wait for checks, squash-merge pinned to the reviewed commit, delete the branch, confirm linked issues closed. On conflicts the click instead has `pr_resolve.py` resolve them in a throwaway clone (model per file, validated), run the repo's tests with no secrets in the environment, and push; the new commit is reviewed again and needs a second click. The model never has a merge tool |
+| Watch, review, merge (PR flow) | `github_monitor.py` announces PRs; `PrReviewWorkflow` runs a reviewer sub-agent and posts its review (`pr_review.py`): a real APPROVE / REQUEST_CHANGES when a reviewer identity is configured (`gh_reviewer.py`, a GitHub App with per-repo tokens), else a comment review with a stated recommendation; an approved card gets a Slack [Merge] button that starts `MergePrWorkflow` (`pr_merge.py`): wait for checks, squash-merge pinned to the reviewed commit, delete the branch, confirm linked issues closed. On conflicts the click instead has `pr_resolve.py` resolve them in a throwaway clone (model per file, validated), run the repo's tests with no secrets in the environment, and push; the new commit is reviewed again and needs a second click. The model never has a merge tool |
 
 ## Honest limits
 
@@ -95,3 +95,6 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
   repo's test command on this machine (allowlisted env, throwaway HOME, clone outside the data dir), which is
   the repo's own code, as if you ran it. Only your own reviewed PRs get there, and the command comes from config
   or the base branch, never the PR. Running it in a container is #21; until then, do not use this on code you do not trust.
+- **The reviewer App's private key is a file your user can read**, like `.env`, so a non-isolated sandbox command
+  could read it too. The installation tokens minted from it are scoped to one repo and `pull_requests: write`,
+  but the key itself can mint tokens for every repo the App is installed on.
