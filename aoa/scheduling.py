@@ -58,11 +58,14 @@ async def ensure_github_schedule(client: Client, settings: Settings) -> None:
 
     from temporalio.client import ScheduleIntervalSpec
 
+    from .delivery import workflow_cfg
+
     session = os.environ.get("AOA_SESSION", "main")
     every = int(os.environ.get("AOA_GITHUB_POLL_SECONDS", "600"))
     schedule = Schedule(
         action=ScheduleActionStartWorkflow(
-            "GithubPollWorkflow", {"session": session, "user": os.environ["AOA_GITHUB_USER"]},
+            "GithubPollWorkflow",
+            {"session": session, "user": os.environ["AOA_GITHUB_USER"], "cfg": workflow_cfg(settings)},
             id=f"{GITHUB_SCHEDULE_ID}-run", task_queue=settings.task_queue,
         ),
         spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(seconds=every))]),

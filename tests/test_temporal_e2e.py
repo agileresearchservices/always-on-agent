@@ -98,3 +98,47 @@ async def test_helper_child_workflow_returns_only_result(client, env):
     store, _ = await _run(client, env, script, sid, [user_event("research")], 1, timeout=60)
     assert store.outbox_since(sid)[0]["payload"]["text"] == "got: HELPER RESULT"
     assert len(store.load_messages(sid)) == 6  # helper turns live in their own conversation
+
+
+async def test_poll_starts_one_review_per_commit_and_publishes(client, env, monkeypatch):
+    """Poll -> PrReviewWorkflow -> reviewer HelperWorkflow (scripted) -> GitHub comment review + Slack card."""
+    import httpx
+
+    from aoa import github_monitor
+    from aoa.delivery import workflow_cfg
+
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    monkeypatch.setenv("GITHUB_TOKEN", "fake")
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    pr = {"repo": "agileresearchservices/demo", "number": 7, "title": "Tidy", "author": "agileresearchservices",
+          "url": "https://github.com/agileresearchservices/demo/pull/7", "sha": "abc123def4567890", "why": "new"}
+
+    async def fake_poll(http, store, session, user, token):
+        return [pr]
+
+    posts = []
+
+    async def fake_gh(method, path, json=None, accept=""):
+        posts.append((method, path, json))
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr("aoa.activities.poll_once", fake_poll)
+    monkeypatch.setattr(github_monitor, "gh_call", fake_gh)
+    verdict = '{"verdict": "request_changes", "summary": "Bug.", "findings": [{"severity": "high", "file": "a.py", "line": 2, "comment": "off by one"}]}'
+    store = Store(env.db_path)
+    llm = FakeLLM([text(verdict)])  # the reviewer answers in one step
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), llm, TemporalScheduler(client, env))
+    worker = await build_worker(env, client, core)
+    async with worker:
+        inp = {"session": sid, "user": "agileresearchservices", "cfg": workflow_cfg(env)}
+        await client.execute_workflow("GithubPollWorkflow", inp, id=f"poll-{sid}", task_queue=env.task_queue)
+        await client.execute_workflow("GithubPollWorkflow", inp, id=f"poll2-{sid}", task_queue=env.task_queue)
+        deadline = asyncio.get_event_loop().time() + 30
+        while asyncio.get_event_loop().time() < deadline and not any(o["kind"] == "pr_review" for o in store.outbox_since(sid)):
+            await asyncio.sleep(0.2)
+    cards = [o for o in store.outbox_since(sid) if o["kind"] == "pr_review"]
+    assert len(cards) == 1 and cards[0]["payload"]["verdict"] == "request_changes"
+    assert len(llm.calls) == 1  # second poll found the same commit: no second review
+    assert posts == [("POST", "/repos/agileresearchservices/demo/pulls/7/reviews",
+                      {"body": posts[0][2]["body"], "event": "COMMENT", "commit_id": pr["sha"]})]
+    assert "off by one" in posts[0][2]["body"]
