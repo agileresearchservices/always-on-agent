@@ -50,7 +50,7 @@ def request_fingerprint(system: list[dict[str, Any]], tools: list[dict[str, Any]
 def describe_prefix_change(prev: tuple[str, list[str]] | None, cur: tuple[str, list[str]]) -> str:
     """Why a cache miss happened, from our side: what differs from the previous request in this conversation."""
     if prev is None:
-        return "no previous request in this worker process (restart?)"
+        return "no previous request recorded for this conversation"
     if prev[0] != cur[0]:
         return "tools/system changed since the previous request"
     for i, (a, b) in enumerate(zip(prev[1], cur[1])):
@@ -154,6 +154,10 @@ class AgentCore:
         blocks = [{"type": "text", "text": f"Task from the main agent:\n\n{task}"}]
         self.store.commit_step(conv, "helper-init", {"ok": True}, role="user", content=blocks)
 
+    def _stored_fp(self, session: str, conv: str) -> tuple[str, list[str]] | None:
+        v = self.store.kv_get(session, f"fp:{conv}")
+        return (v[0], v[1]) if v else None
+
     # ---- the model step ----------------------------------------------------------------
     async def llm_step(self, session: str, conv: str, step_key: str, role: str, depth: int) -> dict[str, Any]:
         done = self.store.step_get(conv, f"llm:{step_key}")
@@ -168,12 +172,14 @@ class AgentCore:
         content = resp.content or [{"type": "text", "text": "(no output)"}]
         cache_miss = is_cache_miss(prev, resp.usage, self.s.cache_ttl_seconds)
         fp = request_fingerprint(system, tools, messages)
+        prev_fp = self._fp.get(conv) or self._stored_fp(session, conv)
         if cache_miss:
             log.warning("cache miss in %s within TTL (read %s of ~%s cached tokens): treat as a bug (prefix changed?)",
                     conv, resp.usage.get("cache_read_input_tokens", 0),
                     prev["cache_read"] + prev["cache_write"])
-            log.warning("cache miss cause in %s: %s", conv, describe_prefix_change(self._fp.get(conv), fp))
+            log.warning("cache miss cause in %s: %s", conv, describe_prefix_change(prev_fp, fp))
         self._fp[conv] = fp
+        self.store.kv_set(session, f"fp:{conv}", list(fp))  # survives worker restarts, so a miss can be explained
         result = {
             "content": content,
             "stop_reason": resp.stop_reason,

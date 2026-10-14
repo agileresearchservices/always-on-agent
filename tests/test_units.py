@@ -212,3 +212,16 @@ def test_describe_prefix_change():
     assert "message 1" in describe_prefix_change(prev, request_fingerprint(sys_a, [], [m("x"), m("z"), m("w")]))
     assert "shrank" in describe_prefix_change(prev, request_fingerprint(sys_a, [], [m("x")]))
     assert "identical" in describe_prefix_change(prev, request_fingerprint(sys_a, [], [m("x"), m("y"), m("w")]))
+
+
+async def test_cache_miss_fingerprint_survives_a_restart(make_core):
+    from aoa.events import user_event
+    from aoa.testing import text
+
+    core, _ = make_core([text("one")])
+    from aoa.direct import handle_events
+    await handle_events(core, "s", [user_event("hi").to_dict()])
+    stored = core._stored_fp("s", "s")
+    assert stored and stored[0] and len(stored[1]) >= 1
+    core._fp.clear()  # simulate a new worker process
+    assert core._stored_fp("s", "s") == stored
