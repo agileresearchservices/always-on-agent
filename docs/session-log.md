@@ -15,6 +15,7 @@ planned eval flywheel).
 | 2026-10-14 | Slack bridge (`aoa/slack_bridge.py`): Socket Mode, one channel, one allowed user, approval buttons, typed approve/deny | f711189 |
 | 2026-10-14 | Slack app created via manifest in the agileresearchservices workspace; `#aoa-agent` private channel; tokens in `.env` | d24fe56 (docs) |
 | 2026-10-14 | `external_send` description says approved sends are recorded, not delivered | b53b645 |
+| 2026-10-14 | Request fingerprint persisted in the store so a cache-miss cause survives worker restarts | 1ed8430 |
 | 2026-10-14 | Routine trust part 2: `schedule_routine` needs approval (card shows name, cron, prompt); shared `_approval_gate` now used by `external_send` and `schedule_routine`; server approval summary handles non-send actions; safety prompt mentions routines | 274ab7f |
 | 2026-10-14 | Routine trust part 1: new `routine` trigger (`core.turn_trigger`); routine turns cannot create or delete routines; `delete_routine` is now guarded too (it had no guard) | 59b7536 |
 
@@ -70,6 +71,6 @@ planned eval flywheel).
 2. ~~**Routine trust, part 2.**~~ Approval-gate routine creation (card shows name, cron, prompt). DONE (274ab7f), live-verified.
 3. **Make it actually always-on.** Today the Temporal dev server, worker, API server and Slack bridge die with the Claude Code session. Run them under launchd (or compose) with `.env`, restart-on-failure and log files. Highest practical value before adding features. Status: not started.
 4. **Decide the injection-warning policy** (finding 6): should "refused a suspicious external instruction" bypass the update hold? Needs a product decision; then an eval case.
-5. **Watch the cache-miss cause line.** No recurrence since diagnostics were added; read the line when it fires, decide whether it is our prefix or the provider.
+5. **Cache misses: mostly explained, two still sporadic.** A miss at 16:10:31 was real and ours: that restart shipped prompt/tool-description edits, so the system block changed (diagnostic then could not say so because the fingerprint lived in memory; fixed in 1ed8430). Controlled experiments after that: worker restart with unchanged prompt = no miss (read 42,877 of ~42.9k); 215 s idle gap = no miss (read 45,013 of ~45.0k). The two earlier unexplained misses (first-turn test call 4; 15:46:40 call 90) did not recur in 30+ calls; likely sporadic cache eviction/routing on the provider side. Action: read the persisted-fingerprint cause line if one recurs; otherwise leave. Tip: any prompt or tool-description change costs one full-prefix miss, so batch such edits.
 6. **First monitor: GitHub PRs awaiting your review** (poller on a Temporal Schedule, wakes the agent only on new items; read-only token kept out of the sandbox). Proves the pattern for calendar ICS, Jira, Slack mentions, Gmail.
 7. **Start evals (issue #1)** with the cases we already exercised by hand: injection email ignored, approval required before send, routine creation not planted by untrusted content, quiet low-value events.
