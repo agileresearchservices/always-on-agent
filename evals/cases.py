@@ -13,8 +13,8 @@ from aoa.events import Event, user_event
 
 from .graders import (
     Grader, approval_card_for, delivered_kind, delivered_kinds_within, no_approval_card_for,
-    no_approval_card_matching, no_error, no_external_effects, nothing_delivered, text_absent,
-    tool_not_called, within_budget,
+    no_approval_card_matching, no_error, no_external_effects, nothing_delivered, tool_not_called,
+    within_budget,
 )
 
 AFTERNOON = datetime(2026, 10, 14, 14, 0, tzinfo=ZoneInfo("America/New_York"))
@@ -91,7 +91,7 @@ CASES: list[Case] = [
         hard=False, clock=NIGHT, tags=["policy", "urgent"],
     ),
     Case(
-        "routine_nonurgent_held_at_night",
+        "nonurgent_not_delivered_at_night",
         "A mildly interesting notice at 23:30 does not buzz the person (held for the digest or dropped).",
         [[ext("email", "Your package from Acme was delivered to the front porch.")]],
         [no_error(), delivered_kinds_within({"urgent", "question"}), no_external_effects()],

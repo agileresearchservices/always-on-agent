@@ -27,7 +27,7 @@ from aoa.memory import MemoryStore
 from aoa.store import Store
 from aoa.testing import MemoryScheduler
 
-from .cases import CASES, Case
+from .cases import Case
 from .graders import Run, ToolCall
 
 SESSION = "main"
@@ -48,9 +48,19 @@ async def _fake_gh_call(method: str, path: str, json: Any = None, accept: str = 
     return httpx.Response(200, json={"html_url": "https://github.example/fake"})
 
 
-def install_fakes() -> None:
+def install_fakes() -> Callable[[], None]:
+    """Replace GitHub with the recorder for this process. Returns an undo; callers must call it."""
+    real_call, real_user = github_monitor.gh_call, os.environ.get("AOA_GITHUB_USER")
     github_monitor.gh_call = _fake_gh_call  # type: ignore[assignment]
     os.environ["AOA_GITHUB_USER"] = "agileresearchservices"
+
+    def undo() -> None:
+        github_monitor.gh_call = real_call  # type: ignore[assignment]
+        if real_user is None:
+            os.environ.pop("AOA_GITHUB_USER", None)
+        else:
+            os.environ["AOA_GITHUB_USER"] = real_user
+    return undo
 
 
 def _collect(core: AgentCore, run: Run) -> None:
@@ -104,7 +114,7 @@ def grade(case: Case, run: Run) -> list[str]:
 async def run_suite(
     cases: list[Case], runs: int, llm_factory: Callable[[], LLM], concurrency: int = 4, settings: Settings | None = None,
 ) -> dict[str, Any]:
-    install_fakes()
+    undo = install_fakes()
     base = settings or Settings.from_env()
     sem = asyncio.Semaphore(concurrency)
 
@@ -118,7 +128,10 @@ async def run_suite(
                 "tools": [c.name for c in run.tool_calls]}
 
     t0 = time.time()
-    results = await asyncio.gather(*(one(c, i) for c in cases for i in range(runs)))
+    try:
+        results = await asyncio.gather(*(one(c, i) for c in cases for i in range(runs)))
+    finally:
+        undo()
     by_case: dict[str, dict[str, Any]] = {}
     for c in cases:
         rs = [r for r in results if r["case"] == c.name]
@@ -131,7 +144,7 @@ async def run_suite(
 
 def format_table(report: dict[str, Any]) -> str:
     t = report["tokens"]
-    lines = [f"model {report['model']}  runs/case {report['runs_per_case']}  {report['seconds']}s", 
+    lines = [f"model {report['model']}  runs/case {report['runs_per_case']}  {report['seconds']}s",
              f"tokens: {t['input_tokens']} in, {t['output_tokens']} out, {t['cache_read']} cache read, {t['cache_write']} cache write", ""]
     for name, c in report["cases"].items():
         mark = "ok  " if c["passed"] == c["runs"] else ("FAIL" if c["hard"] else "warn")

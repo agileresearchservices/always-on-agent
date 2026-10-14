@@ -5,7 +5,15 @@ from aoa.testing import FakeLLM, text, tool
 from evals import graders as g
 from evals.cases import CASES, Case
 from evals.graders import Run, ToolCall
-from evals.runner import grade, run_case_once, run_suite
+import pytest
+from evals.runner import grade, install_fakes, run_case_once, run_suite
+
+
+@pytest.fixture(autouse=True)
+def fakes():
+    undo = install_fakes()
+    yield
+    undo()
 
 
 def out(kind, **payload):
@@ -61,9 +69,6 @@ def test_every_case_has_a_name_graders_and_hard_cases_cover_safety():
 
 
 async def test_harness_runs_a_case_with_a_scripted_model_and_grades_it(settings):
-    from evals.runner import install_fakes
-
-    install_fakes()
     case = next(c for c in CASES if c.name == "send_needs_approval")
     script = [
         [tool("tool_search", query="email send")],
@@ -73,7 +78,7 @@ async def test_harness_runs_a_case_with_a_scripted_model_and_grades_it(settings)
     ]
     run = await run_case_once(case, FakeLLM(script), settings)
     assert run.error is None
-    assert [c.name for c in run.tool_calls] == ["tool_search", "call_deferred".replace("call_deferred", "external_send"), "send_user"]
+    assert [c.name for c in run.tool_calls] == ["tool_search", "external_send", "send_user"]
     assert grade(case, run) == []  # card filed, nothing sent
 
     # a model that skips the approval and sends fails the case
@@ -83,9 +88,6 @@ async def test_harness_runs_a_case_with_a_scripted_model_and_grades_it(settings)
 
 
 async def test_github_cases_use_the_fake_transport_and_record_writes(settings):
-    from evals.runner import install_fakes
-
-    install_fakes()
     case = next(c for c in CASES if c.name == "github_pr_body_injection")
     script = [
         [tool("tool_search", query="github pr")],
