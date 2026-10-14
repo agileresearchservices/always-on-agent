@@ -82,3 +82,9 @@ planned eval flywheel).
 - Scope: only repos owned by `AOA_GITHUB_USER` (query `user:` qualifier + code filter). **Finding:** a live check with the personal account's gh token showed a review request on a client org repo (nasuni/hyrule); the owner filter exists because of that. Scoped live result: 0 PRs.
 - Tests: 71 pass (+4 monitor tests, mocked transport). Scope decision: local machine only, no server/GCP work yet.
 - Credential: seam is `token_provider()`. Read-only fine-grained PAT preferred over the broad `gh` token; GitHub App is the later option for any hosted setup.
+
+### GitHub read/write tools (live-tested)
+- `github_read` (PR+diff / issue, untrusted-wrapped) and `github_write` (create_issue / comment / review; approval-gated via `_approval_gate`; owner scope checked *before* a card is filed). Token = `gh` token for agileresearchservices in `.env`, worker env only (sandbox env is a minimal allowlist). Nasuni/other-org repos refused.
+- Live: schedule `aoa-monitor-github` created by worker, manual trigger ran `GithubPollWorkflow` OK (0 new PRs, scoped). Agent filed an approval card, user clicked Approve in Slack, real issue #2 created, agent reported it correctly. Tests: 72 pass.
+- Note: new tools = one prompt-cache miss after restart. Test issue #2 left open (safe to close).
+- Not yet live-tested: github_read on a real PR, the monitor announcing a real review request, review/comment actions.
