@@ -26,6 +26,8 @@ python -m aoa.client_cli --session main
 
 `python -m aoa usage [--days N]` prints estimated spend per day and per source (pr-review, agent, helper, compact, cmd-review, warm, resolve) from the `usage` table (list prices in `aoa/pricing.py`, dated; update them when prices change; live services only, evals are not in it).
 
+`python -m aoa flags [--scan]` lists flagged bad outcomes and `python -m aoa trace <conv> [--json]` prints a conversation (flywheel step 1, #54, `aoa/flag.py`). `scan` reads the `steps` and `approvals` tables and fills the `flagged` table (one row per conversation and reason, idempotent): denied approvals, `max_tokens` stops, turns that used every step, a tool failing 3+ times, cache misses. The deferred `report_issue` tool lets the model add its own flag; it is marked unverified, capped at 20 open per conversation, and changes nothing else. Flags are leads for a human or the later proposal workflow (#55), never acted on automatically.
+
 All configuration is env vars read in `aoa/config.py` (`Settings.from_env`, all prefixed `AOA_`). A non-numeric value never stops startup (launchd would crash-loop the services): it logs a warning naming the variable (never the value of a *TOKEN/*KEY one) and uses the default; empty = unset. `AOA_CACHE_TTL` and `AOA_GITHUB_POLL_SECONDS` also warn when rounded or floored. Every `AOA_*` name the code reads must appear in `.env.example` (`tests/test_config_env.py`). Tests redirect state with `AOA_DATA_DIR` (see the `settings` fixture in `tests/conftest.py`).
 
 ## Architecture

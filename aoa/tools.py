@@ -189,6 +189,15 @@ async def h_memory_write(ctx: ToolContext, a: dict[str, Any]) -> str:
     raise ToolError("kind must be one of: fact, facts_rewrite, log, scratch, skill")
 
 
+async def h_report_issue(ctx: ToolContext, a: dict[str, Any]) -> str:
+    from . import flag  # local import: flag.py imports Store, and tools is imported early
+
+    try:
+        return flag.report(ctx.store, ctx.conv_id, a["kind"], a["summary"])
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+
+
 async def h_web_fetch(ctx: ToolContext, a: dict[str, Any]) -> str:
     ok, why = url_is_public(a["url"])
     if not ok:
@@ -454,6 +463,16 @@ def _tools() -> list[ToolSpec]:
             "web_fetch", "Fetch a public web page over HTTP GET and return its text (marked untrusted).",
             _obj({"url": {"type": "string"}, "max_chars": {"type": "integer"}}, ["url"]),
             h_web_fetch, core=False, tags=["http", "url", "browse", "internet"],
+        ),
+        ToolSpec(
+            "report_issue",
+            "Record that something went wrong in this conversation (you gave a bad answer, misused a tool, broke "
+            "a rule, or were too noisy) so the owner can review it later. It changes nothing else and sends nothing. "
+            "Use sparingly, for real mistakes only.",
+            _obj({"kind": {"type": "string", "enum": ["wrong_answer", "bad_tool_use", "missed_rule", "too_noisy", "other"]},
+                  "summary": {"type": "string", "description": "what went wrong, in a sentence or two"}},
+                 ["kind", "summary"]),
+            h_report_issue, core=False, helper_ok=False, tags=["mistake", "bug", "feedback", "flag", "problem"],
         ),
         ToolSpec(
             "schedule_routine",
