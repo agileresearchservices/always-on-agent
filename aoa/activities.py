@@ -413,20 +413,23 @@ class AgentActivities:
         p = self.core.store.proposal_get(a["id"])
         res = a["result"]
         repo = Path(__file__).resolve().parent.parent
+        if p is None or not p["spec"]:
+            return {"ok": False, "terminal": True, "reason": "that proposal no longer exists"}
         if not (Path(res["worktree"]) / ".git").exists():
             return {"ok": False, "terminal": True, "reason": "the worktree is gone (the system cleaned its temp dir)"}
-        try:  # the person has read this diff: now it may run against the real model with the API key
-            res = await with_heartbeat(verify_fix(res, p["spec"], self.s), activity.heartbeat)
-        except Exception as e:  # noqa: BLE001 - an eval failure is a result; keep the fix so the click can be retried
-            activity.logger.exception("fix verification crashed")
-            return {"ok": False, "reason": f"the real-model checks could not run: {type(e).__name__}: {str(e)[:150]}"}
-        if not res["ok"]:
-            cleanup(repo, res["tmp"], res["branch"])
-            return {"ok": False, "terminal": True, "reason": res["reason"]}
+        if not res.get("verified"):  # a retry after a failed push keeps the verified result: no second paid run
+            try:  # the person has read this diff: now it may run against the real model with the API key
+                res = await with_heartbeat(verify_fix(res, p["spec"], self.s), activity.heartbeat)
+            except Exception as e:  # noqa: BLE001 - an eval failure is a result; keep the fix so the click can be retried
+                activity.logger.exception("fix verification crashed")
+                return {"ok": False, "reason": f"the real-model checks could not run: {type(e).__name__}: {str(e)[:150]}"}
+            if not res["ok"]:
+                cleanup(repo, res["tmp"], res["branch"])
+                return {"ok": False, "terminal": True, "reason": res["reason"]}
         try:
             url = await open_pr(res, p["spec"], p["id"], p["spec"].get("origin", {}))
         except (FixError, gh.GithubError, httpx.HTTPError) as e:
-            return {"ok": False, "reason": str(e)[:300]}  # worktree and branch are kept so the person can retry
+            return {"ok": False, "reason": str(e)[:300], "verified": res}  # kept (and verified) so the click can be retried
         cleanup(repo, res["tmp"])  # pushed: the worktree goes, the branch stays
         self.core.store.proposal_update(p["id"], "fix_opened", info={**p["info"], "pr": url})
         return {"ok": True, "url": url}

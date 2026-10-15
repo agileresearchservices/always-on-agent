@@ -525,6 +525,8 @@ class FixPrWorkflow:
             )
             await self._report(inp, res, seq, phase="final", pr=pr)
             seq += 1
+            if pr.get("verified"):
+                res = pr["verified"]  # a failed push after verification: the retry must not pay for the checks again
             if pr.get("ok"):
                 return {"ok": True, "stage": None, "pr": pr["url"]}
             if pr.get("terminal"):
