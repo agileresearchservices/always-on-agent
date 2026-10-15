@@ -469,6 +469,20 @@ class EvalProposalWorkflow:
 
 
 @workflow.defn
+class EvalRunWorkflow:
+    """Fired by the eval schedule (`aoa-eval-run`). One activity, never retried: a run costs real tokens, so a failure
+    waits for the next scheduled run. A new workflow, so it needs no patch guard."""
+
+    @workflow.run
+    async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
+        return await workflow.execute_activity(
+            "run_scheduled_evals", {"session": inp["session"], "force": inp.get("force", False)},
+            start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+
+
+@workflow.defn
 class FixPrWorkflow:
     """Started by the server when the person clicks [Draft fix] on an accepted eval case; never by the model. Drafts
     a fix in a worktree and commits it LOCALLY. Nothing is pushed, and no author code sees the API key, until the

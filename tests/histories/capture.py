@@ -34,7 +34,7 @@ from aoa.store import Store
 from aoa.testing import FakeLLM, text, tool
 from aoa.testing import MemoryScheduler
 from aoa.workflows import (
-    EvalProposalWorkflow, FixPrWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
+    EvalProposalWorkflow, EvalRunWorkflow, FixPrWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
     SessionWorkflow,
 )
 
@@ -43,7 +43,7 @@ PR = {"repo": "agileresearchservices/demo", "number": 7, "sha": "a" * 40, "title
 VERDICT = json.dumps({"verdict": "approve", "summary": "Looks fine.", "findings": []})
 GH_STUBBED = {"poll_github", "fetch_pr_for_review", "publish_pr_review", "merge_inspect", "merge_pr", "merge_update_branch",
               "merge_delete_branch", "merge_issue_states", "resolve_conflicts", "merge_report", "eval_draft", "eval_post_card",
-              "fix_run", "fix_open_pr", "fix_report"}
+              "fix_run", "fix_open_pr", "fix_report", "run_scheduled_evals"}
 
 
 def act_name(fn: Any) -> str:
@@ -91,7 +91,7 @@ async def worker_with(client: Client, s: Settings, llm: FakeLLM, stubs: list) ->
     acts = AgentActivities(core, client, s)
     real = [a for a in acts.all() if act_name(a) not in GH_STUBBED]
     flows = [SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow,
-             EvalProposalWorkflow, FixPrWorkflow]
+             EvalProposalWorkflow, EvalRunWorkflow, FixPrWorkflow]
     return Worker(client, task_queue=s.task_queue, workflows=flows, activities=real + stubs), store
 
 
@@ -197,12 +197,23 @@ async def merge(client: Client, name: str, stubs: list) -> None:
     await save(client, name, wid)
 
 
+async def eval_run(client: Client) -> None:
+    """EvalRunWorkflow: one scheduled eval run (stubbed)."""
+    s = mk_env()
+    w, _ = await worker_with(client, s, FakeLLM([]), [stub("run_scheduled_evals", {"status": "green", "est_cost_usd": 0.3})])
+    async with w:
+        wid = f"eval-run-{uuid.uuid4().hex[:6]}"
+        await client.execute_workflow("EvalRunWorkflow", {"session": "main"}, id=wid, task_queue=s.task_queue)
+    await save(client, "eval_run", wid)
+
+
 SCENARIOS = {
     "session_timers_and_reply": session,
     "github_poll": poll_and_review,
     "pr_review_inline_diff": review_inline_diff,
     "eval_proposal": eval_proposal,
     "fix_pr": fix_pr,
+    "eval_run": eval_run,
     "merge_wait_then_merge": lambda c: merge(c, "merge_wait_then_merge", [
         stub("merge_inspect", [inspect("wait"), inspect("merge")]), stub("merge_pr", {"merged": True, "merge_sha": "b" * 40}),
         stub("merge_delete_branch", {"ref": "feat", "result": "deleted"}),

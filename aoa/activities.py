@@ -385,6 +385,17 @@ class AgentActivities:
         self.core.store.outbox_push(a["session"], "eval_proposal", {"text": card_text(p), "proposal_id": p["id"]},
                                     client_key=f"evalprop:{p['id']}")
 
+    @activity.defn(name="run_scheduled_evals")
+    async def run_scheduled_evals(self, a: dict[str, Any]) -> dict[str, Any]:
+        """A scheduled behaviour-eval run, compared with the last green baseline (#61). Costs real tokens."""
+        from .eval_proposal import run_evals
+        from .eval_schedule import run_scheduled
+
+        async def run(args: list[str]) -> dict[str, Any] | None:
+            return await run_evals(args, timeout=1500)
+
+        return await with_heartbeat(run_scheduled(self.core.store, self.s, a["session"], run, force=bool(a.get("force"))), activity.heartbeat)
+
     @activity.defn(name="fix_run")
     async def fix_run(self, a: dict[str, Any]) -> dict[str, Any]:
         """Draft and check a fix for an accepted eval case in a worktree (flywheel step 3). Returns the result; a
@@ -463,5 +474,5 @@ class AgentActivities:
             self.deliver_routine_event, self.poll_github, self.fetch_pr_for_review, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
             self.merge_issue_states, self.merge_report, self.resolve_conflicts, self.eval_draft, self.eval_post_card,
-            self.fix_run, self.fix_open_pr, self.fix_discard, self.fix_report,
+            self.run_scheduled_evals, self.fix_run, self.fix_open_pr, self.fix_discard, self.fix_report,
         ]
