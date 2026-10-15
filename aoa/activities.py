@@ -402,6 +402,9 @@ class AgentActivities:
                 run_fix(p["spec"], p["id"], self.s, ClaudeCodeAuthor(self.s.claude_bin, self.s.fix_budget_usd)), activity.heartbeat)
         except FixError as e:
             return {"ok": False, "stage": "setup", "reason": str(e)}
+        except Exception as e:  # noqa: BLE001 - the workflow must still report: a failed eval run is a result, not a crash
+            activity.logger.exception("fix_run crashed")
+            return {"ok": False, "stage": "error", "reason": f"{type(e).__name__}: {str(e)[:200]}"}
 
     @activity.defn(name="fix_open_pr")
     async def fix_open_pr(self, a: dict[str, Any]) -> dict[str, Any]:
@@ -409,21 +412,36 @@ class AgentActivities:
 
         p = self.core.store.proposal_get(a["id"])
         res = a["result"]
+        if not (Path(res["worktree"]) / ".git").exists():
+            return {"ok": False, "reason": "the worktree is gone (the system cleaned its temp dir); draft the fix again"}
         try:
             url = await open_pr(res, p["spec"], p["id"], p["spec"].get("origin", {}))
-        except (FixError, gh.GithubError) as e:
-            return {"ok": False, "reason": str(e)}
-        finally:
-            cleanup(Path(__file__).resolve().parent.parent, res["tmp"])  # the pushed branch stays; the worktree goes
+        except (FixError, gh.GithubError, httpx.HTTPError) as e:
+            return {"ok": False, "reason": str(e)[:300]}  # worktree and branch are kept so the person can retry
+        cleanup(Path(__file__).resolve().parent.parent, res["tmp"])  # pushed: the worktree goes, the branch stays
         self.core.store.proposal_update(p["id"], "fix_opened", info={**p["info"], "pr": url})
         return {"ok": True, "url": url}
 
+    @activity.defn(name="fix_discard")
+    async def fix_discard(self, a: dict[str, Any]) -> None:
+        """Nobody opened the PR in time: remove the worktree and the unpushed fix branch."""
+        from .fix_pr import cleanup
+
+        res = a["result"]
+        cleanup(Path(__file__).resolve().parent.parent, res["tmp"], res["branch"])
+
     @activity.defn(name="fix_report")
     async def fix_report(self, a: dict[str, Any]) -> None:
-        from .fix_pr import report_text
+        from .fix_pr import ready_text, report_text
 
-        self.core.store.outbox_push(a["session"], "eval_fix", {"text": report_text(a["id"], a["result"], a.get("pr"))},
-                                    client_key=f"evalfix:{a['id']}:{a['run_id']}")
+        kind = a.get("phase", "final")
+        text = ready_text(a["id"], a["result"]) if kind == "ready" else (
+            a.get("note") or report_text(a["id"], a["result"], a.get("pr")))
+        self.core.store.outbox_push(
+            a["session"], "eval_fix",
+            {"text": text, "proposal_id": a["id"], "ready": kind == "ready" or (a.get("pr") is not None and not a["pr"].get("ok")),
+             "retry": kind == "final" and not a["result"].get("ok") and a.get("pr") is None},
+            client_key=f"evalfix:{a['id']}:{a['run_id']}:{a.get('seq', 0)}")
 
     def all(self) -> list:
         return [
@@ -432,5 +450,5 @@ class AgentActivities:
             self.deliver_routine_event, self.poll_github, self.fetch_pr_for_review, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
             self.merge_issue_states, self.merge_report, self.resolve_conflicts, self.eval_draft, self.eval_post_card,
-            self.fix_run, self.fix_open_pr, self.fix_report,
+            self.fix_run, self.fix_open_pr, self.fix_discard, self.fix_report,
         ]

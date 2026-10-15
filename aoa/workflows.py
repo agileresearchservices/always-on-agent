@@ -471,23 +471,53 @@ class EvalProposalWorkflow:
 @workflow.defn
 class FixPrWorkflow:
     """Started by the server when the person clicks [Draft fix] on an accepted eval case; never by the model. Drafts
-    and checks a fix in a worktree, opens a PR only if every check passes, and reports either way. It never merges."""
+    and checks a fix in a worktree and commits it LOCALLY. Nothing is pushed until the person clicks [Open PR] (a
+    signal); with no click within `open_wait_seconds` the worktree and branch are discarded. It never merges."""
+
+    def __init__(self) -> None:
+        self._open = False
+
+    @workflow.signal
+    def open_pr(self) -> None:
+        self._open = True
+
+    async def _report(self, inp: dict[str, Any], res: dict[str, Any], seq: int, **kw: Any) -> None:
+        await workflow.execute_activity(
+            "fix_report", {"session": inp["session"], "id": inp["id"], "result": res, "run_id": workflow.info().run_id,
+                           "seq": seq, **kw},
+            start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
+        )
 
     @workflow.run
     async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
-        pid, session = inp["id"], inp["session"]
+        pid = inp["id"]
         res = await workflow.execute_activity(
             "fix_run", {"id": pid}, start_to_close_timeout=timedelta(minutes=90), heartbeat_timeout=timedelta(minutes=5),
             retry_policy=RetryPolicy(maximum_attempts=1),  # a retry would pay for the session twice
         )
-        pr = None
-        if res.get("ok"):
+        if not res.get("ok"):
+            await self._report(inp, res, 0)
+            return {"ok": False, "stage": res.get("stage"), "pr": None}
+        await self._report(inp, res, 0, phase="ready")
+        deadline = workflow.time() + inp.get("open_wait_seconds", 24 * 3600)
+        seq = 1
+        while True:
+            remaining = deadline - workflow.time()
+            try:
+                await workflow.wait_condition(lambda: self._open, timeout=timedelta(seconds=max(remaining, 0)))
+            except asyncio.TimeoutError:
+                await workflow.execute_activity("fix_discard", {"result": res}, start_to_close_timeout=timedelta(seconds=60),
+                                                retry_policy=STATE_RETRY)
+                await self._report(inp, res, seq, phase="final",
+                                   note=f"The fix for `{pid}` was not opened within a day, so the local branch was discarded. "
+                                        "Click Draft fix to start over.")
+                return {"ok": False, "stage": "expired", "pr": None}
+            self._open = False
             pr = await workflow.execute_activity(
                 "fix_open_pr", {"id": pid, "result": res}, start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
-        await workflow.execute_activity(
-            "fix_report", {"session": session, "id": pid, "result": res, "pr": pr, "run_id": workflow.info().run_id},
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
-        )
-        return {"ok": bool(pr and pr.get("ok")), "stage": res.get("stage"), "pr": (pr or {}).get("url")}
+            await self._report(inp, res, seq, phase="final", pr=pr)
+            seq += 1
+            if pr.get("ok"):
+                return {"ok": True, "stage": None, "pr": pr["url"]}

@@ -31,6 +31,7 @@ def make_repo(tmp_path: Path) -> Path:
     run("config", "user.name", "t")
     (repo / "aoa").mkdir()
     (repo / "aoa" / "prompt.py").write_text("RULES = 'old'\n")
+    (repo / "aoa" / "store.py").write_text("X = 'old'\n")
     run("add", "."), run("commit", "-q", "-m", "init")
     ep.write_accepted_branch(SPEC, "prop-0123abcd", repo)
     return repo
@@ -48,7 +49,7 @@ class Author:
 
 
 def edit_prompt(wt: Path):
-    (wt / "aoa" / "prompt.py").write_text("RULES = 'new'\n")
+    (wt / "aoa" / "store.py").write_text("X = 'new'\n")
 
 
 def report(passed, runs=2, hard_fail=(), soft=None):
@@ -88,10 +89,11 @@ async def go(repo, settings, author, **kw):
 
 def test_helpers():
     assert slug_of(SPEC) == "send-needs-card"
-    assert touched_guardrails(["aoa/safety.py", "aoa/prompt.py", ".github/workflows/x.yml", "CODEOWNERS"]) == [
-        ".github/workflows/x.yml", "CODEOWNERS", "aoa/safety.py"]
-    assert frozen_changes(["evals/cases.py", "tests/histories/x.json", "tests/test_a.py", "aoa/prompt.py"]) == [
-        "evals/cases.py", "tests/histories/x.json"]
+    assert touched_guardrails(["aoa/safety.py", "aoa/prompt.py", "aoa/store.py", ".github/workflows/x.yml", "CODEOWNERS"]) == [
+        ".github/workflows/x.yml", "CODEOWNERS", "aoa/prompt.py", "aoa/safety.py"]
+    assert frozen_changes(["evals/cases.py", "tests/histories/x.json", "tests/test_a.py", "tests/conftest.py", "pyproject.toml",
+                           "aoa/testing.py", "aoa/store.py"]) == [
+        "aoa/testing.py", "evals/cases.py", "pyproject.toml", "tests/conftest.py", "tests/histories/x.json"]
 
 
 async def test_a_good_fix_is_committed_with_before_and_after(tmp_path, settings, pipeline):
@@ -100,7 +102,7 @@ async def test_a_good_fix_is_committed_with_before_and_after(tmp_path, settings,
     author = Author(edit_prompt)
     res = await go(repo, settings, author)
     assert res["ok"] and res["before"]["passed"] == 0 and res["after"]["passed"] == 2
-    assert res["files"] == ["aoa/prompt.py"] and res["guardrails"] == []
+    assert res["files"] == ["aoa/store.py"] and res["guardrails"] == []
     assert "evals/accepted/flywheel_send_needs_card.json" in author.calls[0]
     assert all(c == res["worktree"] for c in pipeline.evals_cwd)  # evals ran against the fixed worktree
     log = subprocess.run(["git", "log", "--oneline", "fix/send-needs-card"], cwd=repo, capture_output=True, text=True).stdout
@@ -308,3 +310,164 @@ async def test_a_failed_author_session_is_a_fix_error(tmp_path, monkeypatch):
     monkeypatch.setattr(fix_pr, "_run", fake_run)
     with pytest.raises(FixError, match="not logged in"):
         await fix_pr.ClaudeCodeAuthor("claude", 1.0).run(tmp_path, "x")
+
+
+# ---- the review fixes: protected files, secrets, base, isolation ---------------------------------------------
+
+async def test_deleted_tests_and_test_infrastructure_are_refused(tmp_path, settings, pipeline):
+    repo = make_repo(tmp_path)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True), subprocess.run(["git", "commit", "-q", "-m", "tests"], cwd=repo, check=True)
+    subprocess.run(["git", "branch", "-D", "eval/send-needs-card"], cwd=repo, check=True, capture_output=True)
+    ep.write_accepted_branch(SPEC, "p", repo)  # cut after the tests exist
+
+    pipeline.reports = [report(0)]
+    res = await go(repo, settings, Author(lambda wt: (wt / "tests" / "test_a.py").unlink()))
+    assert res["stage"] == "author" and "deleted tests" in res["reason"]
+
+    pipeline.reports = [report(0)]
+    res = await go(repo, settings, Author(lambda wt: (wt / "tests" / "conftest.py").write_text("import os\n")))
+    assert res["stage"] == "author" and "conftest" in res["reason"]
+
+
+async def test_the_tree_is_checked_again_after_the_gates_ran_the_authors_code(tmp_path, settings, pipeline, monkeypatch):
+    repo = make_repo(tmp_path)
+    pipeline.reports = [report(0), report(2), report(1, 1)]
+    real = fix_pr._run
+
+    async def sneaky(args, cwd, env, timeout, shell=False):
+        if "pytest" in args:  # the author's test code rewrites protected files while it runs
+            (Path(cwd) / "pyproject.toml").write_text("[tool.pytest]\n")
+            return 0, "1 passed"
+        return await real(args, cwd, env, timeout, shell)
+
+    monkeypatch.setattr(fix_pr, "_run", sneaky)
+    res = await go(repo, settings, Author(edit_prompt))
+    assert res["stage"] == "author" and "pyproject.toml" in res["reason"]
+    assert "fix/send-needs-card" not in subprocess.run(["git", "branch", "--list"], cwd=repo, capture_output=True, text=True).stdout
+
+
+async def test_a_secret_in_the_result_is_refused(tmp_path, settings, pipeline, monkeypatch):
+    repo = make_repo(tmp_path)
+    monkeypatch.setenv("MY_PRIVATE_API_KEY", "zzzz-not-a-real-key-123456")
+    for body, hint in (("T = 'ghp_" + "a" * 30 + "'\n", "pattern"), ("T = 'zzzz-not-a-real-key-123456'\n", "MY_PRIVATE_API_KEY")):
+        pipeline.reports = [report(0), report(2), report(1, 1)]
+        res = await go(repo, settings, Author(lambda wt, b=body: (wt / "aoa" / "store.py").write_text(b)))
+        assert res["stage"] == "secrets" and hint in res["reason"]
+        assert "zzzz-not-a-real-key" not in res["reason"]  # the name, never the value
+
+
+def test_secret_hits_ignores_short_values_and_clean_text():
+    assert fix_pr.secret_hits("nothing here", {"A_TOKEN": "x" * 20}) == []
+    assert fix_pr.secret_hits("x", {"A_TOKEN": "short"}) == []
+    assert fix_pr.secret_hits("-----BEGIN RSA PRIVATE KEY-----", {}) != []
+
+
+async def test_the_fix_is_made_on_top_of_current_main(tmp_path, settings, pipeline):
+    repo = make_repo(tmp_path)
+    (repo / "aoa" / "newer.py").write_text("NEW = 1\n")  # main moved after the person clicked Accept
+    subprocess.run(["git", "add", "."], cwd=repo, check=True), subprocess.run(["git", "commit", "-q", "-m", "later"], cwd=repo, check=True)
+    pipeline.reports = [report(0), report(2), report(1, 1)]
+    seen = {}
+
+    def edit(wt: Path):
+        seen["has_newer"] = (wt / "aoa" / "newer.py").exists()
+        edit_prompt(wt)
+
+    res = await go(repo, settings, Author(edit))
+    assert res["ok"] and seen["has_newer"]
+    fix_pr.cleanup(repo, res["tmp"])
+
+
+async def test_the_authors_session_cannot_read_the_home_or_edit_outside(tmp_path, monkeypatch):
+    seen = {}
+
+    async def fake_run(args, cwd, env, timeout, shell=False):
+        seen["args"], seen["env"] = args, env
+        return 0, json.dumps({"result": "ok"})
+
+    monkeypatch.setattr(fix_pr, "_run", fake_run)
+    await fix_pr.ClaudeCodeAuthor("claude", 1.0).run(tmp_path, "x")
+    args = seen["args"]
+    deny = json.loads(args[args.index("--settings") + 1])["permissions"]["deny"]
+    assert "Read(//Users/**)" in deny and "Write(~/**)" in deny and "Edit(//Users/**)" in deny and "Grep(//Users/**)" in deny
+
+
+def test_untrusted_text_cannot_mention_or_inject_html_in_the_pr():
+    spec_ = dict(SPEC, description="Fix for @everyone <img src=x onerror=1>")
+    res = {"before": {"passed": 0, "runs": 2}, "after": {"passed": 2, "runs": 2}, "pytest": {"ok": True}, "files": ["a"],
+           "suite": {"cases": 1, "hard_failures": [], "soft_misses": {}}, "author": {"summary": "ping @owner <b>x</b>"}, "guardrails": []}
+    title, body = fix_pr.pr_title(res, spec_), fix_pr.pr_body(res, spec_, "p", {"reason": "@x", "conv": "<c>"})
+    for text in (title, body):
+        assert "@everyone" not in text and "@owner" not in text and "<img" not in text and "<b>" not in text and "<c>" not in text
+
+
+def test_ready_text_says_nothing_is_pushed_and_how_to_read_it():
+    res = {"before": {"passed": 0, "runs": 2}, "after": {"passed": 2, "runs": 2}, "files": ["aoa/prompt.py"], "branch": "fix/x",
+           "guardrails": ["aoa/prompt.py"]}
+    t = fix_pr.ready_text("prop-1", res)
+    assert "nothing pushed" in t and "git diff main...fix/x" in t and "guardrail" in t
+
+
+def test_server_open_endpoint_signals_the_waiting_workflow(make_core, settings, monkeypatch):
+    import aoa.server as server
+    from fastapi.testclient import TestClient
+    from temporalio.service import RPCError, RPCStatusCode
+
+    core, _ = make_core([])
+    signalled = []
+
+    class Handle:
+        def __init__(self, wid, fail): self.wid, self.fail = wid, fail
+        async def signal(self, name):
+            if self.fail:
+                raise RPCError("not found", RPCStatusCode.NOT_FOUND, b"")
+            signalled.append((self.wid, name))
+
+    class FakeTemporal:
+        fail = False
+        def get_workflow_handle(self, wid): return Handle(wid, self.fail)
+
+    monkeypatch.setattr(server, "store", core.store)
+    monkeypatch.delenv("AOA_API_TOKEN", raising=False)
+    server.app.state.client = fake = FakeTemporal()
+    c = TestClient(server.app)
+    pid = core.store.proposal_create("main", "r")
+    assert c.post("/sessions/main/proposals/prop-00000000/fix/open").status_code == 404
+    assert c.post(f"/sessions/main/proposals/{pid}/fix/open").status_code == 202
+    assert signalled == [(f"fix-{pid}", "open_pr")]
+    fake.fail = True
+    assert c.post(f"/sessions/main/proposals/{pid}/fix/open").status_code == 409
+
+
+async def test_bridge_offers_open_pr_when_ready_and_draft_fix_when_it_failed(tmp_path):
+    from aoa.slack_bridge import Bridge, BridgeConfig, parse_fix_open_action, render_outbox_item
+
+    cfg = BridgeConfig(channel="C1", user="U1")
+    _, blocks = render_outbox_item({"kind": "eval_fix", "payload": {"text": "ready", "proposal_id": "prop-1", "ready": True}})
+    assert [e["action_id"] for e in blocks[-1]["elements"]] == ["aoa_fix_open"] and "confirm" in blocks[-1]["elements"][0]
+    _, blocks = render_outbox_item({"kind": "eval_fix", "payload": {"text": "no", "proposal_id": "prop-1", "retry": True}})
+    assert [e["action_id"] for e in blocks[-1]["elements"]] == ["aoa_case_fix"]
+    assert render_outbox_item({"kind": "eval_fix", "payload": {"text": "done", "proposal_id": "prop-1"}})[1] is None
+
+    seen = []
+
+    class Web:
+        def __init__(self): self.updated = []
+        async def chat_update(self, **kw): self.updated.append(kw)
+        async def chat_postMessage(self, **kw): pass
+
+    def handler(req):
+        seen.append(req.url.path)
+        return httpx.Response(202, json={"status": "signalled"})
+
+    http = httpx.AsyncClient(base_url="http://aoa", transport=httpx.MockTransport(handler))
+    web = Web()
+    bridge = Bridge(cfg, web, http, tmp_path / "c.txt")
+    click = {"type": "block_actions", "user": {"id": "U1"}, "channel": {"id": "C1"}, "message": {"ts": "7.7", "text": "ready"},
+             "actions": [{"action_id": "aoa_fix_open", "value": "prop-1"}]}
+    assert parse_fix_open_action(click, cfg) == "prop-1" and parse_fix_open_action(click | {"user": {"id": "U2"}}, cfg) is None
+    await bridge.handle_interactive(click)
+    await bridge.handle_interactive(click)  # Slack delivered it twice
+    assert seen == ["/sessions/main/proposals/prop-1/fix/open"] and "Pushing" in json.dumps(web.updated[0]["blocks"])

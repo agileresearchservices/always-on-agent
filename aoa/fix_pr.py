@@ -9,10 +9,16 @@ throwaway git worktree of the accepted `eval/<slug>` branch:
   3. it may not touch the eval suite (`evals/`, recorded histories), so it cannot make the case pass by changing the case;
   4. the result is checked with commands this module runs, not with the author's word: `pytest`, the new case N
      times (all must pass), and the behaviour suite once (no hard case may fail);
-  5. only if all pass: commit, push `fix/<slug>` and open a PR whose body carries the before/after numbers. Touching a
-     guardrail file (safety, approvals, notifier, event trust, merge path) is called out in the title and body.
+  5. only if all pass: commit on `fix/<slug>` LOCALLY and tell the person (files, numbers, how to read the diff).
+     Nothing leaves the machine until they click [Open PR]: then push `fix/<slug>` and open a PR with the before/after
+     numbers. Touching a guardrail file (safety, approvals, notifier, event trust, the prompt, the pipeline itself) is
+     called out in the title and body.
 
 aoa never merges it: the PR gets aoa's normal review and a human decides. Nothing here pushes to main.
+
+This is NOT a sandbox (#21 was skipped on purpose): the author and the test runs execute as your user. What limits
+it: no tokens/keys in the environment, Read/Edit/Write denied under /Users (the worktree lives in the system temp
+dir), a tool allowlist, a secret scan of the result, frozen test infrastructure, and the human click before any push.
 """
 from __future__ import annotations
 
@@ -34,8 +40,16 @@ from .pr_resolve import TIMED_OUT, _run, git_env, safe_env
 GUARDRAIL_PATHS = (
     "aoa/safety.py", "aoa/notify.py", "aoa/events.py", "aoa/tools.py", "aoa/server.py", "aoa/pr_merge.py",
     "aoa/pr_resolve.py", "aoa/gh_reviewer.py", "aoa/slack_bridge.py", ".github/", "CODEOWNERS",
+    # the operating rules, the durable-execution core and the flywheel itself
+    "aoa/prompt.py", "aoa/core.py", "aoa/workflows.py", "aoa/activities.py", "aoa/config.py", "aoa/fix_pr.py",
+    "aoa/eval_proposal.py",
 )
-FROZEN_PATHS = ("evals/", "tests/histories/")  # the fix author may not change the suite that grades it
+# the fix author may not change the suite or the test infrastructure that grades it, or delete a test
+FROZEN_PATHS = ("evals/", "tests/histories/", "tests/conftest.py", "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini",
+                "aoa/testing.py")
+SECRET_PATTERNS = (r"sk-ant-[A-Za-z0-9_-]{10,}", r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
+                   r"xox[abprs]-[A-Za-z0-9-]{10,}", r"AKIA[0-9A-Z]{16}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+SECRET_ENV_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 PYTEST_TIMEOUT = 1200
 ALLOWED_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "Bash(python -m pytest:*)", "Bash(.venv/bin/python -m pytest:*)",
                  "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)")
@@ -87,8 +101,12 @@ class ClaudeCodeAuthor:
 
     async def run(self, worktree: Path, prompt: str) -> dict[str, Any]:
         binary = shutil.which(self.binary, path=os.environ.get("PATH", "") + ":" + str(Path.home() / ".local/bin")) or self.binary
+        # The worktree is in the system temp dir, so everything under /Users (the home, ssh keys, aoa's data dir and
+        # .env, the main checkout) can be denied outright. Deny rules win over allow rules.
+        deny = {"permissions": {"deny": [f"{t}(//Users/**)" for t in ("Read", "Edit", "Write", "Grep", "Glob")]
+                                + [f"{t}(~/**)" for t in ("Read", "Edit", "Write", "Grep", "Glob")]}}
         args = [binary, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
-                "--max-budget-usd", f"{self.budget:g}", "--no-session-persistence",
+                "--max-budget-usd", f"{self.budget:g}", "--no-session-persistence", "--settings", json.dumps(deny),
                 "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", "WebFetch", "WebSearch"]
         env = safe_env() | {"PYTHONPATH": str(worktree)}  # HOME stays: that is where the Claude login lives
         code, out = await _run(args, worktree, env, self.timeout)
@@ -103,14 +121,43 @@ class ClaudeCodeAuthor:
         return {"summary": str(last.get("result", ""))[:1500], "cost_usd": last.get("total_cost_usd")}
 
 
-async def _changed_files(wt: Path) -> list[str]:
+async def _changes(wt: Path) -> list[tuple[str, str]]:
+    """(status, path) for everything changed or new in the worktree; status is the porcelain code ('D' = deleted)."""
     code, out = await _run(["git", "status", "--porcelain", "--untracked-files=all"], wt, git_env(None), 60)
-    files = []
+    rows = []
     for line in out.splitlines():
         path = line[3:].split(" -> ")[-1].strip().strip('"')
         if path:
-            files.append(path)
-    return sorted(set(files))
+            rows.append((line[:2].strip() or "?", path))
+    return sorted(set(rows), key=lambda r: r[1])
+
+
+def deleted_tests(changes: list[tuple[str, str]]) -> list[str]:
+    return [p for s, p in changes if "D" in s and p.startswith("tests/")]
+
+
+def secret_hits(wt_text: str, env: dict[str, str] | None = None) -> list[str]:
+    """Names (never values) of secrets found in `wt_text`: known token shapes, and any value of a secret-looking
+    environment variable of the worker."""
+    env = os.environ if env is None else env
+    hits = [f"pattern {p[:12]}" for p in SECRET_PATTERNS if re.search(p, wt_text)]
+    for k, v in env.items():
+        if any(h in k.upper() for h in SECRET_ENV_HINTS) and len(v) >= 12 and v in wt_text:
+            hits.append(f"the value of ${k}")
+    return hits
+
+
+async def _diff_text(wt: Path) -> str:
+    """Everything the commit would contain: tracked changes plus the new files' contents (capped)."""
+    _, tracked = await _run(["git", "diff", "HEAD"], wt, git_env(None), 60)
+    _, names = await _run(["git", "ls-files", "--others", "--exclude-standard"], wt, git_env(None), 60)
+    extra = []
+    for n in names.splitlines()[:200]:
+        try:
+            extra.append((wt / n).read_text(errors="replace")[:200_000])
+        except OSError:
+            pass
+    return tracked + "\n".join(extra)
 
 
 async def run_fix(
@@ -134,7 +181,10 @@ async def run_fix(
             _git(["worktree", "add", "-q", "-b", fix_branch, str(wt), eval_branch], repo)
         except RuntimeError as e:
             raise FixError(f"could not set up the worktree from {eval_branch}: {e}") from e
-        # a branch cut before main moved still needs the current code: the fix is for what is on main now
+        try:  # the accepted branch was cut when the person clicked Accept: fix what is on main now
+            _git(["rebase", "-q", base], wt)
+        except RuntimeError as e:
+            raise FixError(f"{eval_branch} does not rebase onto {base}: {e}") from e
         spec_file = wt / "evals" / "accepted" / f"{spec['name']}.json"
         if not spec_file.exists():
             raise FixError(f"{eval_branch} does not contain the accepted case")
@@ -147,16 +197,20 @@ async def run_fix(
         beat()
         author_out = await author.run(wt, build_prompt(spec, c0["failures"], slug))
         res["author"] = author_out
-        files = await _changed_files(wt)
+        changes = await _changes(wt)
+        files = [p for _, p in changes]
         res["files"] = files
         if not files:
             return res | {"stage": "author", "reason": "the fix session changed nothing"}
         if bad := frozen_changes(files):
             return res | {"stage": "author", "reason": f"the fix touched the eval suite, which it may not: {bad}"}
+        if gone := deleted_tests(changes):
+            return res | {"stage": "author", "reason": f"the fix deleted tests, which it may not: {gone}"}
         res["guardrails"] = touched_guardrails(files)
         beat()
+        # tests run with a throwaway HOME and no tokens or keys; they still run as this user (see the module docstring)
         code, out = await _run([sys.executable, "-m", "pytest", "-q", "-x"], wt,
-                               safe_env() | {"PYTHONPATH": str(wt)}, PYTEST_TIMEOUT)
+                               safe_env() | {"PYTHONPATH": str(wt), "HOME": str(tmp)}, PYTEST_TIMEOUT)
         res["pytest"] = {"ok": code == 0, "tail": out[-400:]}
         if code != 0:
             return res | {"stage": "pytest", "reason": "the unit tests fail with the fix"}
@@ -174,6 +228,14 @@ async def run_fix(
                         "cost_usd": suite.get("est_cost_usd")}
         if bad_hard:
             return res | {"stage": "suite", "reason": f"hard cases fail with the fix: {bad_hard}"}
+        # the gates ran the author's code: look again at what is in the tree before committing it
+        final = await _changes(wt)
+        final_files = [p for _, p in final]
+        if bad := frozen_changes(final_files) or deleted_tests(final):
+            return res | {"stage": "author", "reason": f"the checks left changes to protected files: {bad}"}
+        if hits := secret_hits(await _diff_text(wt)):
+            return res | {"stage": "secrets", "reason": f"the fix contains what looks like a secret ({', '.join(hits)}); refused"}
+        res["files"], res["guardrails"] = final_files, touched_guardrails(final_files)
         try:
             _git(["add", "-A"], wt)
             _git(["commit", "-q", "-m", f"Fix: {spec['description']}\n\nMakes eval case {spec['name']} pass "
@@ -215,6 +277,15 @@ def github_slug(repo: Path = REPO_DIR) -> str:
     return check_repo_in_scope(m.group(1))
 
 
+def ready_text(proposal_id: str, res: dict[str, Any]) -> str:
+    """Slack message when a checked fix is committed locally and waiting for the person's [Open PR]."""
+    g = "\n:warning: *Touches guardrail files:* " + ", ".join(res["guardrails"]) if res.get("guardrails") else ""
+    files = ", ".join(res["files"][:12]) + (" ..." if len(res["files"]) > 12 else "")
+    return (f"Fix ready for `{proposal_id}` (nothing pushed yet). Case {res['before']['passed']}/{res['before']['runs']} -> "
+            f"{res['after']['passed']}/{res['after']['runs']} runs passing; unit tests green; no hard case fails.\n"
+            f"Files: {files}{g}\nRead it first: `git diff main...{res['branch']}` in the repo. [Open PR] pushes the branch and opens the PR.")
+
+
 def report_text(proposal_id: str, res: dict[str, Any], pr: dict[str, Any] | None) -> str:
     """The Slack message that ends a fix attempt."""
     if pr and pr.get("ok"):
@@ -223,21 +294,26 @@ def report_text(proposal_id: str, res: dict[str, Any], pr: dict[str, Any] | None
                 f"{res['after']['passed']}/{res['after']['runs']} runs passing; tests green; no hard case fails.{g}\n"
                 "aoa will review it; merging is your call.")
     if pr is not None:
-        return f"The fix for `{proposal_id}` passed its checks but the PR could not be opened: {pr.get('reason')}"
+        return f"The fix for `{proposal_id}` is ready but the PR could not be opened: {pr.get('reason')}. The branch is kept; click Open PR to try again."
     cost = (res.get("author") or {}).get("cost_usd")
     spent = f" (fix session ~${cost:.2f})" if isinstance(cost, (int, float)) else ""
     return f"No fix PR for `{proposal_id}`: {res.get('reason', 'unknown')} (stage: {res.get('stage', '?')}).{spent}"
 
 
+def _gh(text: Any) -> str:
+    """Model- and trace-derived text for a GitHub PR: no @-mentions, no raw HTML."""
+    return str(text).replace("@", "@\u200b").replace("<", "&lt;")
+
+
 def pr_title(res: dict[str, Any], spec: dict[str, Any]) -> str:
-    return ("[guardrail] " if res.get("guardrails") else "") + f"Fix: {spec['description']}"[:200]
+    return ("[guardrail] " if res.get("guardrails") else "") + _gh(f"Fix: {spec['description']}")[:200]
 
 
 def pr_body(res: dict[str, Any], spec: dict[str, Any], proposal_id: str, origin: dict[str, Any]) -> str:
     b, a, s = res["before"], res["after"], res["suite"]
     lines = [
-        f"Drafted by the eval flywheel from proposal `{proposal_id}` (flag `{origin.get('reason')}` in `{origin.get('conv')}`).",
-        "", "## Eval case", f"`evals/accepted/{spec['name']}.json`: {spec['description']}",
+        f"Drafted by the eval flywheel from proposal `{proposal_id}` (flag `{_gh(origin.get('reason'))}` in `{_gh(origin.get('conv'))}`).",
+        "", "## Eval case", f"`evals/accepted/{spec['name']}.json`: {_gh(spec['description'])}",
         "", "## Before / after (real model)",
         f"- case before: {b['passed']}/{b['runs']} runs pass", f"- case after: {a['passed']}/{a['runs']} runs pass",
         f"- behaviour suite after ({s['cases']} cases, 1 run each): hard failures: {s['hard_failures'] or 'none'}; "
@@ -246,11 +322,11 @@ def pr_body(res: dict[str, Any], spec: dict[str, Any], proposal_id: str, origin:
         "", "## Files changed"] + [f"- `{f}`" for f in res["files"]]
     if res.get("guardrails"):
         lines += ["", "## Guardrail files touched",
-                  "This change touches code the evals grade (safety, approvals, notifier, trust, merge path). "
+                  "This change touches code the evals grade (safety, approvals, notifier, trust, merge path, the prompt, the pipeline). "
                   "Review it as a safety change, not a routine fix:"] + [f"- `{f}`" for f in res["guardrails"]]
     summary = (res.get("author") or {}).get("summary")
     if summary:
-        lines += ["", "## Author's summary (model-written, unverified)", summary[:1200]]
+        lines += ["", "## Author's summary (model-written, unverified)", _gh(summary[:1200])]
     lines += ["", "No automatic merge: aoa reviews this like any PR and a human decides.",
               "The fix author could read the whole repo, including other eval cases, so these are not held-out numbers.",
               "", "🤖 Generated with [Claude Code](https://claude.com/claude-code)"]

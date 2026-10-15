@@ -161,14 +161,17 @@ async def eval_proposal(client: Client) -> None:
 
 
 async def fix_pr(client: Client) -> None:
-    """FixPrWorkflow: fix_run ok, open the PR, report."""
+    """FixPrWorkflow: fix_run ok, report ready, wait for the [Open PR] signal, open the PR, report."""
     s = mk_env()
     stubs = [stub("fix_run", {"ok": True, "slug": "x", "branch": "fix/x"}),
              stub("fix_open_pr", {"ok": True, "url": "https://github.com/agileresearchservices/demo/pull/9"}), stub("fix_report", None)]
     w, _ = await worker_with(client, s, FakeLLM([]), stubs)
     async with w:
         wid = f"fix-prop-{uuid.uuid4().hex[:6]}"
-        await client.execute_workflow("FixPrWorkflow", {"session": "main", "id": "prop-0123abcd"}, id=wid, task_queue=s.task_queue)
+        h = await client.start_workflow("FixPrWorkflow", {"session": "main", "id": "prop-0123abcd"}, id=wid, task_queue=s.task_queue)
+        await asyncio.sleep(2)  # fix_run and the "ready" report are done; the workflow waits for the click
+        await h.signal("open_pr")
+        await asyncio.wait_for(h.result(), 30)
     await save(client, "fix_pr", wid)
 
 

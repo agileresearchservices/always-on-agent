@@ -228,6 +228,18 @@ async def draft_fix(sid: str, pid: str) -> dict[str, Any]:
     return {"status": "started"}
 
 
+@app.post("/sessions/{sid}/proposals/{pid}/fix/open", status_code=202, dependencies=[Depends(require_token)])
+async def open_fix_pr(sid: str, pid: str) -> dict[str, Any]:
+    """The person read the local fix and clicked [Open PR]: tell the waiting FixPrWorkflow to push and open it."""
+    if not re.fullmatch(r"prop-[0-9a-f]{8}", pid) or store.proposal_get(pid) is None:
+        raise HTTPException(404, "no such proposal")
+    try:
+        await app.state.client.get_workflow_handle(f"fix-{pid}").signal("open_pr")
+    except RPCError as e:
+        raise HTTPException(409, "no fix is waiting to be opened for this case") from e
+    return {"status": "signalled"}
+
+
 @app.get("/sessions/{sid}/state", dependencies=[Depends(require_token)])
 async def state(sid: str) -> dict[str, Any]:
     from .delivery import session_workflow_id
