@@ -50,28 +50,34 @@ class Notifier:
     def next_flush_at(self, session: str, now: datetime) -> float | None:
         """Epoch seconds when the held digest may go out, or None when nothing is held. Never inside quiet
         hours, never before the minimum spacing since the last send."""
-        if not self.store.kv_get(session, "digest", []):
+        held = self.store.kv_get(session, "digest", [])
+        if not held:
             return None
-        last = self.store.kv_get(session, "last_notified_ts", 0.0)
+        return self._flush_at(held, self.store.kv_get(session, "last_notified_ts", 0.0), now)
+
+    def _flush_at(self, held: list[str], last: float, now: datetime) -> float:
         t = max(now.timestamp(), last + self.s.min_update_interval_seconds)
         local = datetime.fromtimestamp(t, ZoneInfo(self.s.tz))
         return quiet_end_after(local, self.s.quiet_start_hour, self.s.quiet_end_hour).timestamp()
 
     def flush_digest(self, session: str, now: datetime) -> dict[str, Any]:
         """Deliver held updates as one message once they are allowed out. Idempotent: the client key names the
-        exact digest, so a retry after a crash cannot send it twice."""
-        held = self.store.kv_get(session, "digest", [])
-        if not held:
-            return {"status": "empty", "flush_at": None}
-        due = self.next_flush_at(session, now)
-        if due is not None and due > now.timestamp():
-            return {"status": "not_due", "flush_at": due}
-        last = self.store.kv_get(session, "last_notified_ts", 0.0)
-        sig = hashlib.sha1(json.dumps(held).encode()).hexdigest()[:12]
-        body = "Held updates:\n" + "\n".join(f"- {h}" for h in held)
-        seq = self.store.outbox_push(session, "update", {"text": body}, client_key=f"digest:{last}:{sig}")
-        self.store.kv_set(session, "digest", [])
-        self.store.kv_set(session, "last_notified_ts", now.timestamp())
+        exact digest, so a retry after a crash cannot send it twice. One transaction, so a concurrent send()
+        cannot append to the digest between the read and the clear."""
+        kv_get, kv_set = self.store.kv_get_c, self.store.kv_set_c
+        with self.store._tx() as c:
+            held = kv_get(c, session, "digest", [])
+            if not held:
+                return {"status": "empty", "flush_at": None}
+            last = kv_get(c, session, "last_notified_ts", 0.0)
+            due = self._flush_at(held, last, now)
+            if due > now.timestamp():
+                return {"status": "not_due", "flush_at": due}
+            sig = hashlib.sha1(json.dumps(held).encode()).hexdigest()[:12]
+            body = "Held updates:\n" + "\n".join(f"- {h}" for h in held)
+            seq = self.store.outbox_push_c(c, session, "update", {"text": body}, client_key=f"digest:{last}:{sig}")
+            kv_set(c, session, "digest", [])
+            kv_set(c, session, "last_notified_ts", now.timestamp())
         return {"status": "sent" if seq is not None else "duplicate", "flush_at": None}
 
     def send(self, session: str, kind: str, text: str, now: datetime, client_key: str | None = None) -> dict[str, Any]:
@@ -81,25 +87,32 @@ class Notifier:
         if not text and kind != "reaction":
             return {"status": "error", "error": "empty message"}
 
-        if kind not in ALWAYS:
-            last = self.store.kv_get(session, "last_notified_ts", 0.0)
-            too_soon = (now.timestamp() - last) < self.s.min_update_interval_seconds
-            quiet = in_quiet_hours(now.astimezone(ZoneInfo(self.s.tz)), self.s.quiet_start_hour, self.s.quiet_end_hour)
-            if quiet or (too_soon and kind != "alert"):
-                held = self.store.kv_get(session, "digest", [])
-                held.append(text)
-                self.store.kv_set(session, "digest", held[-20:])
-                return {"status": "held", "reason": "quiet hours" if quiet else "too soon after the last update",
-                        "note": "Included with your next update that goes out."}
+        kv_get, kv_set = self.store.kv_get_c, self.store.kv_set_c
+        # The whole decision (throttle read, digest read-modify-write, outbox insert, throttle write) is one
+        # BEGIN IMMEDIATE transaction: two concurrent sends cannot both see "not too soon", and a failure
+        # anywhere leaves outbox, digest and last_notified_ts untouched.
+        with self.store._tx() as c:
+            if kind not in ALWAYS:
+                last = kv_get(c, session, "last_notified_ts", 0.0)
+                too_soon = (now.timestamp() - last) < self.s.min_update_interval_seconds
+                quiet = in_quiet_hours(
+                    now.astimezone(ZoneInfo(self.s.tz)), self.s.quiet_start_hour, self.s.quiet_end_hour
+                )
+                if quiet or (too_soon and kind != "alert"):
+                    held = kv_get(c, session, "digest", [])
+                    held.append(text)
+                    kv_set(c, session, "digest", held[-20:])
+                    return {"status": "held", "reason": "quiet hours" if quiet else "too soon after the last update",
+                            "note": "Included with your next update that goes out."}
 
-        held = self.store.kv_get(session, "digest", [])
-        body = text
-        if held and kind in ("update", "reply", "alert"):
-            body = text + "\n\nEarlier updates:\n" + "\n".join(f"- {h}" for h in held)
-            self.store.kv_set(session, "digest", [])
-        seq = self.store.outbox_push(session, kind, {"text": body}, client_key=client_key)
-        if seq is None:
-            return {"status": "duplicate", "note": "this exact send was already delivered"}
-        if kind != "reaction":
-            self.store.kv_set(session, "last_notified_ts", now.timestamp())
+            held = kv_get(c, session, "digest", [])
+            body = text
+            if held and kind in ("update", "reply", "alert"):
+                body = text + "\n\nEarlier updates:\n" + "\n".join(f"- {h}" for h in held)
+                kv_set(c, session, "digest", [])
+            seq = self.store.outbox_push_c(c, session, kind, {"text": body}, client_key=client_key)
+            if seq is None:
+                return {"status": "duplicate", "note": "this exact send was already delivered"}
+            if kind != "reaction":
+                kv_set(c, session, "last_notified_ts", now.timestamp())
         return {"status": "sent", "seq": seq}
