@@ -30,9 +30,11 @@ class FakeLLM:
         self.usage = usage or {"input_tokens": 100, "output_tokens": 20,
                                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
 
-    async def create(self, *, model, system, messages, tools, max_tokens, tool_choice=None, thinking=None, effort=None) -> LLMResponse:
+    async def create(self, *, model, system, messages, tools, max_tokens, tool_choice=None, thinking=None, effort=None,
+                     output_format=None) -> LLMResponse:
         call = {"model": model, "system": system, "messages": messages, "tools": tools, "tool_choice": tool_choice,
-                "thinking": thinking, "effort": effort}
+                "thinking": thinking, "effort": effort,
+                "output_format": output_format}
         self.calls.append(call)
         if not self.script:
             raise AssertionError("FakeLLM script exhausted")

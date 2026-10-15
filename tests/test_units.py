@@ -330,6 +330,50 @@ async def test_forced_tool_choice_drops_thinking_and_effort():
     assert seen["thinking"] == {"type": "adaptive"} and seen["output_config"] == {"effort": "high"}
 
 
+async def test_output_format_is_sent_as_json_schema_and_retried_without_if_rejected():
+    from types import SimpleNamespace as NS
+    from aoa.llm import AnthropicLLM
+
+    calls = []
+
+    class Rejected(Exception):
+        status_code = 400
+
+    class Msgs:
+        async def create(self, **kw):
+            calls.append(__import__('copy').deepcopy(kw))
+            if len(calls) == 1 and reject:
+                raise Rejected("Schema is too complex for compilation")
+            return NS(content=[NS(type="text", text="{}")], stop_reason="end_turn",
+                      usage=NS(input_tokens=1, output_tokens=1, cache_read_input_tokens=0, cache_creation_input_tokens=0))
+
+    schema = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"], "additionalProperties": False}
+    base = dict(model="m", system=[], tools=[], max_tokens=50, output_format=schema,
+                messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    reject = False
+    llm = AnthropicLLM(NS(messages=Msgs()), cache_ttl_seconds=300)
+    await llm.create(**base)
+    assert calls[0]["output_config"] == {"format": {"type": "json_schema", "schema": schema}}
+    calls.clear(); reject = True  # the API refuses the schema: carry on without it, once
+    await llm.create(**base, thinking={"type": "adaptive"}, effort="high")
+    assert len(calls) == 2 and "format" in calls[0]["output_config"]
+    assert calls[1]["output_config"] == {"effort": "high"}  # effort kept, schema dropped
+    calls.clear()
+    await llm.create(**base)  # no effort: no output_config at all on the retry
+    assert len(calls) == 2 and "output_config" not in calls[1]
+
+
+async def test_command_reviewer_asks_for_the_schema_and_reads_plain_json():
+    from aoa.safety import REVIEW_SCHEMA, autoreview
+    from aoa.testing import FakeLLM, text
+
+    llm = FakeLLM([text('{"allow": true, "reason": "routine"}'), text('Sure! {"allow": false, "reason": "no"}'), text("garbage")])
+    assert (await autoreview(llm, "m", "ls", "list")).allow is True
+    assert llm.calls[0]["output_format"] == REVIEW_SCHEMA
+    assert (await autoreview(llm, "m", "rm x", "tidy")).allow is False  # prose-wrapped (schema refused) still parsed
+    assert (await autoreview(llm, "m", "x", "y")).allow is False  # fails closed
+
+
 # ---- store --------------------------------------------------------------------------------------
 def test_commit_step_is_atomic_and_idempotent(settings):
     st = Store(settings.db_path)

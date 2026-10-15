@@ -264,3 +264,31 @@ async def test_a_thinking_only_response_is_stored_with_a_placeholder_so_the_turn
     await handle_events(core, "main", [usr_event("hi")])
     last = core.store.load_messages("main")[-1]
     assert [b["type"] for b in last["content"]] == ["thinking", "text"] and last["content"][1]["text"] == "(no output)"
+
+
+async def test_pr_review_conversations_get_the_verdict_schema_others_do_not(make_core):
+    from aoa.pr_review import VERDICT_SCHEMA
+
+    core, llm = make_core([text("a"), text("b")])
+    await core.prepare_helper("prreview/o/r#1@abc/helper/x", "review it")
+    await core.llm_step("main", "prreview/o/r#1@abc/helper/x", "k", "helper", 1)
+    await handle_events(core, "main", [usr_event("hi")])
+    assert llm.calls[0]["output_format"] == VERDICT_SCHEMA and llm.calls[1]["output_format"] is None
+
+
+def test_the_verdict_schema_is_within_what_structured_outputs_accept():
+    from aoa.pr_review import VERDICT_SCHEMA
+
+    def walk(n):
+        if isinstance(n, dict):
+            if n.get("type") == "object":
+                assert n["additionalProperties"] is False and set(n["required"]) == set(n["properties"])
+            for banned in ("minimum", "maximum", "minLength", "maxLength", "multipleOf", "$ref"):
+                assert banned not in n
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+
+    walk(VERDICT_SCHEMA)
