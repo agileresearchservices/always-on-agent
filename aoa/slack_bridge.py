@@ -208,7 +208,7 @@ class Bridge:
         self.cfg, self.web, self.http, self.cursor_path = cfg, web, http, cursor_path
         self._decided: set[str] = set()  # Slack can deliver one click twice; act on each approval once
         self._cards: dict[str, tuple[str, str]] = {}  # approval_id -> (message ts, text) of its posted card
-        self._deciding: set[str] = set()  # eval-case clicks in flight (Slack may deliver twice)
+        self._deciding: set[Any] = set()  # eval-case clicks in flight (Slack may deliver twice)
         self._merging: set[str] = set()  # merge offers clicked and not yet reported (Slack may deliver twice)
 
     # ---- Slack -> agent --------------------------------------------------------------
@@ -300,12 +300,15 @@ class Bridge:
     async def _proposal(self, pid: str, accept: bool, ts: str | None, text: str) -> None:
         if pid in self._deciding:
             return
-        self._deciding.add(pid)
+        self._deciding.add(pid)  # kept after success: Slack can deliver one click twice
         try:
             r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}", json={"accept": accept})
-        finally:
+        except httpx.HTTPError:
             self._deciding.discard(pid)
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: could not reach the aoa server; click again._")
+            return
         if r.status_code >= 400:
+            self._deciding.discard(pid)
             self._check(r, "decide proposal")
             try:
                 detail = str(r.json().get("detail") or "")
@@ -324,14 +327,17 @@ class Bridge:
                 log.warning("could not update eval-case card", exc_info=True)
 
     async def _fix(self, pid: str, ts: str | None, text: str) -> None:
-        if pid in self._deciding:
+        if ("fix", pid) in self._deciding:
             return
-        self._deciding.add(pid)
+        self._deciding.add(("fix", pid))
         try:
             r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}/fix")
-        finally:
-            self._deciding.discard(pid)
+        except httpx.HTTPError:
+            self._deciding.discard(("fix", pid))
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: could not reach the aoa server; click again._")
+            return
         if r.status_code >= 400:
+            self._deciding.discard(("fix", pid))
             self._check(r, "start fix")
             try:
                 detail = str(r.json().get("detail") or "")

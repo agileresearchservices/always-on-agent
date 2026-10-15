@@ -152,9 +152,10 @@ async def run_evals(args: list[str], *, cwd: Path = REPO_DIR, key: str | None = 
             cwd=str(cwd), env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise
+        finally:  # a timeout or an activity cancellation must not leave a paid eval run going
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(f"eval run failed: {err.decode()[-300:]}")
     return json.loads(out.decode().strip().splitlines()[-1])
@@ -201,6 +202,11 @@ async def start_proposals(settings: Settings, session: str, flags: list[dict[str
     return started
 
 
+def _esc(text: Any) -> str:
+    """Slack control characters out of model- and trace-derived text, so it cannot make a link or an @channel ping."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def card_text(p: dict[str, Any]) -> str:
     spec, info = p["spec"], p["info"]
     v = info.get("validation")
@@ -209,14 +215,15 @@ def card_text(p: dict[str, Any]) -> str:
         valid = f"Validation: {res} ({v['runs'] - v['passed']}/{v['runs']} runs failed"
         valid += f", ~${v['cost_usd']:.2f})" if v.get("cost_usd") is not None else ")"
     else:
-        valid = "Validation: not run (no API key for the worker)"
+        why = f"the eval run failed ({_esc(info['validation_error'])})" if info.get("validation_error") else "no API key for the worker"
+        valid = f":warning: *NOT VALIDATED*: {why}. Nothing shows this case fails on the current agent."
     lines = [f"*Proposed eval case* `{spec['name']}` ({'hard' if spec['hard'] else 'soft'})",
-             f"From flag `{p['reason']}` in `{p['conv_id']}`.", spec["description"], "",
+             f"From flag `{_esc(p['reason'])}` in `{_esc(p['conv_id'])}`.", _esc(spec["description"]), "",
              "*Scenario*"]
     for i, turn in enumerate(spec["turns"], 1):
         for e in turn:
-            lines.append(f"{i}. {e['from']}: {e['text'][:300]}")
-    lines += ["", "*Checks*"] + [f"• {g['type']} {json.dumps(g.get('args') or {})}" for g in spec["graders"]]
+            lines.append(f"{i}. {_esc(e['from'])}: {_esc(e['text'][:300])}")
+    lines += ["", "*Checks*"] + [f"• {g['type']} {_esc(json.dumps(g.get('args') or {}))}" for g in spec["graders"]]
     if _spec().passes_on_empty_run(spec):
         lines.append("_Note: every check passes if the agent does nothing; the case only means something because the agent failed it._")
     return "\n".join(lines + ["", valid])
@@ -236,9 +243,17 @@ def write_accepted_branch(spec: dict[str, Any], proposal_id: str, repo: Path = R
     branch = "eval/" + spec["name"].removeprefix("flywheel_").replace("_", "-")
     if not re.fullmatch(r"eval/[a-z0-9-]{3,60}", branch):
         raise RuntimeError(f"unusable branch name {branch!r}")
+    path = f"evals/accepted/{spec['name']}.json"
+    try:  # an earlier accept that got as far as the commit: same spec on that branch means it is done
+        if json.loads(_git(["show", f"{branch}:{path}"], repo)) == spec:
+            return branch
+    except (RuntimeError, ValueError):
+        pass
     tmp = Path(tempfile.mkdtemp(prefix="aoa-evalbranch-"))
+    created = committed = False
     try:
         _git(["worktree", "add", "-q", "-b", branch, str(tmp / "wt"), base], repo)
+        created = True
         wt = tmp / "wt"
         out = wt / "evals" / "accepted"
         out.mkdir(parents=True, exist_ok=True)
@@ -246,12 +261,18 @@ def write_accepted_branch(spec: dict[str, Any], proposal_id: str, repo: Path = R
         _git(["add", "evals/accepted"], wt)
         _git(["commit", "-q", "-m", f"evals: accept {spec['name']} (flywheel proposal {proposal_id})\n\n"
                                     f"Origin: {spec.get('origin', {}).get('conv')} / {spec.get('origin', {}).get('reason')}"], wt)
+        committed = True
     finally:
         try:
             _git(["worktree", "remove", "--force", str(tmp / "wt")], repo)
         except RuntimeError:
             pass
         shutil.rmtree(tmp, ignore_errors=True)
+        if created and not committed:  # do not leave an empty branch that makes every retry fail
+            try:
+                _git(["branch", "-D", branch], repo)
+            except RuntimeError:
+                pass
     return branch
 
 
@@ -289,17 +310,26 @@ async def run_proposal(store: Store, settings: Settings, llm: LLM, flag: dict[st
         pid = store.proposal_create(flag["conv_id"], flag["reason"])
         if pid is None:
             return {"id": None, "status": "duplicate"}
+    saved = store.proposal_get(pid)
+    if saved and saved["spec"]:  # a retry after the draft was paid for: do not draft (and bill) again
+        spec, notes = saved["spec"], saved["info"].get("notes", "")
+    else:
+        try:
+            spec, notes, usage = await draft(llm, settings.helper_model, store, flag)
+        except ValueError as e:  # SpecError is a ValueError
+            store.proposal_update(pid, "invalid", info={"error": str(e)[:300]})
+            return {"id": pid, "status": "invalid"}
+        store.usage_add(f"{session}#eval-draft", settings.helper_model, usage)
+        if spec is None:
+            store.proposal_update(pid, "declined", info={"notes": notes})
+            return {"id": pid, "status": "declined"}
+        store.proposal_update(pid, "drafting", spec=spec, info={"notes": notes})
     try:
-        spec, notes, usage = await draft(llm, settings.helper_model, store, flag)
-    except ValueError as e:  # SpecError is a ValueError
-        store.proposal_update(pid, "invalid", info={"error": str(e)[:300]})
-        return {"id": pid, "status": "invalid"}
-    store.usage_add(f"{session}#eval-draft", settings.helper_model, usage)
-    if spec is None:
-        store.proposal_update(pid, "declined", info={"notes": notes})
-        return {"id": pid, "status": "declined"}
-    validation = await validate_on_agent(spec, settings.eval_validate_runs)
-    info = {"notes": notes, "validation": validation}
+        validation = await validate_on_agent(spec, settings.eval_validate_runs)
+        error = None
+    except Exception as e:  # noqa: BLE001 - the draft is paid for; show it, flagged, rather than retry the spend
+        validation, error = None, f"{type(e).__name__}: {e}"[:300]
+    info = {"notes": notes, "validation": validation, **({"validation_error": error} if error else {})}
     if validation and validation["verdict"] == "not_reproduced":
         store.proposal_update(pid, "not_reproduced", spec=spec, info=info)
         return {"id": pid, "status": "not_reproduced"}
