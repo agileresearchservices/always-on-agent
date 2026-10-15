@@ -18,6 +18,8 @@ python -m aoa.worker                      # terminal 2
 uvicorn aoa.server:app --port 8000        # terminal 3
 python -m aoa.client_cli --session main   # terminal 4
 python -m aoa usage                       # estimated API spend per day (from the usage table)
+python -m aoa flags --scan                # list flagged bad outcomes (denied approvals, cut-off or capped turns, repeated tool errors, cache misses, report_issue)
+python -m aoa trace <conv> [--json]       # a conversation's messages, the stable trace export
 ```
 
 Trigger it from outside the chat:

@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS routines (
   PRIMARY KEY (session, name));
 CREATE TABLE IF NOT EXISTS kv (session TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
   PRIMARY KEY (session, key));
+CREATE TABLE IF NOT EXISTS flagged (
+  conv_id TEXT NOT NULL, reason TEXT NOT NULL, step_key TEXT, evidence TEXT NOT NULL, ts REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  PRIMARY KEY (conv_id, reason));
 """
 
 
@@ -271,6 +275,44 @@ class Store:
         with self._conn() as c:
             cur = c.execute("UPDATE approvals SET status='expired' WHERE id=? AND status='pending'", (approval_id,))
             return cur.rowcount == 1
+
+    def approvals_denied(self) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute("SELECT id, session, action FROM approvals WHERE status='denied'").fetchall()
+        return [dict(r) | {"action": json.loads(r["action"])} for r in rows]
+
+    # ---- traces and flags -------------------------------------------------
+    def conv_ids(self) -> list[str]:
+        with self._conn() as c:
+            return [r["conv_id"] for r in c.execute("SELECT DISTINCT conv_id FROM steps ORDER BY conv_id")]
+
+    def steps_for(self, conv_id: str) -> list[tuple[str, Any]]:
+        """Every recorded step of a conversation as (step_key, result), in insertion order."""
+        with self._conn() as c:
+            rows = c.execute("SELECT step_key, result FROM steps WHERE conv_id=? ORDER BY rowid", (conv_id,)).fetchall()
+        return [(r["step_key"], json.loads(r["result"])) for r in rows]
+
+    def flag_add(self, conv_id: str, reason: str, evidence: str, step_key: str | None = None) -> bool:
+        """Record a flagged outcome once per (conversation, reason). Returns False if it was already there."""
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO flagged (conv_id, reason, step_key, evidence, ts) VALUES (?,?,?,?,?)",
+                (conv_id, reason, step_key, evidence, time.time()),
+            )
+            return cur.rowcount == 1
+
+    def flags_list(self, status: str | None = "open") -> list[dict[str, Any]]:
+        with self._conn() as c:
+            if status is None:
+                rows = c.execute("SELECT * FROM flagged ORDER BY ts, rowid").fetchall()
+            else:
+                rows = c.execute("SELECT * FROM flagged WHERE status=? ORDER BY ts, rowid", (status,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def flag_set_status(self, conv_id: str, reason: str, status: str) -> bool:
+        with self._conn() as c:
+            return c.execute("UPDATE flagged SET status=? WHERE conv_id=? AND reason=?",
+                             (status, conv_id, reason)).rowcount == 1
 
     # ---- routines ----------------------------------------------------------
     def routine_put(self, session: str, name: str, cron: str, prompt: str) -> None:
