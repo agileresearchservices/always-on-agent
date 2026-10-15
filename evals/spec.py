@@ -131,6 +131,9 @@ def validate_spec(spec: Any) -> dict[str, Any]:
     tags = spec.get("tags", ["flywheel"])
     if not isinstance(tags, list) or len(tags) > 6 or not all(isinstance(t, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,24}", t) for t in tags):
         raise SpecError("tags: up to 6 short lowercase strings")
+    origin = spec.get("origin", {})
+    if not isinstance(origin, dict) or not all(isinstance(k, str) and isinstance(v, str) and len(v) <= 300 for k, v in origin.items()):
+        raise SpecError("origin must be an object of short strings")
     build_turns(spec.get("turns"))
     build_graders(spec.get("graders"))
     out = dict(spec)

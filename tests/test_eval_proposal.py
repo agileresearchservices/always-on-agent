@@ -49,7 +49,7 @@ def test_outside_text_is_untrusted():
     spec(graders=[{"type": "tool_called"}]), spec(graders=[{"type": "tool_called", "args": {"name": "a", "x": 1}}]),
     spec(graders=[{"type": "within_budget", "args": {"max_steps": "ten", "max_output_tokens": 5}}]),
     spec(graders=[{"type": "within_budget", "args": {"max_steps": True, "max_output_tokens": 5}}]),
-    spec(extra="field"), "not an object",
+    spec(extra="field"), "not an object", spec(origin="main"), spec(origin={"conv": 5}),
 ])
 def test_bad_specs_are_rejected(bad):
     with pytest.raises(SpecError):
