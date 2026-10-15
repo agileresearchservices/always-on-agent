@@ -16,6 +16,16 @@ from .store import Store
 
 
 def kind_of(conv_id: str) -> str:
+    # Suffix/prefix checks for the side calls come first: "prreview/x/helper#review" is a command review,
+    # not a helper or a PR review.
+    if conv_id.endswith("#compact"):
+        return "compact"
+    if conv_id.endswith("#review"):
+        return "cmd-review"
+    if conv_id.endswith("#warm"):
+        return "warm"
+    if conv_id.startswith("resolve/"):
+        return "resolve"
     if conv_id.startswith("prreview/"):
         return "pr-review"
     if "/helper" in conv_id:
@@ -59,7 +69,7 @@ def _table(title: str, agg: dict[str, dict[str, Any]]) -> list[str]:
     return lines
 
 
-def render(rows: list[dict[str, Any]], days: int) -> str:
+def render(rows: list[dict[str, Any]], days: int, cache_ttl: int | None = None) -> str:
     if not rows:
         return f"No usage recorded in the last {days} day(s)."
     by_day, by_kind = _sum(rows, "day"), _sum(rows, "kind")
@@ -68,6 +78,9 @@ def render(rows: list[dict[str, Any]], days: int) -> str:
     lines = _table("By day (local time)", by_day) + [""] + _table("By source, same window", by_kind)
     lines += ["", f"Total ${total:.2f} over {len(by_day)} day(s) with usage, average ${avg:.2f}/day.",
               "Estimate from list prices; evals are not included. Billed amounts: Console > Usage and Cost."]
+    if cache_ttl is not None:
+        label = f"{cache_ttl // 3600}h" if cache_ttl >= 3600 and cache_ttl % 3600 == 0 else f"{cache_ttl // 60}m"
+        lines.append(f"Cache writes priced at the {label} rate (AOA_CACHE_TTL={cache_ttl}).")
     return "\n".join(lines)
 
 
@@ -75,4 +88,4 @@ def run(days: int = 2) -> str:
     settings = Settings.from_env()
     start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1)
     store = Store(settings.db_path)
-    return render(collect(store, start.timestamp(), settings.cache_ttl_seconds), days)
+    return render(collect(store, start.timestamp(), settings.cache_ttl_seconds), days, settings.cache_ttl_seconds)

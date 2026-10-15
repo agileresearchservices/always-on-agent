@@ -11,7 +11,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -95,15 +95,6 @@ class Store:
                 (conv_id, self._next_idx(c, conv_id), "user", json.dumps(blocks)),
             )
 
-    def append_user_content(self, conv_id: str, blocks: list[dict[str, Any]]) -> None:
-        """Append blocks to the conversation as user content, merging into a trailing user message.
-
-        This is how steering works: a new user event arriving mid-turn rides along with the
-        tool results of the step in flight instead of waiting in a queue.
-        """
-        with self._tx() as c:
-            self._append_user_blocks(c, conv_id, blocks)
-
     def commit_step(
         self,
         conv_id: str,
@@ -182,18 +173,26 @@ class Store:
                 return False
 
     # ---- outbox (what thin clients subscribe to) ----------------------------
+    @staticmethod
+    def outbox_push_c(
+        c: sqlite3.Connection, session: str, kind: str, payload: dict[str, Any], client_key: str | None = None
+    ) -> int | None:
+        """outbox_push on an open connection (inside `_tx`). A duplicate client_key returns None; the failed
+        INSERT changes nothing, so the surrounding transaction stays usable and commits normally."""
+        try:
+            cur = c.execute(
+                "INSERT INTO outbox (session, kind, payload, client_key, ts) VALUES (?,?,?,?,?)",
+                (session, kind, json.dumps(payload), client_key, time.time()),
+            )
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
     def outbox_push(
         self, session: str, kind: str, payload: dict[str, Any], client_key: str | None = None
     ) -> int | None:
         with self._conn() as c:
-            try:
-                cur = c.execute(
-                    "INSERT INTO outbox (session, kind, payload, client_key, ts) VALUES (?,?,?,?,?)",
-                    (session, kind, json.dumps(payload), client_key, time.time()),
-                )
-                return cur.lastrowid
-            except sqlite3.IntegrityError:
-                return None
+            return self.outbox_push_c(c, session, kind, payload, client_key)
 
     def outbox_since(self, session: str, after: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         with self._conn() as c:
@@ -290,11 +289,26 @@ class Store:
         return [dict(r) for r in rows]
 
     # ---- kv ----------------------------------------------------------------
+    @staticmethod
+    def kv_get_c(c: sqlite3.Connection, session: str, key: str, default: Any = None) -> Any:
+        row = c.execute("SELECT value FROM kv WHERE session=? AND key=?", (session, key)).fetchone()
+        return json.loads(row["value"]) if row else default
+
+    @staticmethod
+    def kv_set_c(c: sqlite3.Connection, session: str, key: str, value: Any) -> None:
+        c.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (session, key, json.dumps(value)))
+
     def kv_get(self, session: str, key: str, default: Any = None) -> Any:
         with self._conn() as c:
-            row = c.execute("SELECT value FROM kv WHERE session=? AND key=?", (session, key)).fetchone()
-        return json.loads(row["value"]) if row else default
+            return self.kv_get_c(c, session, key, default)
 
     def kv_set(self, session: str, key: str, value: Any) -> None:
         with self._conn() as c:
-            c.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (session, key, json.dumps(value)))
+            self.kv_set_c(c, session, key, value)
+
+    def kv_update(self, session: str, key: str, fn: Callable[[Any], Any], default: Any = None) -> Any:
+        """Atomic read-modify-write of one kv value; returns the new value."""
+        with self._tx() as c:
+            new = fn(self.kv_get_c(c, session, key, default))
+            self.kv_set_c(c, session, key, new)
+            return new

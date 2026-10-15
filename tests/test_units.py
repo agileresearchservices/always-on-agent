@@ -446,3 +446,128 @@ def test_alert_skips_spacing_but_not_quiet_hours(tmp_path, settings):
     night = datetime(2026, 10, 14, 23, 30, tzinfo=ET)
     assert n.send("s", "alert", "at night", night)["status"] == "held"  # never wakes the person
     assert n.send("s", "urgent", "fire", night)["status"] == "sent"
+
+
+def test_cache_ttl_parse_is_tolerant_but_loud(monkeypatch, tmp_path, caplog):
+    import logging
+
+    from aoa.config import Settings
+
+    monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
+    caplog.set_level(logging.WARNING, logger="aoa.config")
+    for raw, want in ((None, 300), ("", 300), ("300", 300), ("3600", 3600)):
+        caplog.clear()
+        if raw is None:
+            monkeypatch.delenv("AOA_CACHE_TTL", raising=False)
+        else:
+            monkeypatch.setenv("AOA_CACHE_TTL", raw)
+        assert Settings.from_env().cache_ttl_seconds == want
+        assert not caplog.records  # the valid values are silent
+    for raw, want in (("600", 3600), ("0", 300), ("garbage", 300)):
+        caplog.clear()
+        monkeypatch.setenv("AOA_CACHE_TTL", raw)
+        assert Settings.from_env().cache_ttl_seconds == want
+        msg = " ".join(r.getMessage() for r in caplog.records)
+        assert "AOA_CACHE_TTL" in msg and raw in msg and str(want) in msg
+
+
+def test_bad_numeric_env_warns_and_uses_the_default(monkeypatch, tmp_path, caplog):
+    """A typo in .env must not stop the worker (launchd would crash-loop it): warn, name the variable, use the default."""
+    import logging
+
+    from aoa.config import Settings, _int
+
+    monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
+    caplog.set_level(logging.WARNING, logger="aoa.config")
+    base = Settings.from_env()
+    for var, attr in (("AOA_MAX_STEPS", "max_steps_per_turn"), ("AOA_APPROVAL_NUDGE", "approval_nudge_seconds"),
+                      ("AOA_IDLE_SLEEP", "idle_sleep_seconds"), ("AOA_BATCH_WINDOW", "batch_window_seconds")):
+        caplog.clear()
+        monkeypatch.setenv(var, "twelve")
+        assert getattr(Settings.from_env(), attr) == getattr(base, attr)
+        msg = " ".join(r.getMessage() for r in caplog.records)
+        assert var in msg and "twelve" in msg
+        caplog.clear()
+        monkeypatch.setenv(var, "")  # empty means unset: silent
+        assert getattr(Settings.from_env(), attr) == getattr(base, attr)
+        assert not caplog.records
+        monkeypatch.delenv(var)
+    # a secret-looking variable never has its value echoed
+    caplog.clear()
+    monkeypatch.setenv("AOA_REVIEWER_TOKEN", "ghp_sekrit")
+    assert _int("AOA_REVIEWER_TOKEN", 1) == 1
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "AOA_REVIEWER_TOKEN" in msg and "ghp_sekrit" not in msg
+
+
+def test_quiet_hours_and_positive_durations_fall_back_with_a_warning(monkeypatch, tmp_path, caplog):
+    import logging
+
+    from aoa.config import Settings
+
+    monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
+    caplog.set_level(logging.WARNING, logger="aoa.config")
+    for var, bad, attr, default in (
+        ("AOA_QUIET_START", "24", "quiet_start_hour", 22),
+        ("AOA_QUIET_END", "-1", "quiet_end_hour", 7),
+        ("AOA_SHELL_TIMEOUT", "0", "shell_timeout_seconds", 60),
+        ("AOA_IDLE_SLEEP", "-30", "idle_sleep_seconds", 600),
+    ):
+        caplog.clear()
+        monkeypatch.setenv(var, bad)
+        assert getattr(Settings.from_env(), attr) == default
+        assert any(var in r.getMessage() for r in caplog.records)
+        monkeypatch.delenv(var)
+    caplog.clear()
+    monkeypatch.setenv("AOA_QUIET_START", "0")
+    monkeypatch.setenv("AOA_QUIET_END", "23")
+    s = Settings.from_env()
+    assert (s.quiet_start_hour, s.quiet_end_hour) == (0, 23) and not caplog.records
+
+
+def test_poll_seconds_floor_and_fallback(caplog):
+    import logging
+
+    from aoa.scheduling import poll_seconds
+
+    caplog.set_level(logging.WARNING, logger="aoa.scheduling")
+    assert poll_seconds(None) == 600 and poll_seconds("") == 600 and poll_seconds("120") == 120
+    assert not caplog.records
+    assert poll_seconds("5") == 30 and poll_seconds("-1") == 30
+    assert poll_seconds("often") == 600
+    assert len(caplog.records) == 3
+
+
+async def test_ensure_github_schedule_updates_an_existing_schedule(monkeypatch, settings):
+    from temporalio.client import ScheduleAlreadyRunningError, ScheduleUpdate
+
+    from aoa.scheduling import GITHUB_SCHEDULE_ID, ensure_github_schedule
+
+    class Handle:
+        def __init__(self):
+            self.updates = []
+
+        async def update(self, fn):
+            self.updates.append(fn(None))
+
+    class Client:
+        def __init__(self):
+            self.handle, self.created, self.handle_ids = Handle(), 0, []
+
+        async def create_schedule(self, sid, schedule):
+            self.created += 1
+            raise ScheduleAlreadyRunningError()
+
+        def get_schedule_handle(self, sid):
+            self.handle_ids.append(sid)
+            return self.handle
+
+    monkeypatch.setenv("AOA_GITHUB_USER", "someone")
+    monkeypatch.setenv("AOA_GITHUB_POLL_SECONDS", "5")
+    client = Client()
+    await ensure_github_schedule(client, settings)
+    assert client.created == 1 and client.handle_ids == [GITHUB_SCHEDULE_ID]
+    (update,) = client.handle.updates
+    assert isinstance(update, ScheduleUpdate)
+    assert update.schedule.spec.intervals[0].every == timedelta(seconds=30)  # floored
+    assert update.schedule.action.args[0]["user"] == "someone"
