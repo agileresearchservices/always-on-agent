@@ -18,7 +18,8 @@ from .scheduling import TemporalScheduler, ensure_github_schedule
 from .search_attrs import ensure_registered
 from .store import Store
 from .workflows import (
-    GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow,
+    EvalProposalWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
+    SessionWorkflow,
 )
 
 
@@ -34,7 +35,7 @@ async def build_worker(settings: Settings, client: Client, core: AgentCore | Non
     return Worker(
         client,
         task_queue=settings.task_queue,
-        workflows=[SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow],
+        workflows=[SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow, EvalProposalWorkflow],
         activities=acts.all(),
         max_concurrent_activities=20,
     )

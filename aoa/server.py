@@ -182,6 +182,28 @@ async def merge(sid: str, offer_id: str, m: MergeRequest) -> dict[str, Any]:
     return {"status": "started"}
 
 
+class ProposalDecision(BaseModel):
+    accept: bool
+
+
+@app.post("/sessions/{sid}/proposals/{pid}", dependencies=[Depends(require_token)])
+async def decide_proposal(sid: str, pid: str, d: ProposalDecision) -> dict[str, Any]:
+    """The person clicked Accept/Reject on an eval-case card. Accepting commits the spec to a local branch
+    (eval/<name>), nothing else; once per proposal."""
+    from . import eval_proposal
+
+    if not re.fullmatch(r"prop-[0-9a-f]{8}", pid):
+        raise HTTPException(404, "no such proposal")
+    try:
+        return await asyncio.to_thread(eval_proposal.decide, store, pid, d.accept)
+    except LookupError as e:
+        raise HTTPException(404, "no such proposal") from e
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(502, f"could not write the branch: {e}") from e
+
+
 @app.get("/sessions/{sid}/state", dependencies=[Depends(require_token)])
 async def state(sid: str) -> dict[str, Any]:
     from .delivery import session_workflow_id

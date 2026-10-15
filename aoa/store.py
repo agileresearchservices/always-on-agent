@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -38,6 +39,9 @@ CREATE TABLE IF NOT EXISTS flagged (
   conv_id TEXT NOT NULL, reason TEXT NOT NULL, step_key TEXT, evidence TEXT NOT NULL, ts REAL NOT NULL,
   status TEXT NOT NULL DEFAULT 'open',
   PRIMARY KEY (conv_id, reason));
+CREATE TABLE IF NOT EXISTS eval_proposals (
+  id TEXT PRIMARY KEY, conv_id TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL,
+  spec TEXT, info TEXT, ts REAL NOT NULL, UNIQUE (conv_id, reason));
 """
 
 
@@ -308,6 +312,55 @@ class Store:
             else:
                 rows = c.execute("SELECT * FROM flagged WHERE status=? ORDER BY ts, rowid", (status,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ---- eval proposals (flywheel step 2) -------------------------------------
+    def proposal_create(self, conv_id: str, reason: str) -> str | None:
+        """Start a proposal for a flag; None if one already exists for it (each flag is proposed once)."""
+        pid = "prop-" + uuid.uuid4().hex[:8]
+        with self._conn() as c:
+            cur = c.execute("INSERT OR IGNORE INTO eval_proposals (id, conv_id, reason, status, ts) VALUES (?,?,?,?,?)",
+                            (pid, conv_id, reason, "drafting", time.time()))
+            return pid if cur.rowcount == 1 else None
+
+    def proposal_find(self, conv_id: str, reason: str) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute("SELECT id FROM eval_proposals WHERE conv_id=? AND reason=?", (conv_id, reason)).fetchone()
+        return self.proposal_get(row["id"]) if row else None
+
+    def proposal_update(self, pid: str, status: str, spec: Any = None, info: Any = None) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE eval_proposals SET status=?, spec=COALESCE(?, spec), info=COALESCE(?, info) WHERE id=?",
+                      (status, None if spec is None else json.dumps(spec), None if info is None else json.dumps(info), pid))
+
+    def proposal_move(self, pid: str, from_status: str, to_status: str) -> bool:
+        """Atomic status change (e.g. proposed -> accepting), so a double click acts once."""
+        with self._conn() as c:
+            return c.execute("UPDATE eval_proposals SET status=? WHERE id=? AND status=?",
+                             (to_status, pid, from_status)).rowcount == 1
+
+    def proposal_get(self, pid: str) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM eval_proposals WHERE id=?", (pid,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["spec"], d["info"] = (json.loads(d["spec"]) if d["spec"] else None), (json.loads(d["info"]) if d["info"] else {})
+        return d
+
+    def proposals_list(self, status: str | None = None) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute("SELECT id FROM eval_proposals" + (" WHERE status=?" if status else "") + " ORDER BY ts, rowid",
+                             (status,) if status else ()).fetchall()
+        return [self.proposal_get(r["id"]) for r in rows]  # type: ignore[misc]
+
+    def proposals_since(self, ts: float) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM eval_proposals WHERE ts>=?", (ts,)).fetchone()["n"]
+
+    def flags_count(self, conv_id: str, reason_prefix: str, status: str) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM flagged WHERE conv_id=? AND status=? AND substr(reason, 1, ?)=?",
+                             (conv_id, status, len(reason_prefix), reason_prefix)).fetchone()["n"]
 
     def flag_set_status(self, conv_id: str, reason: str, status: str) -> bool:
         with self._conn() as c:

@@ -1,4 +1,4 @@
-"""python -m evals [--runs N] [--case NAME ...] [--concurrency K] [--batch]   (needs ANTHROPIC_API_KEY; costs real tokens)
+"""python -m evals [--runs N] [--case NAME ...] [--concurrency K] [--batch] [--spec FILE [--json]]   (needs ANTHROPIC_API_KEY; costs real tokens)
 
 Cases tagged "slow" (the hard review set) run only when named with --case or selected with --tag review-hard (or slow);
 --tag review alone gives the quick seed review cases.
@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
+from pathlib import Path
 
 from .cases import CASES
 from .runner import format_table, run_suite, save
@@ -33,13 +35,25 @@ def main() -> int:
     ap.add_argument("--tag", action="append", help="only cases with this tag (repeatable); the slow hard review set needs --tag review-hard")
     ap.add_argument("--paged", action="store_true", help="review the old way: the reviewer fetches the PR itself and pages through the spilled diff (for comparison; production inlines it)")
     ap.add_argument("--second-pass", action="store_true", help="experiment: review each PR twice, the second pass hunting ordering/error-path/cross-file bugs")
+    ap.add_argument("--spec", help="run the one case in this JSON spec file instead of the suite (used to validate a flywheel proposal)")
+    ap.add_argument("--json", action="store_true", help="print the report as JSON on stdout (with --spec)")
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     if a.list:
         for c in CASES:
             print(f"{'hard' if c.hard else 'soft'}  {c.name:34} {c.description}")
         return 0
-    cases = select_cases(CASES, a.case, a.tag)
+    if a.spec:
+        from .cases import Case
+        from .spec import case_from_spec
+
+        try:
+            cases = [case_from_spec(json.loads(Path(a.spec).read_text()), Case)]
+        except (OSError, ValueError) as e:  # SpecError is a ValueError, and so is bad JSON
+            print(f"bad spec: {e}", file=sys.stderr)
+            return 2
+    else:
+        cases = select_cases(CASES, a.case, a.tag)
     if not cases:
         print("no such case; try --list", file=sys.stderr)
         return 2
@@ -62,6 +76,9 @@ def main() -> int:
     report = asyncio.run(run_suite(cases, a.runs, factory, concurrency))
     if coord is not None:
         report["batch"] = {"batches": coord.batches, "requests": coord.requests}
+    if a.spec and a.json:
+        print(json.dumps({k: report[k] for k in ("model", "runs_per_case", "est_cost_usd", "cases")}))
+        return 0
     print(format_table(report))
     print(f"\nresults: {save(report)}")
     return 1 if any(c["hard"] and c["passed"] != c["runs"] for c in report["cases"].values()) else 0

@@ -35,6 +35,7 @@ PREFIX = {
     "sent_log": "_outbound_ ",
     "pr_review": ":mag: ",
     "pr_merge": "",
+    "eval_proposal": ":test_tube: ",
 }
 TYPED_DECISION = re.compile(r"^\s*(approve|deny)\s+(apr-[0-9a-f]+)\s*$", re.IGNORECASE)
 
@@ -94,6 +95,32 @@ def parse_merge_action(payload: dict[str, Any], cfg: BridgeConfig) -> str | None
     return None
 
 
+def parse_proposal_action(payload: dict[str, Any], cfg: BridgeConfig) -> tuple[str, bool] | None:
+    """Accept/Reject click on an eval-case card -> (proposal id, accept), only from the allowed user in our channel."""
+    if payload.get("type") != "block_actions" or (payload.get("user") or {}).get("id") != cfg.user:
+        return None
+    if (payload.get("channel") or {}).get("id") != cfg.channel:
+        return None
+    for act in payload.get("actions", []):
+        if act.get("action_id") in ("aoa_case_accept", "aoa_case_reject") and act.get("value"):
+            return act["value"], act["action_id"] == "aoa_case_accept"
+    return None
+
+
+def proposal_blocks(text: str, pid: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
+    if status:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": status}]})
+    if pid:
+        blocks.append({"type": "actions", "block_id": f"aoa_{pid}", "elements": [
+            {"type": "button", "action_id": "aoa_case_accept", "style": "primary", "value": pid,
+             "text": {"type": "plain_text", "text": "Accept case"}},
+            {"type": "button", "action_id": "aoa_case_reject", "style": "danger", "value": pid,
+             "text": {"type": "plain_text", "text": "Reject"}},
+        ]})
+    return blocks
+
+
 def merge_button(offer_id: str) -> dict[str, Any]:
     return {"type": "actions", "block_id": f"aoa_{offer_id}", "elements": [
         {"type": "button", "action_id": "aoa_merge", "style": "primary", "value": offer_id,
@@ -124,6 +151,8 @@ def render_outbox_item(item: dict[str, Any]) -> tuple[str, list[dict[str, Any]] 
     """Outbox row -> (fallback text, Block Kit blocks or None)."""
     kind, p = item["kind"], item["payload"]
     text = PREFIX.get(kind, f"_{kind}_ ") + to_mrkdwn(str(p.get("text", "")))
+    if kind == "eval_proposal" and p.get("proposal_id"):
+        return text, proposal_blocks(text, p["proposal_id"])
     if kind == "pr_review" and p.get("merge_offer"):
         return text, card_blocks(text, offer_id=p["merge_offer"])
     if kind != "approval" or not p.get("approval_id"):
@@ -154,6 +183,7 @@ class Bridge:
         self.cfg, self.web, self.http, self.cursor_path = cfg, web, http, cursor_path
         self._decided: set[str] = set()  # Slack can deliver one click twice; act on each approval once
         self._cards: dict[str, tuple[str, str]] = {}  # approval_id -> (message ts, text) of its posted card
+        self._deciding: set[str] = set()  # eval-case clicks in flight (Slack may deliver twice)
         self._merging: set[str] = set()  # merge offers clicked and not yet reported (Slack may deliver twice)
 
     # ---- Slack -> agent --------------------------------------------------------------
@@ -173,6 +203,11 @@ class Bridge:
         if offer is not None:
             msg = payload.get("message") or {}
             await self._merge(offer, msg.get("ts"), msg.get("text", ""))
+            return
+        prop = parse_proposal_action(payload, self.cfg)
+        if prop is not None:
+            msg = payload.get("message") or {}
+            await self._proposal(prop[0], prop[1], msg.get("ts"), msg.get("text", ""))
             return
         parsed = parse_block_action(payload, self.cfg)
         if parsed is None:
@@ -231,6 +266,31 @@ class Bridge:
                                            blocks=card_blocks(text, ":hourglass_flowing_sand: Merging…"))
             except Exception:  # noqa: BLE001 - cosmetic only
                 log.warning("could not update PR card", exc_info=True)
+
+    async def _proposal(self, pid: str, accept: bool, ts: str | None, text: str) -> None:
+        if pid in self._deciding:
+            return
+        self._deciding.add(pid)
+        try:
+            r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}", json={"accept": accept})
+        finally:
+            self._deciding.discard(pid)
+        if r.status_code >= 400:
+            self._check(r, "decide proposal")
+            try:
+                detail = str(r.json().get("detail") or "")
+            except ValueError:
+                detail = ""
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: {detail or r.status_code}_")
+            return
+        out = r.json()
+        status = (f":white_check_mark: Accepted, committed to local branch `{out.get('branch')}`" if accept
+                  else ":no_entry: Rejected")
+        if ts:
+            try:
+                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text, blocks=proposal_blocks(text, None, status))
+            except Exception:  # noqa: BLE001 - cosmetic only
+                log.warning("could not update eval-case card", exc_info=True)
 
     async def _merge_result(self, p: dict[str, Any]) -> None:
         """A merge finished: update the card it started from (button back only if a retry can help)."""

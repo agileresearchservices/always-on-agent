@@ -360,11 +360,35 @@ class AgentActivities:
             client_key=f"prmerge:{a['run_id']}",
         )
 
+    @activity.defn(name="eval_draft")
+    async def eval_draft(self, a: dict[str, Any]) -> dict[str, Any]:
+        """Draft and validate one eval proposal for a flag (flywheel step 2). Costs a model call plus N eval runs."""
+        from .eval_proposal import run_proposal
+
+        flag = next((f for f in self.core.store.flags_list(None)
+                     if f["conv_id"] == a["conv_id"] and f["reason"] == a["reason"]), None)
+        if flag is None:
+            return {"id": None, "status": "no_such_flag"}
+        out = await with_heartbeat(run_proposal(self.core.store, self.s, self.core.llm, flag, a["session"]), activity.heartbeat)
+        if out["status"] in ("proposed", "not_reproduced", "declined"):
+            self.core.store.flag_set_status(a["conv_id"], a["reason"], out["status"])
+        return out
+
+    @activity.defn(name="eval_post_card")
+    async def eval_post_card(self, a: dict[str, Any]) -> None:
+        from .eval_proposal import card_text
+
+        p = self.core.store.proposal_get(a["id"])
+        if p is None or p["status"] != "proposed":
+            return
+        self.core.store.outbox_push(a["session"], "eval_proposal", {"text": card_text(p), "proposal_id": p["id"]},
+                                    client_key=f"evalprop:{p['id']}")
+
     def all(self) -> list:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
             self.maybe_compact, self.digest_status, self.flush_digest, self.approvals_next, self.approvals_tick, self.sandbox_sleep, self.warm_cache, self.report_failure,
             self.deliver_routine_event, self.poll_github, self.fetch_pr_for_review, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
-            self.merge_issue_states, self.merge_report, self.resolve_conflicts,
+            self.merge_issue_states, self.merge_report, self.resolve_conflicts, self.eval_draft, self.eval_post_card,
         ]

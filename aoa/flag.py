@@ -47,33 +47,37 @@ def scan(store: Store, settings: Settings) -> list[dict[str, Any]]:
 
     for conv in store.conv_ids():
         steps = store.steps_for(conv)
-        tool_names: dict[str, str] = {}  # tool_use id -> name, from the model's own calls
+        tool_names: dict[str, tuple[str, str]] = {}  # tool_use id -> (name, turn), from the model's own calls
+        misses: list[str] = []
         turns: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         for key, res in steps:
             if not key.startswith("llm:"):
                 continue
-            for tu in res.get("tool_uses", []):
-                tool_names[tu["id"]] = tu["name"]
             turn = _turn_of(key)
+            for tu in res.get("tool_uses", []):
+                tool_names[tu["id"]] = (tu["name"], turn or "?")
             if turn is not None:
                 turns[turn].append((key, res))
             if res.get("stop_reason") == "max_tokens":
                 added.append((conv, f"max_tokens:{key}", key, "the model's output was cut off at max_tokens"))
             if res.get("cache_miss"):
-                added.append((conv, f"cache_miss:{key}", key, "prompt cache missed within the TTL (a stability bug)"))
+                misses.append(key)
+        if misses:  # one flag per conversation: a restart that changes the tool index makes one expected miss
+            added.append((conv, "cache_miss", misses[0],
+                          f"prompt cache missed within the TTL {len(misses)} time(s), first at {misses[0]} (a stability bug if not a restart)"))
         for turn, llm_steps in turns.items():
             last_key, last = llm_steps[-1]
             if len(llm_steps) >= settings.max_steps_per_turn and last.get("tool_uses"):
                 added.append((conv, f"max_steps:{turn}", last_key,
                               f"the turn used all {settings.max_steps_per_turn} steps and was still calling tools"))
-        errors: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        errors: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)  # (tool, turn) -> failures
         for key, res in steps:
             if key.startswith("tool:") and res.get("is_error"):
-                errors[tool_names.get(res.get("tool_use_id", ""), "unknown")].append((key, str(res.get("content", ""))))
-        for name, errs in errors.items():
+                errors[tool_names.get(res.get("tool_use_id", ""), ("unknown", "?"))].append((key, str(res.get("content", ""))))
+        for (name, turn), errs in errors.items():  # per turn, so scattered failures over months do not add up
             if len(errs) >= TOOL_ERROR_REPEATS:
-                added.append((conv, f"tool_errors:{name}", errs[0][0],
-                              _clip(f"{name} failed {len(errs)} times; first: {errs[0][1]}")))
+                added.append((conv, f"tool_errors:{name}:{turn}", errs[0][0],
+                              _clip(f"{name} failed {len(errs)} times in one turn; first: {errs[0][1]}")))
 
     return [{"conv_id": c, "reason": r, "step_key": k, "evidence": e}
             for c, r, k, e in added if store.flag_add(c, r, e, k)]
@@ -83,8 +87,7 @@ def report(store: Store, conv: str, kind: str, summary: str) -> str:
     """The model's own report (the `report_issue` tool). A hint, so it is labelled as such and capped."""
     if kind not in REPORT_KINDS:
         raise ValueError(f"kind must be one of: {', '.join(REPORT_KINDS)}")
-    open_reports = [f for f in store.flags_list("open") if f["conv_id"] == conv and f["reason"].startswith("reported:")]
-    if len(open_reports) >= REPORTED_OPEN_CAP:
+    if store.flags_count(conv, "reported:", "open") >= REPORTED_OPEN_CAP:
         return "not recorded: too many open reports from this conversation"
     digest = hashlib.sha256(summary.encode()).hexdigest()[:8]
     fresh = store.flag_add(conv, f"reported:{kind}:{digest}", _clip(f"[model-reported, unverified] {summary}"))
@@ -101,7 +104,7 @@ def _block_text(block: dict[str, Any]) -> str:
         c = block.get("content")
         c = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
         return f"[tool_result{' ERROR' if block.get('is_error') else ''}] {c}"
-    return f"[{t}]"  # thinking and anything else: kept out of the export
+    return f"[{t}]"  # thinking and anything else: left out of the text form (the JSON form keeps every block as stored)
 
 
 def render_trace(store: Store, conv: str, *, as_json: bool = False, max_chars: int = 2000) -> str:
