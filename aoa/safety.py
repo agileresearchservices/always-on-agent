@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import re
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from .llm import LLM
+
+log = logging.getLogger(__name__)
+
+# (model, usage dict) of the reviewer call, so the caller can record its spend
+UsageCallback = Callable[[str, dict[str, int]], None]
 
 DENY_PATTERNS: list[tuple[str, str]] = [
     (r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\s+(/|~|\$HOME|\*)(\s|$)", "recursive force delete of a root/home/glob path"),
@@ -61,7 +68,7 @@ REVIEW_SCHEMA = {
 }
 
 
-async def autoreview(llm: LLM, model: str, command: str, why: str) -> Verdict:
+async def autoreview(llm: LLM, model: str, command: str, why: str, on_usage: UsageCallback | None = None) -> Verdict:
     """Second-model review. Any failure to get a clear 'allow' is a deny (fail closed)."""
     try:
         resp = await llm.create(
@@ -72,6 +79,11 @@ async def autoreview(llm: LLM, model: str, command: str, why: str) -> Verdict:
             max_tokens=200,
             output_format=REVIEW_SCHEMA,
         )
+        if on_usage is not None:
+            try:  # bookkeeping only: a failing callback must never turn an allow into a deny
+                on_usage(resp.model or model, resp.usage)
+            except Exception:  # noqa: BLE001
+                log.warning("review usage callback failed", exc_info=True)
         raw = "".join(b["text"] for b in resp.content if b["type"] == "text")
         try:
             data = json.loads(raw)  # structured output: the whole reply is the JSON object
@@ -85,8 +97,8 @@ async def autoreview(llm: LLM, model: str, command: str, why: str) -> Verdict:
         return Verdict(False, f"review unavailable ({type(e).__name__}); command not run. Try again or ask the person.", "error")
 
 
-async def review_command(llm: LLM, model: str, command: str, why: str) -> Verdict:
-    return static_check(command) or await autoreview(llm, model, command, why)
+async def review_command(llm: LLM, model: str, command: str, why: str, on_usage: UsageCallback | None = None) -> Verdict:
+    return static_check(command) or await autoreview(llm, model, command, why, on_usage)
 
 
 # ---- network guard for web_fetch --------------------------------------------------------------

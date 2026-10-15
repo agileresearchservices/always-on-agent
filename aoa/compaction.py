@@ -84,6 +84,8 @@ async def compact(
         max_tokens=settings.max_tokens,
         tool_choice={"type": "none"} if tools else None,
     )
+    # Own conv id: last_usage(conv_id) drives the compaction decision and must keep describing the main agent's call.
+    store.usage_add(f"{conv_id}#compact", model, resp.usage)
     summary = "".join(b["text"] for b in resp.content if b["type"] == "text").strip()
     if not summary:
         return False
