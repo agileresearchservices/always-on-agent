@@ -124,8 +124,22 @@ class AnthropicLLM:
             kwargs["output_config"] = out_cfg
         return kwargs
 
-    async def create(self, *, output_format: dict[str, Any] | None = None, **params: Any) -> LLMResponse:
-        kwargs = self.build_kwargs(output_format=output_format, **params)
+    async def create(
+        self,
+        *,
+        model: str,
+        system: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_tokens: int,
+        tool_choice: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        effort: str | None = None,
+        output_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        kwargs = self.build_kwargs(
+            model=model, system=system, messages=messages, tools=tools, max_tokens=max_tokens,
+            tool_choice=tool_choice, thinking=thinking, effort=effort, output_format=output_format)
         out_cfg = dict(kwargs.get("output_config") or {})
         try:
             resp = await self.client.messages.create(**kwargs)
@@ -141,7 +155,7 @@ class AnthropicLLM:
             else:
                 kwargs.pop("output_config", None)
             resp = await self.client.messages.create(**kwargs)
-        return parse_message(resp, params["model"])
+        return parse_message(resp, model)
 
 
 def parse_message(resp: Any, model: str) -> LLMResponse:

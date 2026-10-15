@@ -231,3 +231,35 @@ async def test_polling_blips_are_retried_and_a_cancelled_caller_cannot_kill_the_
     assert (await ok).content[0]["text"].startswith("ok #") and batches.blips == 0
     later = await mk()  # the driver survived and serves the next round
     assert later.content[0]["text"].startswith("ok #")
+
+
+async def test_big_rounds_are_chunked_and_a_lost_inflight_batch_fails_its_callers():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from aoa.batch_llm import BatchCoordinator, BatchedLLM, transient
+
+    batches = _FakeBatches()
+    coord = BatchCoordinator(NS(messages=NS(batches=batches)), settle=0.05, poll=0.01, chunk=3, progress=lambda m: None)
+    msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    mk = lambda c: BatchedLLM(c, cache_ttl_seconds=300).create(model="m", system=[], messages=msg, tools=[], max_tokens=5)
+    await asyncio.gather(*(mk(coord) for _ in range(7)))
+    assert sorted(len(b) for b in batches.created) == [1, 3, 3] and coord.requests == 7
+
+    class Dies(_FakeBatches):
+        async def retrieve(self, batch_id):
+            raise ValueError("permanent")  # not transient: no retries, and callers must not hang
+
+    bad = BatchCoordinator(NS(messages=NS(batches=Dies())), settle=0.05, poll=0.01, progress=lambda m: None)
+    res = await asyncio.wait_for(asyncio.gather(mk(bad), mk(bad), return_exceptions=True), 5)
+    assert all(isinstance(r, ValueError) for r in res)
+    assert transient(ConnectionError()) and not transient(ValueError())
+    assert transient(type("E", (Exception,), {"status_code": 529})()) and not transient(type("E", (Exception,), {"status_code": 400})())
+
+
+def test_the_batch_marker_shows_in_the_table():
+    from evals.runner import format_table
+
+    rep = {"model": "m", "runs_per_case": 1, "seconds": 5.0, "tokens": dict(input_tokens=1, output_tokens=1, cache_read=0, cache_write=0),
+           "cases": {}, "batch": {"batches": 4, "requests": 40}}
+    assert "batch mode (40 requests in 4 batches" in format_table(rep)

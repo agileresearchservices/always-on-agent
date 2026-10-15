@@ -41,7 +41,7 @@ def main() -> int:
         from aoa.batch_llm import BatchCoordinator, BatchedLLM
 
         coord = BatchCoordinator(poll=a.batch_poll)
-        factory, concurrency = (lambda: BatchedLLM(coord)), max(1, len(cases) * a.runs)  # all runs share each round
+        factory, concurrency = (lambda: BatchedLLM(coord)), max(1, min(len(cases) * a.runs, 1000))  # all runs share each round (a batch holds <= 1000 requests here)
     report = asyncio.run(run_suite(cases, a.runs, factory, concurrency))
     if coord is not None:
         report["batch"] = {"batches": coord.batches, "requests": coord.requests}

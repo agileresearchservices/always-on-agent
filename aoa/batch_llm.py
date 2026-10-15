@@ -23,17 +23,18 @@ class BatchError(Exception):
 
 
 class BatchCoordinator:
-    def __init__(self, client: Any | None = None, *, settle: float = 2.0, poll: float = 15.0,
+    def __init__(self, client: Any | None = None, *, settle: float = 2.0, poll: float = 15.0, chunk: int = 1000,
                  progress: Callable[[str], None] | None = None):
         if client is None:
             import anthropic
 
             client = anthropic.AsyncAnthropic()
-        self.client, self.settle, self.poll = client, settle, poll
+        self.client, self.settle, self.poll, self.chunk = client, settle, poll, chunk
         self.progress = progress or (lambda m: print(m, file=sys.stderr, flush=True))
         self.batches = 0
         self.requests = 0
         self._pending: list[tuple[str, dict[str, Any], asyncio.Future]] = []
+        self._inflight: list[tuple[str, dict[str, Any], asyncio.Future]] = []
         self._ids = itertools.count(1)
         self._driver: asyncio.Task | None = None
 
@@ -50,20 +51,22 @@ class BatchCoordinator:
             await self._drive_loop()
         except BaseException as e:  # noqa: BLE001 - never die with callers still waiting on a future
             err = e if isinstance(e, Exception) else BatchError("batch driver was cancelled")
-            for _, _, fut in self._pending:
+            for _, _, fut in [*self._pending, *self._inflight]:  # waiting, and already submitted
                 if not fut.done():
                     fut.set_exception(err)
-            self._pending = []
+            self._pending, self._inflight = [], []
             if not isinstance(e, Exception):
                 raise
 
     async def _retry(self, what: str, call: Callable[[], Any], tries: int = 5) -> Any:
-        """A blip talking to the API must not throw away a batch that is already running (and billed)."""
+        """A blip reading a batch must not throw away one that is already running (and billed). Only idempotent
+        reads are retried; creating a batch is not (a lost response would submit and bill it twice; the SDK
+        already retries the request itself)."""
         for attempt in range(tries):
             try:
                 return await call()
             except Exception as e:  # noqa: BLE001
-                if attempt == tries - 1:
+                if attempt == tries - 1 or not transient(e):
                     raise
                 wait = min(60.0, self.poll * (2 ** attempt))
                 log.warning("batch %s failed (%s); retrying in %.0fs", what, type(e).__name__, wait)
@@ -76,8 +79,9 @@ class BatchCoordinator:
                 seen = len(self._pending)
                 await asyncio.sleep(self.settle)
             batch, self._pending = self._pending, []
+            self._inflight = batch
             try:
-                results = await self._run_batch([(cid, p) for cid, p, _ in batch])
+                results = await self._run_chunks([(cid, p) for cid, p, _ in batch])
             except Exception as e:  # noqa: BLE001 - the whole batch failed: fail its callers, not the process
                 for _, _, fut in batch:
                     if not fut.done():
@@ -94,9 +98,17 @@ class BatchCoordinator:
                 else:
                     fut.set_result(r)
 
+    async def _run_chunks(self, reqs: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+        """A batch holds at most 100k requests / 256 MB: split a big round, run the chunks side by side."""
+        chunks = [reqs[i:i + self.chunk] for i in range(0, len(reqs), self.chunk)]
+        out: dict[str, Any] = {}
+        for part in await asyncio.gather(*(self._run_batch(c) for c in chunks)):
+            out |= part
+        return out
+
     async def _run_batch(self, reqs: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
-        b = await self._retry("create", lambda: self.client.messages.batches.create(
-            requests=[{"custom_id": cid, "params": params} for cid, params in reqs]))
+        b = await self.client.messages.batches.create(
+            requests=[{"custom_id": cid, "params": params} for cid, params in reqs])
         self.batches += 1
         self.requests += len(reqs)
         self.progress(f"batch {b.id}: {len(reqs)} requests submitted")
@@ -123,6 +135,15 @@ class BatchCoordinator:
         return out
 
 
+def transient(e: Exception) -> bool:
+    """Worth retrying an idempotent read: connection trouble, timeouts, 408/409/429 and 5xx."""
+    status = getattr(e, "status_code", None)
+    if status is not None:
+        return status in (408, 409, 429) or status >= 500
+    return isinstance(e, (ConnectionError, TimeoutError, OSError)) or type(e).__name__ in (
+        "APIConnectionError", "APITimeoutError")
+
+
 class BatchedLLM(AnthropicLLM):
     """Same request building as AnthropicLLM; the call itself goes through the shared coordinator. Unlike the
     synchronous client there is no retry-without-schema: a schema the API rejects fails that run, which is what
@@ -132,6 +153,20 @@ class BatchedLLM(AnthropicLLM):
         super().__init__(client=coordinator.client, cache_ttl_seconds=cache_ttl_seconds)
         self.coordinator = coordinator
 
-    async def create(self, *, output_format: dict[str, Any] | None = None, **params: Any) -> LLMResponse:
-        kwargs = self.build_kwargs(output_format=output_format, **params)
-        return await self.coordinator.submit(kwargs, params["model"])
+    async def create(
+        self,
+        *,
+        model: str,
+        system: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_tokens: int,
+        tool_choice: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        effort: str | None = None,
+        output_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        kwargs = self.build_kwargs(
+            model=model, system=system, messages=messages, tools=tools, max_tokens=max_tokens,
+            tool_choice=tool_choice, thinking=thinking, effort=effort, output_format=output_format)
+        return await self.coordinator.submit(kwargs, model)
