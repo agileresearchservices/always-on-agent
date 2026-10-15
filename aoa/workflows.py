@@ -466,3 +466,28 @@ class EvalProposalWorkflow:
                 start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
             )
         return out
+
+
+@workflow.defn
+class FixPrWorkflow:
+    """Started by the server when the person clicks [Draft fix] on an accepted eval case; never by the model. Drafts
+    and checks a fix in a worktree, opens a PR only if every check passes, and reports either way. It never merges."""
+
+    @workflow.run
+    async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
+        pid, session = inp["id"], inp["session"]
+        res = await workflow.execute_activity(
+            "fix_run", {"id": pid}, start_to_close_timeout=timedelta(minutes=90), heartbeat_timeout=timedelta(minutes=30),
+            retry_policy=RetryPolicy(maximum_attempts=1),  # a retry would pay for the session twice
+        )
+        pr = None
+        if res.get("ok"):
+            pr = await workflow.execute_activity(
+                "fix_open_pr", {"id": pid, "result": res}, start_to_close_timeout=timedelta(minutes=10),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        await workflow.execute_activity(
+            "fix_report", {"session": session, "id": pid, "result": res, "pr": pr, "run_id": workflow.info().run_id},
+            start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
+        )
+        return {"ok": bool(pr and pr.get("ok")), "stage": res.get("stage"), "pr": (pr or {}).get("url")}

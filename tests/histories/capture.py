@@ -34,7 +34,7 @@ from aoa.store import Store
 from aoa.testing import FakeLLM, text, tool
 from aoa.testing import MemoryScheduler
 from aoa.workflows import (
-    EvalProposalWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
+    EvalProposalWorkflow, FixPrWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
     SessionWorkflow,
 )
 
@@ -42,7 +42,8 @@ HERE = Path(__file__).parent
 PR = {"repo": "agileresearchservices/demo", "number": 7, "sha": "a" * 40, "title": "Add thing", "author": "agileresearchservices"}
 VERDICT = json.dumps({"verdict": "approve", "summary": "Looks fine.", "findings": []})
 GH_STUBBED = {"poll_github", "fetch_pr_for_review", "publish_pr_review", "merge_inspect", "merge_pr", "merge_update_branch",
-              "merge_delete_branch", "merge_issue_states", "resolve_conflicts", "merge_report", "eval_draft", "eval_post_card"}
+              "merge_delete_branch", "merge_issue_states", "resolve_conflicts", "merge_report", "eval_draft", "eval_post_card",
+              "fix_run", "fix_open_pr", "fix_report"}
 
 
 def act_name(fn: Any) -> str:
@@ -90,7 +91,7 @@ async def worker_with(client: Client, s: Settings, llm: FakeLLM, stubs: list) ->
     acts = AgentActivities(core, client, s)
     real = [a for a in acts.all() if act_name(a) not in GH_STUBBED]
     flows = [SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow,
-             EvalProposalWorkflow]
+             EvalProposalWorkflow, FixPrWorkflow]
     return Worker(client, task_queue=s.task_queue, workflows=flows, activities=real + stubs), store
 
 
@@ -159,6 +160,18 @@ async def eval_proposal(client: Client) -> None:
     await save(client, "eval_proposal", wid)
 
 
+async def fix_pr(client: Client) -> None:
+    """FixPrWorkflow: fix_run ok, open the PR, report."""
+    s = mk_env()
+    stubs = [stub("fix_run", {"ok": True, "slug": "x", "branch": "fix/x"}),
+             stub("fix_open_pr", {"ok": True, "url": "https://github.com/agileresearchservices/demo/pull/9"}), stub("fix_report", None)]
+    w, _ = await worker_with(client, s, FakeLLM([]), stubs)
+    async with w:
+        wid = f"fix-prop-{uuid.uuid4().hex[:6]}"
+        await client.execute_workflow("FixPrWorkflow", {"session": "main", "id": "prop-0123abcd"}, id=wid, task_queue=s.task_queue)
+    await save(client, "fix_pr", wid)
+
+
 def inspect(action: str, **kw: Any) -> dict[str, Any]:
     base = {"action": action, "reason": action, "title": "Add thing", "head_ref": "feat", "base_ref": "main", "same_repo": True,
             "default_base": True, "protected_refs": ["main"], "merge_sha": None, "issues": [{"number": 3, "state": "OPEN"}]}
@@ -183,6 +196,7 @@ SCENARIOS = {
     "github_poll": poll_and_review,
     "pr_review_inline_diff": review_inline_diff,
     "eval_proposal": eval_proposal,
+    "fix_pr": fix_pr,
     "merge_wait_then_merge": lambda c: merge(c, "merge_wait_then_merge", [
         stub("merge_inspect", [inspect("wait"), inspect("merge")]), stub("merge_pr", {"merged": True, "merge_sha": "b" * 40}),
         stub("merge_delete_branch", {"ref": "feat", "result": "deleted"}),

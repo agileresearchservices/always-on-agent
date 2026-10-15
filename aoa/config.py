@@ -112,6 +112,8 @@ class Settings:
     # eval flywheel
     eval_validate_runs: int
     eval_proposals_per_day: int
+    fix_budget_usd: float
+    claude_bin: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -154,6 +156,8 @@ class Settings:
             approval_expire_seconds=max(nudge + 1, _int("AOA_APPROVAL_EXPIRE", 24 * 3600)),
             eval_validate_runs=max(1, min(_int("AOA_EVAL_VALIDATE_RUNS", 2), 5)),
             eval_proposals_per_day=max(0, _int("AOA_EVAL_PROPOSALS_PER_DAY", 3)),
+            fix_budget_usd=max(0.0, _float("AOA_FIX_BUDGET_USD", 3.0)),
+            claude_bin=os.environ.get("AOA_CLAUDE_BIN", "").strip() or "claude",
         )
 
     # Derived paths -------------------------------------------------------

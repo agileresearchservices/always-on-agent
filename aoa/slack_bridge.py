@@ -36,6 +36,7 @@ PREFIX = {
     "pr_review": ":mag: ",
     "pr_merge": "",
     "eval_proposal": ":test_tube: ",
+    "eval_fix": ":hammer_and_wrench: ",
 }
 TYPED_DECISION = re.compile(r"^\s*(approve|deny)\s+(apr-[0-9a-f]+)\s*$", re.IGNORECASE)
 
@@ -107,10 +108,34 @@ def parse_proposal_action(payload: dict[str, Any], cfg: BridgeConfig) -> tuple[s
     return None
 
 
-def proposal_blocks(text: str, pid: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+def parse_fix_action(payload: dict[str, Any], cfg: BridgeConfig) -> str | None:
+    """[Draft fix] click on an accepted eval-case card -> proposal id, only from the allowed user in our channel."""
+    if payload.get("type") != "block_actions" or (payload.get("user") or {}).get("id") != cfg.user:
+        return None
+    if (payload.get("channel") or {}).get("id") != cfg.channel:
+        return None
+    for act in payload.get("actions", []):
+        if act.get("action_id") == "aoa_case_fix" and act.get("value"):
+            return act["value"]
+    return None
+
+
+def fix_button(pid: str) -> dict[str, Any]:
+    return {"type": "actions", "block_id": f"aoa_fix_{pid}", "elements": [
+        {"type": "button", "action_id": "aoa_case_fix", "value": pid, "text": {"type": "plain_text", "text": "Draft fix"},
+         "confirm": {"title": {"type": "plain_text", "text": "Draft a fix PR?"},
+                     "text": {"type": "mrkdwn", "text": "Runs a coding session (up to its dollar cap) and real-model eval runs, "
+                                                        "then opens a PR only if every check passes. It never merges."},
+                     "confirm": {"type": "plain_text", "text": "Draft fix"}, "deny": {"type": "plain_text", "text": "Cancel"}}},
+    ]}
+
+
+def proposal_blocks(text: str, pid: str | None = None, status: str | None = None, fix_for: str | None = None) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
     if status:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": status}]})
+    if fix_for:
+        blocks.append(fix_button(fix_for))
     if pid:
         blocks.append({"type": "actions", "block_id": f"aoa_{pid}", "elements": [
             {"type": "button", "action_id": "aoa_case_accept", "style": "primary", "value": pid,
@@ -204,6 +229,11 @@ class Bridge:
             msg = payload.get("message") or {}
             await self._merge(offer, msg.get("ts"), msg.get("text", ""))
             return
+        fix = parse_fix_action(payload, self.cfg)
+        if fix is not None:
+            msg = payload.get("message") or {}
+            await self._fix(fix, msg.get("ts"), msg.get("text", ""))
+            return
         prop = parse_proposal_action(payload, self.cfg)
         if prop is not None:
             msg = payload.get("message") or {}
@@ -288,7 +318,31 @@ class Bridge:
                   else ":no_entry: Rejected")
         if ts:
             try:
-                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text, blocks=proposal_blocks(text, None, status))
+                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text,
+                                           blocks=proposal_blocks(text, None, status, fix_for=pid if accept else None))
+            except Exception:  # noqa: BLE001 - cosmetic only
+                log.warning("could not update eval-case card", exc_info=True)
+
+    async def _fix(self, pid: str, ts: str | None, text: str) -> None:
+        if pid in self._deciding:
+            return
+        self._deciding.add(pid)
+        try:
+            r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}/fix")
+        finally:
+            self._deciding.discard(pid)
+        if r.status_code >= 400:
+            self._check(r, "start fix")
+            try:
+                detail = str(r.json().get("detail") or "")
+            except ValueError:
+                detail = ""
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: {detail or r.status_code}_")
+            return
+        if ts:
+            try:  # take the button away while it runs; the result arrives as its own message
+                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text, blocks=proposal_blocks(
+                    text, None, ":hourglass_flowing_sand: Drafting a fix; the result will be posted here"))
             except Exception:  # noqa: BLE001 - cosmetic only
                 log.warning("could not update eval-case card", exc_info=True)
 

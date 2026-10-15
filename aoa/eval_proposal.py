@@ -137,19 +137,19 @@ def classify(passed: int, runs: int) -> str:
     return "reproduced" if passed == 0 else "flaky"
 
 
-async def validate_on_agent(spec: dict[str, Any], runs: int, *, key: str | None = None, timeout: int = VALIDATE_TIMEOUT) -> dict[str, Any] | None:
-    """Run the spec `runs` times with the real model in a subprocess. None if there is no API key to do it with.
-    The child gets ONLY the API key (no GitHub token, no aoa config), like a manual eval run."""
+async def run_evals(args: list[str], *, cwd: Path = REPO_DIR, key: str | None = None, timeout: int = VALIDATE_TIMEOUT) -> dict[str, Any] | None:
+    """`python -m evals ARGS --json` in a subprocess; the parsed report, or None when there is no API key.
+    The child gets ONLY the API key (no GitHub token, no aoa config), like a manual eval run, and runs the code in
+    `cwd` (a worktree, when checking a fix)."""
     key = key or os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
-    with tempfile.TemporaryDirectory(prefix="aoa-spec-") as d:
-        f = Path(d) / "case.json"
-        f.write_text(json.dumps(spec))
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ANTHROPIC_API_KEY": key, "HOME": d, "AOA_DATA_DIR": d}
+    with tempfile.TemporaryDirectory(prefix="aoa-evalrun-") as d:
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ANTHROPIC_API_KEY": key, "HOME": d, "AOA_DATA_DIR": d,
+               "PYTHONPATH": str(cwd)}
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "evals", "--spec", str(f), "--runs", str(runs), "--json",
-            cwd=str(REPO_DIR), env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            sys.executable, "-m", "evals", *args, "--json",
+            cwd=str(cwd), env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError:
@@ -157,7 +157,19 @@ async def validate_on_agent(spec: dict[str, Any], runs: int, *, key: str | None 
             raise
     if proc.returncode != 0:
         raise RuntimeError(f"eval run failed: {err.decode()[-300:]}")
-    rep = json.loads(out.decode().strip().splitlines()[-1])
+    return json.loads(out.decode().strip().splitlines()[-1])
+
+
+async def validate_on_agent(spec: dict[str, Any], runs: int, *, key: str | None = None, timeout: int = VALIDATE_TIMEOUT,
+                            cwd: Path = REPO_DIR) -> dict[str, Any] | None:
+    """Run the spec `runs` times with the real model. None if there is no API key to do it with."""
+    if not (key or os.environ.get("ANTHROPIC_API_KEY")):
+        return None
+    with tempfile.TemporaryDirectory(prefix="aoa-spec-") as d:
+        f = Path(d) / "case.json"
+        f.write_text(json.dumps(spec))
+        rep = await run_evals(["--spec", str(f), "--runs", str(runs)], cwd=cwd, key=key, timeout=timeout)
+    assert rep is not None
     c = rep["cases"][spec["name"]]
     return {"passed": c["passed"], "runs": c["runs"], "failures": c["failures"][:3], "cost_usd": rep.get("est_cost_usd"),
             "verdict": classify(c["passed"], c["runs"])}

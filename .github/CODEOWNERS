@@ -1,0 +1,12 @@
+# Files the evals grade: a change here can weaken a safety rule, so the owner reviews it by name.
+# (The flywheel's fix PRs also say so in their title and body: aoa/fix_pr.py GUARDRAIL_PATHS.)
+/aoa/safety.py        @agileresearchservices
+/aoa/notify.py        @agileresearchservices
+/aoa/events.py        @agileresearchservices
+/aoa/tools.py         @agileresearchservices
+/aoa/server.py        @agileresearchservices
+/aoa/pr_merge.py      @agileresearchservices
+/aoa/pr_resolve.py    @agileresearchservices
+/aoa/gh_reviewer.py   @agileresearchservices
+/aoa/slack_bridge.py  @agileresearchservices
+/.github/             @agileresearchservices

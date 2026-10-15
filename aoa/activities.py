@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import secrets
 import time
+from pathlib import Path
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -384,6 +385,45 @@ class AgentActivities:
         self.core.store.outbox_push(a["session"], "eval_proposal", {"text": card_text(p), "proposal_id": p["id"]},
                                     client_key=f"evalprop:{p['id']}")
 
+    @activity.defn(name="fix_run")
+    async def fix_run(self, a: dict[str, Any]) -> dict[str, Any]:
+        """Draft and check a fix for an accepted eval case in a worktree (flywheel step 3). Returns the result; a
+        failed attempt is a normal result (ok False), not an exception."""
+        from .fix_pr import ClaudeCodeAuthor, FixError, run_fix
+
+        p = self.core.store.proposal_get(a["id"])
+        if p is None or p["status"] != "accepted" or not p["spec"]:
+            return {"ok": False, "stage": "setup", "reason": "that proposal is not an accepted eval case"}
+        if self.s.fix_budget_usd <= 0:
+            return {"ok": False, "stage": "setup", "reason": "fix PRs are off (AOA_FIX_BUDGET_USD=0)"}
+        try:
+            return await run_fix(p["spec"], p["id"], self.s, ClaudeCodeAuthor(self.s.claude_bin, self.s.fix_budget_usd),
+                                 heartbeat=activity.heartbeat)
+        except FixError as e:
+            return {"ok": False, "stage": "setup", "reason": str(e)}
+
+    @activity.defn(name="fix_open_pr")
+    async def fix_open_pr(self, a: dict[str, Any]) -> dict[str, Any]:
+        from .fix_pr import FixError, cleanup, open_pr
+
+        p = self.core.store.proposal_get(a["id"])
+        res = a["result"]
+        try:
+            url = await open_pr(res, p["spec"], p["id"], p["spec"].get("origin", {}))
+        except (FixError, gh.GithubError) as e:
+            return {"ok": False, "reason": str(e)}
+        finally:
+            cleanup(Path(__file__).resolve().parent.parent, res["tmp"])  # the pushed branch stays; the worktree goes
+        self.core.store.proposal_update(p["id"], "fix_opened", info={**p["info"], "pr": url})
+        return {"ok": True, "url": url}
+
+    @activity.defn(name="fix_report")
+    async def fix_report(self, a: dict[str, Any]) -> None:
+        from .fix_pr import report_text
+
+        self.core.store.outbox_push(a["session"], "eval_fix", {"text": report_text(a["id"], a["result"], a.get("pr"))},
+                                    client_key=f"evalfix:{a['id']}:{a['run_id']}")
+
     def all(self) -> list:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
@@ -391,4 +431,5 @@ class AgentActivities:
             self.deliver_routine_event, self.poll_github, self.fetch_pr_for_review, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
             self.merge_issue_states, self.merge_report, self.resolve_conflicts, self.eval_draft, self.eval_post_card,
+            self.fix_run, self.fix_open_pr, self.fix_report,
         ]
