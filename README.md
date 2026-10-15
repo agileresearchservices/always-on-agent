@@ -32,8 +32,22 @@ curl -XPOST localhost:8000/webhooks/email -H 'content-type: application/json' \
   -d '{"text":"Invoice from Acme overdue","dedupe_key":"msg-123"}'
 ```
 
-Tests: `pytest` runs 47 tests with a scripted fake model and no server.
+Tests: `pytest` runs the whole fast suite (400+ tests) with a scripted fake model and no server.
 `pytest -m temporal` runs the end-to-end tests once `temporal server start-dev` is up (they skip otherwise).
+
+## Documentation
+
+| Read this | For |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | The system picture, one message end to end, a module map of every file |
+| [docs/reference/](docs/reference/) | One page per subsystem: [store](docs/reference/store.md), [tools](docs/reference/tools.md), [workflows](docs/reference/workflows.md), [trust and safety](docs/reference/trust-and-safety.md), [prompt and cache](docs/reference/prompt-and-cache.md), [GitHub pipeline](docs/reference/github-pipeline.md), [flywheel and evals](docs/reference/flywheel.md), [configuration](docs/reference/configuration.md) |
+| [docs/build-guide.md](docs/build-guide.md) | Rebuilding the project in stages, each with a check |
+| [docs/operations.md](docs/operations.md) | Running it as services, restarting, cost, a runbook |
+| [docs/decisions.md](docs/decisions.md) | Why it is built this way, and what was deliberately left out |
+| [docs/slack-setup.md](docs/slack-setup.md) | Creating the Slack app |
+
+A test (`tests/test_docs_in_sync.py`) fails if the configuration, tool or store pages miss something the code defines, or a
+doc link breaks.
 
 ## Configuration and secrets
 
