@@ -46,6 +46,30 @@ class BatchCoordinator:
         return parse_message(resp, model)
 
     async def _drive(self) -> None:
+        try:
+            await self._drive_loop()
+        except BaseException as e:  # noqa: BLE001 - never die with callers still waiting on a future
+            err = e if isinstance(e, Exception) else BatchError("batch driver was cancelled")
+            for _, _, fut in self._pending:
+                if not fut.done():
+                    fut.set_exception(err)
+            self._pending = []
+            if not isinstance(e, Exception):
+                raise
+
+    async def _retry(self, what: str, call: Callable[[], Any], tries: int = 5) -> Any:
+        """A blip talking to the API must not throw away a batch that is already running (and billed)."""
+        for attempt in range(tries):
+            try:
+                return await call()
+            except Exception as e:  # noqa: BLE001
+                if attempt == tries - 1:
+                    raise
+                wait = min(60.0, self.poll * (2 ** attempt))
+                log.warning("batch %s failed (%s); retrying in %.0fs", what, type(e).__name__, wait)
+                await asyncio.sleep(wait)
+
+    async def _drive_loop(self) -> None:
         while self._pending:
             seen = -1
             while seen != len(self._pending):  # wait for a quiet moment: every active run is now waiting
@@ -60,6 +84,8 @@ class BatchCoordinator:
                         fut.set_exception(e)
                 continue
             for cid, _, fut in batch:
+                if fut.done():  # the caller gave up (cancelled / timed out): nothing to deliver
+                    continue
                 r = results.get(cid)
                 if r is None:
                     fut.set_exception(BatchError(f"no result for request {cid}"))
@@ -69,30 +95,38 @@ class BatchCoordinator:
                     fut.set_result(r)
 
     async def _run_batch(self, reqs: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
-        b = await self.client.messages.batches.create(
-            requests=[{"custom_id": cid, "params": params} for cid, params in reqs])
+        b = await self._retry("create", lambda: self.client.messages.batches.create(
+            requests=[{"custom_id": cid, "params": params} for cid, params in reqs]))
         self.batches += 1
         self.requests += len(reqs)
         self.progress(f"batch {b.id}: {len(reqs)} requests submitted")
         while b.processing_status != "ended":
             await asyncio.sleep(self.poll)
-            b = await self.client.messages.batches.retrieve(b.id)
+            b = await self._retry("status check", lambda: self.client.messages.batches.retrieve(b.id))
             c = b.request_counts
             self.progress(f"batch {b.id}: {b.processing_status} (done {c.succeeded + c.errored + c.canceled + c.expired}/{len(reqs)})")
         out: dict[str, Any] = {}
-        async for entry in await self.client.messages.batches.results(b.id):
-            res = entry.result
+
+        async def fetch() -> dict[str, Any]:
+            got: dict[str, Any] = {}
+            async for entry in await self.client.messages.batches.results(b.id):
+                got[entry.custom_id] = entry.result
+            return got
+
+        for cid, res in (await self._retry("results", fetch)).items():
             if res.type == "succeeded":
-                out[entry.custom_id] = res.message
+                out[cid] = res.message
             else:
                 detail = getattr(getattr(res, "error", None), "error", None)
                 msg = getattr(detail, "message", None) or res.type
-                out[entry.custom_id] = BatchError(f"batch request {res.type}: {msg}")
+                out[cid] = BatchError(f"batch request {res.type}: {msg}")
         return out
 
 
 class BatchedLLM(AnthropicLLM):
-    """Same request building as AnthropicLLM; the call itself goes through the shared coordinator."""
+    """Same request building as AnthropicLLM; the call itself goes through the shared coordinator. Unlike the
+    synchronous client there is no retry-without-schema: a schema the API rejects fails that run, which is what
+    an eval should show."""
 
     def __init__(self, coordinator: BatchCoordinator, cache_ttl_seconds: int | None = None):
         super().__init__(client=coordinator.client, cache_ttl_seconds=cache_ttl_seconds)

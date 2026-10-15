@@ -202,3 +202,32 @@ async def test_a_failed_batch_request_fails_only_that_caller():
     res = await asyncio.gather(*calls, return_exceptions=True)
     assert [isinstance(r, BatchError) for r in res].count(True) == 1 and "boom" in str(next(r for r in res if isinstance(r, BatchError)))
     assert sum(not isinstance(r, Exception) for r in res) == 2
+
+
+async def test_polling_blips_are_retried_and_a_cancelled_caller_cannot_kill_the_driver():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from aoa.batch_llm import BatchCoordinator, BatchedLLM
+
+    class Flaky(_FakeBatches):
+        def __init__(self):
+            super().__init__()
+            self.blips = 2
+
+        async def retrieve(self, batch_id):
+            if self.blips:
+                self.blips -= 1
+                raise ConnectionError("network blip")
+            return await super().retrieve(batch_id)
+
+    batches = Flaky()
+    coord = BatchCoordinator(NS(messages=NS(batches=batches)), settle=0.05, poll=0.01, progress=lambda m: None)
+    msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    mk = lambda: BatchedLLM(coord, cache_ttl_seconds=300).create(model="m", system=[], messages=msg, tools=[], max_tokens=5)
+    doomed, ok = asyncio.ensure_future(mk()), asyncio.ensure_future(mk())
+    await asyncio.sleep(0.02)
+    doomed.cancel()  # e.g. a per-run timeout fired while its request was in the batch
+    assert (await ok).content[0]["text"].startswith("ok #") and batches.blips == 0
+    later = await mk()  # the driver survived and serves the next round
+    assert later.content[0]["text"].startswith("ok #")
