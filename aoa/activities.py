@@ -119,7 +119,9 @@ class AgentActivities:
         pr = a["pr"]
         try:
             return await read_github("pr", pr["repo"], pr["number"], REVIEW_READ_CHARS)
-        except Exception:  # noqa: BLE001 - the fallback path covers every failure
+        except Exception as e:  # noqa: BLE001 - the fallback path covers every failure
+            activity.logger.warning("fetch_pr_for_review failed for %s#%s, the reviewer will page through the PR itself: %s: %s",
+                                    pr.get("repo"), pr.get("number"), type(e).__name__, e)
             return ""
 
     @activity.defn(name="publish_pr_review")
