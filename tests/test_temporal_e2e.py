@@ -412,7 +412,7 @@ async def test_fix_workflow_waits_for_the_click_then_opens_the_pr(client, env, m
 async def _run_fix_clicks(h, store, pid, kinds):
     await _wait_for(lambda: len(kinds()) == 1)
     ready = kinds()[0]
-    assert ready["ready"] and "nothing pushed" in ready["text"] and ready["token"]
+    assert ready["ready"] and "nothing is pushed" in ready["text"] and ready["token"]
     assert store.proposal_get(pid)["status"] == "accepted"  # no PR yet
     await h.signal("open_pr", "stale000")  # a button from an earlier attempt does nothing
     await asyncio.sleep(1.0)
