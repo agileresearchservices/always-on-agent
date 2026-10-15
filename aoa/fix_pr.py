@@ -47,7 +47,8 @@ GUARDRAIL_PATHS = (
     "aoa/eval_proposal.py",
 )
 # the fix author may not change the suite or the test infrastructure that grades it, or delete a test
-FROZEN_PATHS = ("evals/", "tests/histories/", "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "aoa/testing.py")
+FROZEN_PATHS = ("evals/", "tests/histories/", "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "aoa/testing.py",
+                ".claude/", ".mcp.json", "CLAUDE.md", ".gitattributes", ".gitmodules", ".gitignore", ".git/")
 FROZEN_NAMES = ("conftest.py", "sitecustomize.py", "usercustomize.py")  # by file name, anywhere in the tree (and any *.pth)
 SECRET_PATTERNS = (r"sk-ant-[A-Za-z0-9_-]{10,}", r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
                    r"xox[abprs]-[A-Za-z0-9-]{10,}", r"AKIA[0-9A-Z]{16}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
@@ -58,8 +59,32 @@ TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")  # no Bash: the author cannot 
 
 def allowed_tools(worktree: Path) -> list[str]:
     """Each tool allowed only inside the worktree (`//` = an absolute path in Claude Code's rule syntax)."""
-    root = "/" + str(worktree.resolve()).lstrip("/")
+    root = "//" + str(worktree.resolve()).lstrip("/")
     return [f"{t}({root}/**)" for t in TOOLS]
+
+
+def deny_rules(worktree: Path, extra: tuple[Path, ...] = ()) -> list[str]:
+    """Deny rules from the real home, repo and data dirs (not a hard-coded /Users), plus the usual home roots, and the
+    worktree's own .git pointer: repointing it would make the next git call run config the author controls."""
+    root = "//" + str(worktree.resolve()).lstrip("/")
+    dirs = {Path.home(), REPO_DIR, *extra, Path("/Users"), Path("/home"), Path("/root")}
+    rules = [f"{t}(//{str(d.resolve()).lstrip('/')}/**)" for d in dirs for t in TOOLS]
+    rules += [f"{t}(~/**)" for t in TOOLS]
+    rules += [f"{t}({root}/.git)" for t in ("Edit", "Write")] + [f"{t}({root}/.git/**)" for t in ("Edit", "Write")]
+    return sorted(set(rules))
+
+
+def git_pointer(wt: Path) -> str:
+    """The content of the worktree's `.git` file (`gitdir: <repo>/.git/worktrees/<name>`)."""
+    try:
+        return (wt / ".git").read_text()
+    except OSError:
+        return ""
+
+
+def check_pointer(wt: Path, expected: str) -> None:
+    if not expected or git_pointer(wt) != expected:
+        raise FixError("the worktree's .git pointer changed; refusing to run git there")
 
 
 class FixError(Exception):
@@ -124,15 +149,14 @@ class ClaudeCodeAuthor:
     """Headless Claude Code in the worktree. No GitHub token and no API key reach it; it runs under the machine's own
     Claude login. Tools are allowlisted and spend is capped."""
 
-    def __init__(self, binary: str, budget_usd: float, timeout: int = 2400):
-        self.binary, self.budget, self.timeout = binary, budget_usd, timeout
+    def __init__(self, binary: str, budget_usd: float, timeout: int = 2400, deny_extra: tuple[Path, ...] = ()):
+        self.binary, self.budget, self.timeout, self.deny_extra = binary, budget_usd, timeout, deny_extra
 
     async def run(self, worktree: Path, prompt: str) -> dict[str, Any]:
         binary = shutil.which(self.binary, path=os.environ.get("PATH", "") + ":" + str(Path.home() / ".local/bin")) or self.binary
         # The worktree is in the system temp dir, so everything under /Users (the home, ssh keys, aoa's data dir and
         # .env, the main checkout) can be denied outright. Deny rules win over allow rules.
-        deny = {"permissions": {"deny": [f"{t}(//Users/**)" for t in ("Read", "Edit", "Write", "Grep", "Glob")]
-                                + [f"{t}(~/**)" for t in ("Read", "Edit", "Write", "Grep", "Glob")]}}
+        deny = {"permissions": {"deny": deny_rules(worktree, self.deny_extra)}}
         args = [binary, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
                 "--max-budget-usd", f"{self.budget:g}", "--no-session-persistence", "--settings", json.dumps(deny),
                 "--allowedTools", *allowed_tools(worktree), "--disallowedTools", "Bash", "WebFetch", "WebSearch"]
@@ -149,13 +173,18 @@ class ClaudeCodeAuthor:
         return {"summary": str(last.get("result", ""))[:1500], "cost_usd": last.get("total_cost_usd")}
 
 
+def _noise(path: str) -> bool:
+    return "__pycache__/" in path or path.endswith(".pyc") or path.startswith(".pytest_cache")
+
+
 async def _changes(wt: Path) -> list[tuple[str, str]]:
-    """(status, path) for everything changed or new in the worktree; status is the porcelain code ('D' = deleted)."""
-    code, out = await _run(["git", "status", "--porcelain", "--untracked-files=all"], wt, git_env(None), 60)
+    """(status, path) for everything changed, new or IGNORED in the worktree (an ignored conftest.py would still run);
+    status is the porcelain code ('D' = deleted, '!!' = ignored)."""
+    out = await agit(["status", "--porcelain", "--untracked-files=all", "--ignored"], wt, raw=True)  # leading space is data
     rows = []
     for line in out.splitlines():
         path = line[3:].split(" -> ")[-1].strip().strip('"')
-        if path:
+        if path and not _noise(path):
             rows.append((line[:2].strip() or "?", path))
     return sorted(set(rows), key=lambda r: r[1])
 
@@ -177,20 +206,43 @@ def secret_hits(wt_text: str, env: dict[str, str] | None = None) -> list[str]:
 
 async def _diff_text(wt: Path) -> str:
     """Everything the commit would contain, as one unified diff with new files shown as added lines (capped)."""
-    await _run(["git", "add", "-N", "."], wt, git_env(None), 60)  # intent-to-add: untracked files appear in `git diff`
-    _, diff = await _run(["git", "diff", "HEAD", "--no-color"], wt, git_env(None), 60)
+    await agit(["add", "-N", "."], wt)  # intent-to-add: untracked files appear in `git diff`
+    diff = await agit(["diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv"], wt)
     return diff[:3_000_000]
 
 
-async def agit(args: list[str], cwd: Path) -> str:
+async def agit(args: list[str], cwd: Path, raw: bool = False) -> str:
     """`_git` off the event loop, so a slow worktree add or rebase cannot stall the activity's heartbeat."""
-    return await asyncio.to_thread(_git, args, cwd)
+    return await asyncio.to_thread(_git, args, cwd, raw)
 
 
 async def checked_pytest(wt: Path, home: Path) -> tuple[int, str]:
     """The unit tests, for a fix the person has read: no tokens or keys, a throwaway HOME. Returns (code, output)."""
     return await _run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"], wt,
                       safe_env() | {"PYTHONPATH": str(wt), "HOME": str(home)}, PYTEST_TIMEOUT)
+
+
+async def clear_stale(repo: Path, branch: str) -> None:
+    """Remove a leftover `branch` and any worktree holding it (from an attempt that crashed or was never cleaned up).
+    One fix runs per proposal at a time, so this branch is ours."""
+    try:
+        listing = await agit(["worktree", "list", "--porcelain"], repo)
+    except RuntimeError:
+        listing = ""
+    path = None
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line == f"branch refs/heads/{branch}" and path:
+            try:
+                await agit(["worktree", "remove", "--force", path], repo)
+            except RuntimeError:
+                pass
+    for args in (["worktree", "prune"], ["branch", "-D", branch]):
+        try:
+            await agit(args, repo)
+        except RuntimeError:
+            pass
 
 
 async def run_fix(
@@ -212,9 +264,11 @@ async def run_fix(
     res: dict[str, Any] = {"ok": False, "slug": slug, "branch": fix_branch, "worktree": str(wt), "tmp": str(tmp)}
     created = False
     try:
+        await clear_stale(repo, fix_branch)  # a crashed earlier attempt must not block this one
         try:
             await agit(["worktree", "add", "-q", "-b", fix_branch, str(wt), eval_branch], repo)
             created = True
+            res["gitfile"] = git_pointer(wt)
         except RuntimeError as e:  # includes "branch already exists": that one is not ours to delete
             raise FixError(f"could not set up the worktree from {eval_branch}: {e}") from e
         try:  # the accepted branch was cut when the person clicked Accept: fix what is on main now
@@ -232,6 +286,7 @@ async def run_fix(
             return res | {"stage": "before", "reason": "the case already passes on the current code; nothing to fix"}
         beat()
         res["author"] = await author.run(wt, build_prompt(spec, c0["failures"], slug))
+        check_pointer(wt, res["gitfile"])  # before any git command reads config the author could have pointed at
         changes = await _changes(wt)
         files = [p for _, p in changes]
         res["files"] = files
@@ -274,10 +329,11 @@ async def verify_fix(
     wt, runs = Path(res["worktree"]), settings.eval_validate_runs
     spec_file = wt / "evals" / "accepted" / f"{spec['name']}.json"
     try:  # what runs must be what the person was shown
+        check_pointer(wt, res.get("gitfile", ""))
         head = (await agit(["rev-parse", "HEAD"], wt)).strip()
-        dirty = (await agit(["status", "--porcelain", "--untracked-files=all"], wt)).strip()
-    except RuntimeError as e:
-        return res | {"ok": False, "stage": "changed", "terminal": True, "reason": f"the worktree cannot be read: {e}"}
+        dirty = bool(await _changes(wt))
+    except (RuntimeError, FixError) as e:
+        return res | {"ok": False, "stage": "changed", "terminal": True, "reason": f"the worktree cannot be trusted: {e}"}
     if head != res.get("sha") or dirty:
         return res | {"ok": False, "stage": "changed", "terminal": True,
                       "reason": "the branch is not the commit you were shown (it changed after the report); nothing was run"}
@@ -317,10 +373,10 @@ def cleanup(repo: Path, tmp: Path | str, fix_branch: str | None = None) -> None:
         _git(["worktree", "remove", "--force", str(tmp / "wt")], repo)
     except RuntimeError:
         pass
-    shutil.rmtree(tmp, ignore_errors=True)
-    if fix_branch:
+    shutil.rmtree(tmp, ignore_errors=True)  # also when git refused (e.g. a repointed .git file)
+    for args in ((["worktree", "prune"], ["branch", "-D", fix_branch]) if fix_branch else (["worktree", "prune"],)):
         try:
-            _git(["branch", "-D", fix_branch], repo)
+            _git(args, repo)
         except RuntimeError:
             pass
 
@@ -415,10 +471,15 @@ async def open_pr(
     gh = gh or gh_call
     slug = github_slug(repo)
     token = token or token_provider()
-    code, out = await _run(["git", "push", "-q", "origin", f"{res['branch']}:refs/heads/{res['branch']}"],
-                           Path(res["worktree"]), git_env(token, home=Path(res["tmp"])), 300)
+    wt = Path(res["worktree"])
+    check_pointer(wt, res.get("gitfile", ""))
+    if (await agit(["rev-parse", "HEAD"], wt)).strip() != res.get("sha"):
+        raise FixError("the branch is no longer the commit you were shown; not pushing")
+    code, out = await _run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "push", "-q", "origin",
+                            f"{res['sha']}:refs/heads/{res['branch']}"],  # the exact commit, not whatever the branch is now
+                           wt, git_env(token, home=Path(res["tmp"])), 300)
     if code != 0:
-        raise FixError(f"push failed: {out[-300:].replace(token, '***')}")
+        raise FixError(f"push failed: {(out[-300:].replace(token, '***') if token else out[-300:])}")
     r = await gh("POST", f"/repos/{slug}/pulls", json={
         "title": pr_title(res, spec), "head": res["branch"], "base": base, "body": pr_body(res, spec, proposal_id, origin)})
     if r.status_code >= 300:

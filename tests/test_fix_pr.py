@@ -170,30 +170,51 @@ def test_report_text():
     assert "No fix PR" in fix_pr.report_text("p", {"stage": "pytest", "reason": "tests fail", "author": {"cost_usd": 0.4}}, None)
 
 
-async def test_open_pr_pushes_without_leaking_the_token_and_opens_the_pr(tmp_path, monkeypatch):
-    repo = make_repo(tmp_path)
+async def test_open_pr_pushes_the_exact_commit_without_leaking_the_token(tmp_path, monkeypatch):
+    res = committed_worktree(tmp_path)
+    repo = tmp_path / "repo"
     monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
     subprocess.run(["git", "remote", "add", "origin", "https://github.com/agileresearchservices/always-on-agent.git"], cwd=repo, check=True)
     pushes, posts = [], []
+    real = fix_pr._run
 
     async def fake_run(args, cwd, env, timeout, shell=False):
-        pushes.append((args, env))
-        return 0, ""
+        if "push" in args:
+            pushes.append((args, env))
+            return 0, ""
+        return await real(args, cwd, env, timeout, shell)
 
     async def fake_gh(method, path, json=None, **kw):
         posts.append((method, path, json))
         return httpx.Response(201, json={"html_url": "https://github.com/agileresearchservices/always-on-agent/pull/99"})
 
     monkeypatch.setattr(fix_pr, "_run", fake_run)
-    res = {"branch": "fix/send-needs-card", "worktree": str(tmp_path / "wt"), "tmp": str(tmp_path),
-           "before": {"passed": 0, "runs": 2}, "after": {"passed": 2, "runs": 2}, "pytest": {"ok": True}, "files": ["a"],
-           "suite": {"cases": 1, "hard_failures": [], "soft_misses": {}}}
+    res |= {"after": {"passed": 2, "runs": 2}, "pytest": {"ok": True}, "files": ["a"], "suite": {"cases": 1, "hard_failures": [], "soft_misses": {}}}
     url = await fix_pr.open_pr(res, SPEC, "prop-0123abcd", SPEC["origin"], repo=repo, gh=fake_gh, token="s3cret")
     assert url.endswith("/pull/99")
     args, env = pushes[0]
+    assert f"{res['sha']}:refs/heads/fix/send-needs-card" in args  # the exact commit, not the branch name
+    assert "core.hooksPath=/dev/null" in args
     assert "s3cret" not in " ".join(args) and "s3cret" not in json.dumps({k: v for k, v in env.items() if not k.startswith("GIT_CONFIG_VALUE")})
     assert posts[0][1] == "/repos/agileresearchservices/always-on-agent/pulls" and posts[0][2]["head"] == "fix/send-needs-card"
     assert posts[0][2]["base"] == "main"
+
+
+async def test_open_pr_refuses_when_the_branch_moved_or_the_pointer_changed(tmp_path, monkeypatch):
+    res = committed_worktree(tmp_path)
+    repo = tmp_path / "repo"
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    subprocess.run(["git", "remote", "add", "origin", "https://github.com/agileresearchservices/always-on-agent.git"], cwd=repo, check=True)
+    wt = Path(res["worktree"])
+    (wt / "aoa" / "store.py").write_text("X = 'moved'\n")
+    subprocess.run(["git", "commit", "-qam", "moved"], cwd=wt, check=True)
+    with pytest.raises(FixError, match="no longer the commit"):
+        await fix_pr.open_pr(res | {"suite": {}, "after": {}, "pytest": {}, "files": []}, SPEC, "p", SPEC["origin"], repo=repo,
+                             gh=None, token="t")
+    (wt / ".git").write_text("gitdir: /somewhere/the/author/controls\n")
+    with pytest.raises(FixError, match="pointer"):
+        await fix_pr.open_pr(res | {"suite": {}, "after": {}, "pytest": {}, "files": []}, SPEC, "p", SPEC["origin"], repo=repo,
+                             gh=None, token="t")
 
 
 async def test_open_pr_refuses_a_repo_outside_scope(tmp_path, monkeypatch):
@@ -297,7 +318,7 @@ async def test_the_authors_command_has_a_budget_an_allowlist_and_no_secrets(tmp_
     args = seen["args"]
     assert "-p" in args and args[args.index("--max-budget-usd") + 1] == "3" and "--no-session-persistence" in args
     allowed = args[args.index("--allowedTools") + 1: args.index("--disallowedTools")]
-    root = "/" + str(tmp_path.resolve()).lstrip("/")
+    root = "//" + str(tmp_path.resolve()).lstrip("/")
     assert allowed == [f"{t}({root}/**)" for t in ("Read", "Edit", "Write", "Grep", "Glob")]  # no shell, scoped to the worktree
     assert "Bash" in args[args.index("--disallowedTools") + 1:]
     assert "ghp_secret" not in json.dumps(seen["env"]) and "sk-secret" not in json.dumps(seen["env"])
@@ -503,7 +524,8 @@ def committed_worktree(tmp_path: Path) -> dict:
     (tmp / "wt" / "aoa" / "store.py").write_text("X = 'new'\n")
     subprocess.run(["git", "add", "-A"], cwd=tmp / "wt", check=True), subprocess.run(["git", "commit", "-q", "-m", "fix"], cwd=tmp / "wt", check=True)
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp / "wt", capture_output=True, text=True, check=True).stdout.strip()
-    return {"worktree": str(tmp / "wt"), "tmp": str(tmp), "branch": "fix/send-needs-card", "before": {"passed": 0, "runs": 2}, "sha": sha}
+    return {"worktree": str(tmp / "wt"), "tmp": str(tmp), "branch": "fix/send-needs-card", "before": {"passed": 0, "runs": 2}, "sha": sha,
+            "gitfile": fix_pr.git_pointer(tmp / "wt")}
 
 
 async def test_verify_fix_runs_tests_then_the_case_then_the_suite(tmp_path, settings, pipeline):
@@ -680,3 +702,83 @@ def test_the_attempt_token_fits_the_servers_limit():
     from aoa.server import OpenFixRequest
 
     assert OpenFixRequest(token="abcd1234").token == "abcd1234"  # a run id's first 8 characters
+
+
+# ---- the fifth review round: the worktree's .git file, ignored files, stale branches --------------------------
+
+async def test_an_author_that_repoints_the_git_file_is_stopped_before_git_reads_its_config(tmp_path, settings, pipeline):
+    repo = make_repo(tmp_path)
+    pipeline.reports = [report(0)]
+
+    def edit(wt: Path):
+        (wt / ".git").write_text("gitdir: /tmp/elsewhere-the-author-controls\n")
+        edit_prompt(wt)
+
+    with pytest.raises(FixError, match="pointer"):
+        await go(repo, settings, Author(edit))
+    assert "fix/send-needs-card" not in subprocess.run(["git", "branch", "--list"], cwd=repo, capture_output=True, text=True).stdout
+
+
+async def test_an_ignored_conftest_is_still_seen(tmp_path, settings, pipeline):
+    repo = make_repo(tmp_path)
+    (repo / ".gitignore").write_text("hidden/\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True), subprocess.run(["git", "commit", "-q", "-m", "ignore"], cwd=repo, check=True)
+    subprocess.run(["git", "branch", "-D", "eval/send-needs-card"], cwd=repo, check=True, capture_output=True)
+    ep.write_accepted_branch(SPEC, "p", repo)
+    pipeline.reports = [report(0)]
+
+    def edit(wt: Path):
+        edit_prompt(wt)
+        (wt / "hidden").mkdir()
+        (wt / "hidden" / "conftest.py").write_text("import os\n")  # git would never commit it, but pytest would load it
+
+    res = await go(repo, settings, Author(edit))
+    assert res["stage"] == "author" and "conftest.py" in res["reason"]
+
+
+def test_more_files_that_change_how_tools_behave_are_frozen():
+    assert frozen_changes([".claude/settings.json", ".mcp.json", "CLAUDE.md", ".gitattributes", ".gitmodules", ".gitignore",
+                           "aoa/store.py", "README.md"]) == [".claude/settings.json", ".gitattributes", ".gitignore", ".gitmodules",
+                                                              ".mcp.json", "CLAUDE.md"]
+
+
+def test_the_deny_rules_come_from_the_real_paths_and_protect_the_git_pointer(tmp_path):
+    rules = fix_pr.deny_rules(tmp_path / "wt", extra=(tmp_path / "custom-data",))
+    assert any("custom-data" in r for r in rules)
+    assert any(r.startswith("Read(//") and str(Path.home().resolve()).lstrip("/") in r for r in rules)
+    assert "Read(//Users/**)" in rules and any(r.startswith("Read(//") and r.endswith("home/**)") for r in rules) and "Write(~/**)" in rules
+    wt = "//" + str((tmp_path / "wt").resolve()).lstrip("/")
+    assert f"Write({wt}/.git)" in rules and f"Edit({wt}/.git/**)" in rules
+
+
+async def test_a_leftover_branch_and_worktree_from_a_crashed_attempt_do_not_block_the_next(tmp_path, settings, pipeline):
+    repo = make_repo(tmp_path)
+    stale = tmp_path / "stale-wt"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "fix/send-needs-card", str(stale), "eval/send-needs-card"], cwd=repo, check=True)
+    pipeline.reports = [report(0)]
+    res = await go(repo, settings, Author(edit_prompt))
+    assert res["ok"] and not stale.exists()
+    fix_pr.cleanup(repo, res["tmp"])
+
+
+def test_a_failed_start_gives_the_daily_slot_back(make_core, settings, monkeypatch):
+    import dataclasses
+
+    import aoa.server as server
+    from fastapi.testclient import TestClient
+
+    core, _ = make_core([])
+
+    class Down:
+        async def start_workflow(self, *a, **k):
+            raise ConnectionError("temporal is down")
+
+    monkeypatch.setattr(server, "store", core.store)
+    monkeypatch.setattr(server, "settings", dataclasses.replace(settings, fix_per_day=1))
+    monkeypatch.delenv("AOA_API_TOKEN", raising=False)
+    server.app.state.client = Down()
+    c = TestClient(server.app, raise_server_exceptions=False)
+    pid = core.store.proposal_create("main", "r")
+    core.store.proposal_update(pid, "accepted", spec=SPEC, info={})
+    assert c.post(f"/sessions/main/proposals/{pid}/fix").status_code == 500
+    assert c.post(f"/sessions/main/proposals/{pid}/fix").status_code == 500  # still 500, not 409: the slot came back

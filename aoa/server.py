@@ -227,9 +227,11 @@ async def draft_fix(sid: str, pid: str) -> dict[str, Any]:
         await app.state.client.start_workflow(
             "FixPrWorkflow", {"session": sid, "id": pid}, id=f"fix-{pid}", task_queue=settings.task_queue,
             id_conflict_policy=WorkflowIDConflictPolicy.FAIL, id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE)
-    except WorkflowAlreadyStartedError as e:
+    except BaseException as e:
         store.kv_update("flywheel", day_key, lambda n: max(0, (n or 1) - 1), 0)  # not started: give the slot back
-        raise HTTPException(409, "a fix for this case is already running") from e
+        if isinstance(e, WorkflowAlreadyStartedError):
+            raise HTTPException(409, "a fix for this case is already running") from e
+        raise
     return {"status": "started"}
 
 

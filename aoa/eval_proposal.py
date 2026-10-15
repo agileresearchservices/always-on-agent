@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,6 +33,7 @@ from .safety import wrap_untrusted
 from .store import Store
 
 REPO_DIR = Path(__file__).resolve().parent.parent
+log = logging.getLogger(__name__)
 
 
 def _spec():
@@ -229,12 +231,14 @@ def card_text(p: dict[str, Any]) -> str:
     return "\n".join(lines + ["", valid])
 
 
-def _git(args: list[str], cwd: Path) -> str:
+def _git(args: list[str], cwd: Path, raw: bool = False) -> str:
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", ""), "GIT_TERMINAL_PROMPT": "0"}
-    r = subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
+    # command-line -c wins over any repo config: no hooks and no fsmonitor, whatever the checkout's config says
+    r = subprocess.run(["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                        *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(f"git {args[0]} failed: {r.stderr.strip()[-300:]}")
-    return r.stdout.strip()
+    return r.stdout if raw else r.stdout.strip()
 
 
 def write_accepted_branch(spec: dict[str, Any], proposal_id: str, repo: Path = REPO_DIR, base: str = "main") -> str:
@@ -328,6 +332,7 @@ async def run_proposal(store: Store, settings: Settings, llm: LLM, flag: dict[st
         validation = await validate_on_agent(spec, settings.eval_validate_runs)
         error = None
     except Exception as e:  # noqa: BLE001 - the draft is paid for; show it, flagged, rather than retry the spend
+        log.exception("validating the proposed eval case failed")
         validation, error = None, f"{type(e).__name__}: {e}"[:300]
     info = {"notes": notes, "validation": validation, **({"validation_error": error} if error else {})}
     if validation and validation["verdict"] == "not_reproduced":
