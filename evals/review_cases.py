@@ -5,8 +5,8 @@ named next to each); the reviewer should name them. `clean` cases are the fixed 
 high finding, and an approving verdict. Everything is soft: the pass rate and the recorded defect counts are
 the measurement, and they are the baseline for any change to the reviewer (a verification pass, a model tier).
 
-Needles are alternatives matched case-insensitively against one finding (or the summary); "a&b" needs both words
-in the same finding. They are written from the real review findings and fix commits, loose enough for wording.
+Needles are alternatives matched case-insensitively, each word starting at a word boundary ("hang" does not
+match "change"), against one finding or the summary; "a&b" needs both words in the same finding. They are written from the real review findings and fix commits, loose enough for wording.
 """
 from __future__ import annotations
 
@@ -49,25 +49,25 @@ PRE = {
                                "no longer pending"),
          "stale_click": ("late click", "click&expir", "stale&approv", "after the expiry", "past its lifetime"),
          "tick_under_load": ("never ticks", "starv", "tick&busy", "tick&load", "tick&loop"),
-         "bad_config": ("nudge&expire", "clamp", "zero", "misconfig", "expire&less than")},
+         "bad_config": ("nudge&expire", "clamp", "zero&expire", "misconfig", "expire&less than")},
         1, "9beb5fc"),
     "pr33_search_attributes": (
         "Search attributes: child start fails when they are not registered; stored offer read before the try.",
         {"unregistered_attrs_fail_child": ("not registered", "unregistered", "search attribute&fail",
                                            "ensure_registered", "child start&fail"),
          "fragile_error_match": ("fragile", "message text", "matching the text", "invalid_argument", "status code"),
-         "offer_fields_before_try": ("keyerror", "before the try", "missing&offer", "500")},
+         "offer_fields_before_try": ("keyerror", "before the try", "missing&offer", "500&offer")},
         2, "b7302a0"),
     "pr41_batch_evals": (
         "Batch eval driver: transient errors, cancelled futures, no chunking, in-flight callers hang, create retry.",
         {"transient_poll_errors": ("batches.retrieve", "batches.results", "network blip", "poll&retry", "transient&poll",
                                    "backoff", "polling&fail", "retrieve&error"),
          "cancelled_future": ("invalidstateerror", "done()", "cancelled&future", "future&cancel"),
-         "no_chunking": ("chunk", "100k", "256 mb", "batch limits", "batch size", "request-count", "size limit", "api limit",
+         "no_chunking": ("chunk&batch", "chunk&round", "100k", "256 mb", "batch limits", "batch size", "request-count", "size limit", "api limit",
                          "every run at once"),
          "inflight_callers_hang": ("in-flight", "hang", "already taken out", "never failed", "never resolve", "never complete",
                                   "driver&cancel", "driver&dies"),
-         "create_retry_duplicates": ("duplicate", "second, billed", "lost response", "create&retr", "non-transient")},
+         "create_retry_duplicates": ("duplicate&batch", "second, billed", "lost response", "create&retr", "non-transient")},
         3, "5d4c75b, 9745fda"),
 }
 CLEAN = {

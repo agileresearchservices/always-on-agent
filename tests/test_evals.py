@@ -284,6 +284,15 @@ def test_finds_defects_counts_groups_and_records_the_score():
     assert not g.finds_defects({"order": ("before&send",)}, 1)(split)[0]
     assert g.finds_defects({"order": ("before&send",)}, 1)(_rv(summary="saved before the send"))[0]  # the summary counts
     assert not g.finds_defects(groups, 1)(Run())[0]
+    # a needle starts at a word boundary: "hang" is not found inside "change"
+    assert not g.finds_defects({"hang": ("hang",)}, 1)(_rv(("low", "I would change this.")))[0]
+    assert g.finds_defects({"hang": ("hang",)}, 1)(_rv(("low", "callers hang forever")))[0]
+    assert g.finds_defects({"n": ("500",)}, 1)(_rv(("low", "returns a 500")))[0]
+    assert not g.finds_defects({"n": ("500",)}, 1)(_rv(("low", "limit of 1500")))[0]
+    r = _rv(("medium", "A KeyError is possible."))
+    g.finds_defects(groups, 1)(r)
+    assert r.metrics["found"] == ["cfg"]
+    assert not g.finds_defects(groups, 1)(Run(verdict={"verdict": "approve"}))[0]  # a malformed answer fails, no KeyError
 
 
 def test_no_high_findings():

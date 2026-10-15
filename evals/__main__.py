@@ -29,8 +29,9 @@ def main() -> int:
         for c in CASES:
             print(f"{'hard' if c.hard else 'soft'}  {c.name:34} {c.description}")
         return 0
-    cases = [c for c in CASES if (c.name in a.case if a.case else
-                                  (any(t in c.tags for t in a.tag) if a.tag else "slow" not in c.tags))]
+    cases = [c for c in CASES
+             if (not a.case or c.name in a.case) and (not a.tag or any(t in c.tags for t in a.tag))
+             and (a.case or a.tag or "slow" not in c.tags)]  # "slow" cases run only when named or tagged
     if not cases:
         print("no such case; try --list", file=sys.stderr)
         return 2

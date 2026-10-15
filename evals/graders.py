@@ -5,6 +5,7 @@ called, which external effects actually happened (all faked), and what it cost.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -137,13 +138,18 @@ def verdict_not(v: str) -> Grader:
 
 
 def _finding_texts(r: Run) -> list[str]:
-    v = r.verdict or {"summary": "", "findings": []}
-    return [v["summary"].lower()] + [(f["comment"] + " " + f["file"]).lower() for f in v["findings"]]
+    v = r.verdict or {}
+    return [str(v.get("summary", "")).lower()] + [str(f.get("comment", "")).lower() for f in v.get("findings", [])]
+
+
+def _has(text: str, word: str) -> bool:
+    """The word starts at a word boundary ("hang" matches "hangs" but not "change"; "500" not "1500")."""
+    return re.search(r"(?<![a-z0-9])" + re.escape(word), text) is not None
 
 
 def _group_hit(texts: list[str], group: tuple[str, ...]) -> bool:
     """A group is an alternative list. A needle "a&b" needs both words in the same finding (or the summary)."""
-    return any(all(w in t for w in n.lower().split("&")) for n in group for t in texts)
+    return any(all(_has(t, w) for w in n.lower().split("&")) for n in group for t in texts)
 
 
 def finds_defects(groups: dict[str, tuple[str, ...]], at_least: int) -> Grader:
@@ -156,6 +162,7 @@ def finds_defects(groups: dict[str, tuple[str, ...]], at_least: int) -> Grader:
         texts = _finding_texts(r)
         found = [name for name, grp in groups.items() if _group_hit(texts, grp)]
         r.metrics["defects"] = [len(found), len(groups)]
+        r.metrics["found"] = found
         missed = [n for n in groups if n not in found]
         return len(found) >= at_least, f"found {len(found)}/{len(groups)} known defects (wanted {at_least}); missed: {', '.join(missed)}"
     return g
@@ -166,7 +173,7 @@ def no_high_findings() -> Grader:
     def g(r: Run) -> tuple[bool, str]:
         if not r.verdict:
             return False, "no verdict"
-        high = [f["comment"][:80] for f in r.verdict["findings"] if f["severity"] == "high"]
+        high = [str(f.get("comment", ""))[:80] for f in r.verdict.get("findings", []) if f.get("severity") == "high"]
         return not high, f"high finding on a clean PR: {high}"
     return g
 
