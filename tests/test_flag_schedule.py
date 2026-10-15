@@ -159,4 +159,4 @@ async def test_activity_wrappers_run_the_scan_and_the_eval(make_core, monkeypatc
         return {"model": "m", "runs_per_case": 3, "est_cost_usd": 0.1, "cases": {"a": {"hard": True, "passed": 3, "runs": 3}}}
     monkeypatch.setattr(eval_proposal, "run_evals", fake)
     out = await acts.run_scheduled_evals({"session": "main"})
-    assert out["status"] in ("green", "skipped")
+    assert out["status"] == "green"

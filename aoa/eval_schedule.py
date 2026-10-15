@@ -22,6 +22,7 @@ from .store import Store
 
 KEEP_RUNS = 30
 GREEN_WINDOW = 5  # soft cases are held to their best rate over this many recent green runs
+ERROR_BACKOFF = 86400  # after a failed run, don't pay for the same unchanged setup again for a day
 MAX_AGE = 7 * 86400  # run anyway when the last run is this old: the hosted model can change under a fixed name
 FINGERPRINT_FILES = ("prompt.py", "tools.py", "safety.py", "events.py", "notify.py")
 RunFn = Callable[[list[str]], Awaitable[dict[str, Any] | None]]
@@ -50,17 +51,22 @@ async def run_scheduled(store: Store, settings: Settings, session: str, run: Run
     runs = store.kv_get(session, "eval_runs", [])
     if not force and runs and runs[-1]["fingerprint"] == fp and now - runs[-1]["ts"] < MAX_AGE:
         return {"status": "skipped", "reason": "nothing that shapes the agent changed since the last run"}
+    last_err = store.kv_get(session, "eval_error_at", {})
+    if not force and last_err.get("fp") == fp and now - last_err.get("ts", 0) < ERROR_BACKOFF:
+        return {"status": "skipped", "reason": "the last run failed on this same setup less than a day ago"}
     try:
         report = await run(["--runs", str(settings.eval_schedule_runs)])
         cases = (report or {}).get("cases", {})
-        if cases and not any(c["passed"] for c in cases.values()):
+        why = next((f for c in cases.values() for f in c.get("failures", []) if "raised" in f), "")
+        if cases and why and not any(c["passed"] for c in cases.values()):
             # the harness grades a crashed run as a failed case, so a bad key or an outage looks like "everything
-            # regressed". A real behaviour regression does not fail every soft case too: call it an error.
-            why = next((f for c in cases.values() for f in c.get("failures", []) if "raised" in f), "")
+            # regressed". Only when a run actually raised do we call it an error; a total failure with no crash is
+            # a real (if extreme) regression and takes the normal path.
             raise RuntimeError(f"every case failed in all runs, so the eval harness or the API is probably broken {why}".strip())
     except Exception as e:  # a crash or timeout: the activity is never retried, so say so once instead of staying silent
         msg = _scrub(f"{type(e).__name__}: {e}")
         sig = msg[:60]
+        store.kv_set(session, "eval_error_at", {"fp": fp, "ts": now})
         first = sig != store.kv_get(session, "eval_last_error", "")
         if first:
             store.outbox_push(session, "alert", {"text": f":warning: *Scheduled eval run failed* (nothing was compared): {msg[:300]}\n"
@@ -76,6 +82,7 @@ async def run_scheduled(store: Store, settings: Settings, session: str, run: Run
     store.kv_set(session, "eval_runs", (runs + [{**new, "regressions": regs}])[-KEEP_RUNS:])
     was_bad = bool(store.kv_get(session, "eval_last_posted", "") or store.kv_get(session, "eval_last_error", ""))
     store.kv_set(session, "eval_last_error", "")
+    store.kv_set(session, "eval_error_at", {})
     if not regs:
         store.kv_set(session, "eval_baseline", new)  # only a green run moves the baseline
         store.kv_set(session, "eval_last_posted", "")

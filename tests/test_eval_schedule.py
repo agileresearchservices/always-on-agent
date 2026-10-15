@@ -132,10 +132,12 @@ async def test_a_crashed_run_alerts_once_and_a_green_run_closes_it(env):
     store, s = env
     out = await es.run_scheduled(store, s, "main", boom(RuntimeError("eval run failed: 401")), now=100.0)
     assert out["status"] == "error" and out["posted"] and len(alerts(store)) == 1
-    again = await es.run_scheduled(store, s, "main", boom(RuntimeError("eval run failed: 401")), now=200.0)
+    soon = await es.run_scheduled(store, s, "main", boom(RuntimeError("eval run failed: 401")), now=200.0)
+    assert soon["status"] == "skipped"  # backoff: no paid re-run of the same setup within a day
+    again = await es.run_scheduled(store, s, "main", boom(RuntimeError("eval run failed: 401")), now=200.0 + es.ERROR_BACKOFF)
     assert again["status"] == "error" and not again["posted"] and len(alerts(store)) == 1  # same failure, no new post
     assert store.kv_get("main", "eval_runs", []) == []  # a failed run is not a result
-    ok = await es.run_scheduled(store, s, "main", stub(GREEN), now=300.0)
+    ok = await es.run_scheduled(store, s, "main", stub(GREEN), now=300.0 + 2 * es.ERROR_BACKOFF)
     assert ok["status"] == "green" and len(texts(store, "update")) == 1 and "green again" in texts(store, "update")[0]
 
 
@@ -179,7 +181,14 @@ async def test_slow_soft_slide_across_scheduled_runs_alerts(env):
 async def test_a_run_where_nothing_passed_is_an_error_not_a_regression(env):
     store, s = env
     dead = report(a=(True, 0, 3), b=(False, 0, 3))
+    dead["cases"]["a"]["failures"] = ["run 1 raised AuthenticationError"]
     out = await es.run_scheduled(store, s, "main", stub(dead), now=1.0)
     assert out["status"] == "error" and "probably broken" in out["error"]
     assert store.kv_get("main", "eval_runs", []) == [] and "Eval regression" not in alerts(store)[0]["payload"]["text"]
     assert "failed" in alerts(store)[0]["payload"]["text"]
+
+
+async def test_a_total_failure_without_a_crash_is_still_a_regression(env):
+    store, s = env
+    out = await es.run_scheduled(store, s, "main", stub(report(a=(True, 0, 3), b=(False, 0, 3))), now=1.0)
+    assert out["status"] == "regression"

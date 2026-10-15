@@ -455,7 +455,8 @@ class Bridge:
                 self._check(r, "read outbox")
                 for item in r.json().get("items", []):
                     text, blocks = render_outbox_item(item)
-                    kw: dict[str, Any] = {"channel": self.cfg.channel, "text": text}
+                    kw: dict[str, Any] = {"channel": self.cfg.channel, "text": text,
+                                      "unfurl_links": False, "unfurl_media": False}  # GitHub preview cards repeat the line
                     if blocks:
                         kw["blocks"] = blocks
                     resp = await self.web.chat_postMessage(**kw)
