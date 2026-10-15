@@ -219,6 +219,50 @@ def test_cache_breakpoints_placed_and_capped():
     assert "cache_control" not in messages[2]["content"][0]  # inputs are not mutated
 
 
+def test_cache_ttl_applies_to_every_breakpoint_and_only_when_long():
+    system = system_blocks(build_sections("t", "f"))
+    messages = [{"role": "user", "content": [{"type": "text", "text": "c"}]}]
+    tools = [{"name": "x"}]
+    s, m, t = place_cache_breakpoints(system, messages, tools, ttl="1h")
+    marked = [b for b in [*s, *t, *m[-1]["content"]] if "cache_control" in b]
+    assert len(marked) == 3 and all(b["cache_control"] == {"type": "ephemeral", "ttl": "1h"} for b in marked)
+    assert "ttl" not in system[-1]["cache_control"]  # inputs are not mutated
+    s, m, t = place_cache_breakpoints(system, messages, tools)  # 5m is the API default: no field, prefix unchanged
+    assert all("ttl" not in b["cache_control"] for b in [*s, *t, *m[-1]["content"]] if "cache_control" in b)
+
+
+def test_cache_ttl_setting_is_normalised_and_drives_the_windows(monkeypatch, tmp_path):
+    from aoa.config import Settings
+    from aoa.delivery import workflow_cfg
+    from aoa.llm import ttl_label
+
+    monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
+    for raw, want in (("300", 300), ("0", 300), ("600", 3600), ("3600", 3600), ("86400", 3600)):
+        monkeypatch.setenv("AOA_CACHE_TTL", raw)
+        assert Settings.from_env().cache_ttl_seconds == want
+    assert workflow_cfg(Settings.from_env())["warm_min_gap"] == 3540  # re-warm a minute before the 1h entry lapses
+    assert ttl_label(300) is None and ttl_label(3600) == "1h"
+
+
+async def test_anthropic_llm_sends_the_ttl():
+    from types import SimpleNamespace
+    from aoa.llm import AnthropicLLM
+
+    seen = {}
+
+    class Msgs:
+        async def create(self, **kw):
+            seen.update(kw)
+            return SimpleNamespace(content=[SimpleNamespace(type="text", text="ok")], stop_reason="end_turn",
+                                   usage=SimpleNamespace(input_tokens=1, output_tokens=1, cache_read_input_tokens=0,
+                                                         cache_creation_input_tokens=0))
+
+    llm = AnthropicLLM(SimpleNamespace(messages=Msgs()), cache_ttl_seconds=3600)
+    await llm.create(model="m", system=system_blocks(build_sections("t", "f")), tools=[{"name": "x"}], max_tokens=5,
+                     messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    assert seen["system"][-1]["cache_control"]["ttl"] == "1h" and seen["tools"][-1]["cache_control"]["ttl"] == "1h"
+
+
 # ---- store --------------------------------------------------------------------------------------
 def test_commit_step_is_atomic_and_idempotent(settings):
     st = Store(settings.db_path)

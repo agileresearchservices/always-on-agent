@@ -66,7 +66,7 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 | Files all the way down; profile, dated log, scratchpad, skills | `memory.py` |
 | Dynamic tool discovery (names only, schema on demand) | `tools.py`: core vs deferred, `tool_search`, `call_deferred` |
 | Subagents with fresh context, results only | `spawn_helper` runs a child workflow (`HelperWorkflow`), several in parallel |
-| Prompt caching: static prefix, fixed order, cache miss = bug | `prompt.py` (hashed sections, experiments only append), `llm.place_cache_breakpoints`, miss detection in `core.llm_step`, volatile context lives in the user message |
+| Prompt caching: static prefix, fixed order, cache miss = bug | `prompt.py` (hashed sections, experiments only append), `llm.place_cache_breakpoints` (5m or 1h via `AOA_CACHE_TTL`), miss detection in `core.llm_step`, volatile context lives in the user message |
 | Warm the cache while the user types | `POST /sessions/{id}/typing` -> `warm_cache` activity |
 | Compact inside the warm window | `compaction.py`: summariser reuses the exact cached prefix |
 | Long output goes to a file | `sandbox._spill`, `core._cap` |

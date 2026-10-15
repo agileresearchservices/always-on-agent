@@ -65,7 +65,7 @@ class Settings:
             tool_result_max_chars=_int("AOA_TOOL_RESULT_MAX_CHARS", 8000),
             context_hard_limit_tokens=_int("AOA_CONTEXT_HARD_LIMIT", 120_000),
             context_warm_compact_tokens=_int("AOA_CONTEXT_WARM_COMPACT", 50_000),
-            cache_ttl_seconds=_int("AOA_CACHE_TTL", 300),
+            cache_ttl_seconds=3600 if _int("AOA_CACHE_TTL", 300) > 300 else 300,  # the API offers 5m or 1h
             idle_sleep_seconds=_int("AOA_IDLE_SLEEP", 600),
             batch_window_seconds=_float("AOA_BATCH_WINDOW", 2.0),
             min_update_interval_seconds=_int("AOA_MIN_UPDATE_INTERVAL", 1800),
