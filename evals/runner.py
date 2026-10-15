@@ -209,14 +209,27 @@ async def run_suite(
             by_case[c.name]["high_findings"] = sum(r["severities"].get("high", 0) for r in rs)
     tot = {k: sum(r[k] for r in results) for k in ("input_tokens", "output_tokens", "cache_read", "cache_write")}
     return {"model": base.model, "runs_per_case": runs, "seconds": round(time.time() - t0, 1), "tokens": tot,
-            "est_cost_usd": _est_cost(base, tot), "cases": by_case, "results": results}
+            "est_cost_usd": _est_cost_runs(base, cases, results), "cases": by_case, "results": results}
 
 
-def _est_cost(base: Settings, tot: dict[str, int]) -> float | None:
-    """List-price estimate of the run, priced as the main model (the reviewer model's calls are a rounding error).
-    None for a model without a known price. Batch mode halves it; `format_table` applies that."""
-    return cost_usd(base.model, tot["input_tokens"], tot["output_tokens"], tot["cache_read"], tot["cache_write"],
-                    base.cache_ttl_seconds)
+def _est_cost(base: Settings, tot: dict[str, int], model: str | None = None) -> float | None:
+    """List-price estimate for some tokens (default: priced as the main model). None for a model without a known
+    price. Batch mode halves it; `format_table` applies that."""
+    return cost_usd(model or base.model, tot["input_tokens"], tot["output_tokens"], tot["cache_read"],
+                    tot["cache_write"], base.cache_ttl_seconds)
+
+
+def _est_cost_runs(base: Settings, cases: list[Case], results: list[dict[str, Any]]) -> float | None:
+    """Review cases run on the helper model, the rest on the main model; the command reviewer's calls are a
+    rounding error and are priced with whichever model the run used."""
+    mode = {c.name: c.mode for c in cases}
+    total = 0.0
+    for r in results:
+        est = _est_cost(base, r, base.helper_model if mode.get(r["case"]) == "review" else base.model)
+        if est is None:
+            return None
+        total += est
+    return total
 
 
 def format_table(report: dict[str, Any]) -> str:

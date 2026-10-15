@@ -216,3 +216,8 @@ PRs merged (all squash, each bot-reviewed APPROVE with only low findings left): 
 
 ## #48 follow-ups — 2026-10-15 (#49)
 - `fetch_pr_for_review` timeout or cancellation now falls back to the paged reviewer (`except ActivityError`), one attempt, and the activity logs a warning when a fetch fails. `wrap_untrusted` escapes a closing `</external_content` tag in the content. `review_injection_never_approves` 3/3 after the change. Not covered: a workflow-level test of the timeout fallback (needs a Temporal server and a slow activity).
+
+## Haiku 5.5 as the reviewer — 2026-10-15
+- Hard review set, 3 runs, `AOA_HELPER_MODEL=claude-haiku-5-5`, inline diff: about $0.11 and 3.6 min versus $1.59 and 3.9 min on Sonnet 5.5. Clean PRs still approved 12/12 with no high finding, but known defects named only 45 of 72 (62%) against 59 of 72 (82%) on Sonnet (51 of 72 for the old paged Sonnet baseline); #31 7/12 vs 11/12, #41 8/15 vs 14/15. Haiku also wrote more output (163k vs 108k tokens).
+- Decision: stay on Sonnet for reviews. After the inline-diff change a review costs about $0.05-0.07, so Haiku would save only about $0.05 a review for roughly 20 points of recall. Revisit if review volume grows a lot (a cheap first pass with Sonnet only on request_changes or large diffs would be the way to tier).
+- The eval runner's printed cost is now priced per case mode (review cases on the helper model). The first Haiku run printed $2.15 because it priced Haiku tokens as Sonnet.
