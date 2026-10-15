@@ -328,3 +328,14 @@ def test_hard_review_fixtures_are_complete_and_safe():
     for p in DIR.glob("*/diff.patch"):
         t = p.read_text()
         assert not re.search(r"sk-ant-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_\w{20,}|xox[bp]-\d|-----BEGIN [A-Z ]*PRIVATE KEY", t), p
+
+
+def test_report_shows_estimated_cost_and_halves_it_in_batch_mode(settings):
+    from evals.runner import _est_cost, format_table
+    tot = {"input_tokens": 0, "output_tokens": 1_000_000, "cache_read": 0, "cache_write": 0}
+    est = _est_cost(settings, tot)
+    assert est == 10.0  # sonnet-5-5 output, $10 per million
+    report = {"model": settings.model, "runs_per_case": 1, "seconds": 1, "tokens": tot, "est_cost_usd": est, "cases": {}}
+    assert "estimated cost: $10.00" in format_table(report)
+    assert "estimated cost: $5.00" in format_table({**report, "batch": {"requests": 1, "batches": 1}})
+    assert "unknown" in format_table({**report, "est_cost_usd": None})

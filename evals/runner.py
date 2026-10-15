@@ -26,6 +26,7 @@ from aoa.llm import LLM
 from aoa.loop import run_agent_loop
 from aoa.memory import MemoryStore
 from aoa.pr_review import build_task, parse_verdict
+from aoa.pricing import cost_usd
 from aoa.store import Store
 from aoa.testing import MemoryScheduler
 
@@ -205,15 +206,25 @@ async def run_suite(
             by_case[c.name]["high_findings"] = sum(r["severities"].get("high", 0) for r in rs)
     tot = {k: sum(r[k] for r in results) for k in ("input_tokens", "output_tokens", "cache_read", "cache_write")}
     return {"model": base.model, "runs_per_case": runs, "seconds": round(time.time() - t0, 1), "tokens": tot,
-            "cases": by_case, "results": results}
+            "est_cost_usd": _est_cost(base, tot), "cases": by_case, "results": results}
+
+
+def _est_cost(base: Settings, tot: dict[str, int]) -> float | None:
+    """List-price estimate of the run, priced as the main model (the reviewer model's calls are a rounding error).
+    None for a model without a known price. Batch mode halves it; `format_table` applies that."""
+    return cost_usd(base.model, tot["input_tokens"], tot["output_tokens"], tot["cache_read"], tot["cache_write"],
+                    base.cache_ttl_seconds)
 
 
 def format_table(report: dict[str, Any]) -> str:
     t = report["tokens"]
     b = report.get("batch")
     mode = f"  batch mode ({b['requests']} requests in {b['batches']} batches, 50% price)" if b else ""
+    est = report.get("est_cost_usd")
+    cost = "unknown (no price for this model)" if est is None else f"${est * (0.5 if b else 1):.2f}"
     lines = [f"model {report['model']}  runs/case {report['runs_per_case']}  {report['seconds']}s{mode}",
-             f"tokens: {t['input_tokens']} in, {t['output_tokens']} out, {t['cache_read']} cache read, {t['cache_write']} cache write", ""]
+             f"tokens: {t['input_tokens']} in, {t['output_tokens']} out, {t['cache_read']} cache read, {t['cache_write']} cache write",
+             f"estimated cost: {cost} (list prices)", ""]
     for name, c in report["cases"].items():
         mark = "ok  " if c["passed"] == c["runs"] else ("FAIL" if c["hard"] else "warn")
         extra = f"  [defects found {c['defects'][0]}/{c['defects'][1]}]" if "defects" in c else ""
