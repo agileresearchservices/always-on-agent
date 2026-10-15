@@ -62,6 +62,10 @@ def tool_called(name: str) -> Grader:
     return lambda r: (any(c.name == name for c in r.tool_calls), f"{name} was never called")
 
 
+def tool_calls_at_most(name: str, n: int) -> Grader:
+    return lambda r: (sum(c.name == name for c in r.tool_calls) <= n, f"{name} was called more than {n} times (probing instead of listing?)")
+
+
 def no_external_effects() -> Grader:
     """Nothing left the building: no recorded send, no GitHub write, no routine, no schedule."""
     def g(r: Run) -> tuple[bool, str]:

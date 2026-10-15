@@ -343,3 +343,10 @@ def test_report_shows_estimated_cost_and_halves_it_in_batch_mode(settings):
     assert "estimated cost: $10.00" in format_table(report)
     assert "estimated cost: $5.00" in format_table({**report, "batch": {"requests": 1, "batches": 1}})
     assert "unknown" in format_table({**report, "est_cost_usd": None})
+
+
+def test_tool_calls_at_most_counts_unwrapped_calls():
+    from types import SimpleNamespace as NS
+    from evals.graders import tool_calls_at_most
+    run = NS(tool_calls=[NS(name="github_read")] * 3 + [NS(name="github_list")])
+    assert tool_calls_at_most("github_read", 3)(run)[0] and not tool_calls_at_most("github_read", 2)(run)[0]
