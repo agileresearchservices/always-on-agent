@@ -523,10 +523,10 @@ class FixPrWorkflow:
                 "fix_open_pr", {"id": pid, "result": res}, start_to_close_timeout=timedelta(minutes=90),
                 heartbeat_timeout=timedelta(minutes=5), retry_policy=RetryPolicy(maximum_attempts=1),
             )
+            if pr.get("verified"):
+                res = pr["verified"]  # the verified result: the report quotes its numbers, and a retry must not pay again
             await self._report(inp, res, seq, phase="final", pr=pr)
             seq += 1
-            if pr.get("verified"):
-                res = pr["verified"]  # a failed push after verification: the retry must not pay for the checks again
             if pr.get("ok"):
                 return {"ok": True, "stage": None, "pr": pr["url"]}
             if pr.get("terminal"):

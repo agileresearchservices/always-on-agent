@@ -432,7 +432,7 @@ class AgentActivities:
             return {"ok": False, "reason": str(e)[:300], "verified": res}  # kept (and verified) so the click can be retried
         cleanup(repo, res["tmp"])  # pushed: the worktree goes, the branch stays
         self.core.store.proposal_update(p["id"], "fix_opened", info={**p["info"], "pr": url})
-        return {"ok": True, "url": url}
+        return {"ok": True, "url": url, "verified": res}  # the report needs the numbers from the verification
 
     @activity.defn(name="fix_discard")
     async def fix_discard(self, a: dict[str, Any]) -> None:

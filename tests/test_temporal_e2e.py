@@ -352,8 +352,7 @@ def _fix_fixtures(env, monkeypatch, open_results, verify=None):
     wt.mkdir(parents=True, exist_ok=True)
     (wt / ".git").write_text("gitdir: nowhere\n")  # fix_open_pr only checks that the worktree is still there
     result = {"ok": True, "slug": "e2e-fix", "branch": "fix/e2e-fix", "worktree": str(wt), "tmp": str(wt.parent),
-              "before": {"passed": 0, "runs": 2}, "after": {"passed": 2, "runs": 2}, "files": ["aoa/store.py"], "guardrails": [],
-              "pytest": {"ok": True}, "suite": {"cases": 3, "hard_failures": [], "soft_misses": {}}}
+              "before": {"passed": 0, "runs": 2}, "files": ["aoa/store.py"], "guardrails": []}  # as fix_run returns it: no after/suite yet
 
     async def fake_run_fix(spec_, pid, settings, author, **kw):
         assert author.budget == env.fix_budget_usd
@@ -366,7 +365,8 @@ def _fix_fixtures(env, monkeypatch, open_results, verify=None):
         return out
 
     async def fake_verify(res, spec_, settings, **kw):  # the real-model checks, which need the API key
-        return verify(res) if verify else res | {"ok": True, "after": {"passed": 2, "runs": 2},
+        return verify(res) if verify else res | {"ok": True, "verified": True, "after": {"passed": 2, "runs": 2},
+                                                  "pytest": {"ok": True, "summary": "5 passed"},
                                                   "suite": {"cases": 3, "hard_failures": [], "soft_misses": {}}}
 
     monkeypatch.setattr(fix_pr, "run_fix", fake_run_fix)
@@ -406,6 +406,7 @@ async def test_fix_workflow_waits_for_the_click_then_opens_the_pr(client, env, m
         out = await h.result()
     assert out == {"ok": True, "stage": None, "pr": url}
     assert "pull/99" in kinds()[2]["text"] and not kinds()[2]["ready"]
+    assert "0/2 -> 2/2 runs passing" in kinds()[2]["text"]  # the numbers come from the verified result (found by a live run)
     assert store.proposal_get(pid)["status"] == "fix_opened"
 
 
@@ -478,3 +479,27 @@ async def test_fix_workflow_a_failed_real_model_check_discards_and_offers_a_retr
     assert out == {"ok": False, "stage": "verify", "pr": None}
     last = kinds()[-1]
     assert "did not pass the real-model checks" in last["text"] and last["retry"] and not last["ready"]
+
+
+async def test_fix_workflow_first_click_success_reports_the_verified_numbers(client, env, monkeypatch):
+    """The path the live run took: one click, no earlier failure. The report must quote the numbers from verification
+    (an earlier version read them from the pre-verification result and crashed after the PR was already open)."""
+    url = "https://github.com/agileresearchservices/always-on-agent/pull/98"
+    spec, _ = _fix_fixtures(env, monkeypatch, [url])
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    store = Store(env.db_path)
+    pid = store.proposal_create("main", "r")
+    store.proposal_update(pid, "accepted", spec=spec, info={})
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), FakeLLM([]), TemporalScheduler(client, env))
+    kinds = lambda: [o["payload"] for o in store.outbox_since(sid) if o["kind"] == "eval_fix"]  # noqa: E731
+    async with await build_worker(env, client, core):
+        h = await client.start_workflow("FixPrWorkflow", {"session": sid, "id": pid}, id=f"fix-{sid}", task_queue=env.task_queue)
+        try:
+            await _wait_for(lambda: len(kinds()) == 1)
+            await h.signal("open_pr", kinds()[0]["token"])
+            out = await h.result()
+        except BaseException:
+            await h.terminate("test failed")
+            raise
+    assert out == {"ok": True, "stage": None, "pr": url}
+    assert "pull/98" in kinds()[1]["text"] and "0/2 -> 2/2 runs passing" in kinds()[1]["text"]
