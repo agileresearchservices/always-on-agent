@@ -300,3 +300,50 @@ def test_approval_settings_are_sane(monkeypatch):
 def test_durations_in_approval_notices_read_correctly():
     from aoa.core import AgentCore
     assert [AgentCore._dur(x) for x in (5, 90, 5400, 14400, 86400)] == ["5s", "90s", "90m", "4h", "24h"]
+
+
+async def test_github_list_and_new_reads(make_core, monkeypatch):
+    import httpx
+    import pytest
+    from aoa.tools import REGISTRY, ToolError, format_checks
+
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    calls = []
+    item = {"repository_url": "https://api.github.com/repos/agileresearchservices/demo", "number": 7, "title": "Fix it",
+            "user": {"login": "octo"}, "state": "open", "draft": True, "labels": [{"name": "bug"}], "updated_at": "2026-10-15T10:00:00Z"}
+
+    async def fake(method, path, json=None, accept=""):
+        calls.append(path)
+        if path.startswith("/search/issues"):
+            return httpx.Response(200, json={"total_count": 41, "items": [item]})
+        if path.endswith("/comments?per_page=100"):
+            return httpx.Response(200, json=[{"user": {"login": "octo"}, "created_at": "t", "body": "hello"}])
+        if path.endswith("/pulls/7"):
+            return httpx.Response(200, json={"head": {"sha": "abcdef123456"}})
+        if path.endswith("/check-runs?per_page=100"):
+            return httpx.Response(200, json={"check_runs": [{"name": "ci", "status": "completed", "conclusion": "failure"}]})
+        return httpx.Response(200, json={"statuses": []})
+
+    monkeypatch.setattr("aoa.github_monitor.gh_call", fake)
+    core, _ = make_core([text("ok")])
+    ctx = core._ctx("main", "main", "main", 0, True)
+    lst, rd = REGISTRY["github_list"].handler, REGISTRY["github_read"].handler
+
+    out = await lst(ctx, {"kind": "pr", "limit": 500})
+    assert "agileresearchservices/demo#7 Fix it (by octo, open, draft, bug" in out and "41 open prs (showing 1)" in out
+    assert "user%3Aagileresearchservices%20is%3Apr%20is%3Aopen" in calls[0] and "per_page=30" in calls[0]  # limit clamped
+    await lst(ctx, {"kind": "issue", "repo": "agileresearchservices/demo", "state": "all"})
+    assert "repo%3Aagileresearchservices/demo%20is%3Aissue" in calls[1] and "is%3Aall" not in calls[1]
+    n = len(calls)
+    for bad in ({"kind": "pr", "repo": "nasuni/hyrule"}, {"kind": "pr", "state": "weird"}, {"kind": "repo"}):
+        with pytest.raises(ToolError):
+            await lst(ctx, bad)
+    assert len(calls) == n  # refused before any request
+
+    assert "hello" in await rd(ctx, {"what": "comments", "repo": "agileresearchservices/demo", "number": 7})
+    chk = await rd(ctx, {"what": "checks", "repo": "agileresearchservices/demo", "number": 7})
+    assert "FAILING" in chk and "ci (failure)" in chk and "abcdef12" in chk
+    assert "UNTRUSTED" in chk.upper() or "untrusted" in chk.lower()
+    assert format_checks(1, "s" * 8, [("a", "completed", "success")], [("b", "completed", "success")]).split("\n")[0].endswith("PASSING (2 checks)")
+    assert "PENDING" in format_checks(1, "s" * 8, [("a", "in_progress", None)], [])
+    assert "no checks" in format_checks(1, "s" * 8, [], [])
