@@ -52,6 +52,12 @@ async def run_scheduled(store: Store, settings: Settings, session: str, run: Run
         return {"status": "skipped", "reason": "nothing that shapes the agent changed since the last run"}
     try:
         report = await run(["--runs", str(settings.eval_schedule_runs)])
+        cases = (report or {}).get("cases", {})
+        if cases and not any(c["passed"] for c in cases.values()):
+            # the harness grades a crashed run as a failed case, so a bad key or an outage looks like "everything
+            # regressed". A real behaviour regression does not fail every soft case too: call it an error.
+            why = next((f for c in cases.values() for f in c.get("failures", []) if "raised" in f), "")
+            raise RuntimeError(f"every case failed in all runs, so the eval harness or the API is probably broken {why}".strip())
     except Exception as e:  # a crash or timeout: the activity is never retried, so say so once instead of staying silent
         msg = _scrub(f"{type(e).__name__}: {e}")
         sig = msg[:60]

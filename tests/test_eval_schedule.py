@@ -174,3 +174,12 @@ async def test_slow_soft_slide_across_scheduled_runs_alerts(env):
         t += es.MAX_AGE + 1
         await es.run_scheduled(store, s, "main", stub(report(s=(False, p, 3))), now=t)
     assert len(alerts(store)) == 1 and "`s`" in alerts(store)[0]["payload"]["text"]
+
+
+async def test_a_run_where_nothing_passed_is_an_error_not_a_regression(env):
+    store, s = env
+    dead = report(a=(True, 0, 3), b=(False, 0, 3))
+    out = await es.run_scheduled(store, s, "main", stub(dead), now=1.0)
+    assert out["status"] == "error" and "probably broken" in out["error"]
+    assert store.kv_get("main", "eval_runs", []) == [] and "Eval regression" not in alerts(store)[0]["payload"]["text"]
+    assert "failed" in alerts(store)[0]["payload"]["text"]
