@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import time
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -117,17 +119,32 @@ async def poll_once(http: httpx.AsyncClient, store: Store, session: str, user: s
     return announce
 
 
+def _quiet_for(pr: dict[str, Any], settle: int, now: float) -> bool:
+    """Has the PR been untouched for `settle` seconds? Its last-updated time moves on every push, so a PR still
+    being pushed to waits for a later poll. A missing or unreadable time counts as quiet (never blocks a review)."""
+    if settle <= 0:
+        return True
+    try:
+        updated = datetime.fromisoformat(str(pr.get("updated", "")).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return True
+    return now - updated >= settle
+
+
 def reviews_to_start(store: Store, session: str, prs: list[dict[str, Any]], user: str,
-                     cap: int = MAX_REVIEWS_PER_POLL) -> list[dict[str, Any]]:
+                     cap: int = MAX_REVIEWS_PER_POLL, settle: int = 0, now: float | None = None) -> list[dict[str, Any]]:
     """Only the owner's own PRs are auto-reviewed: others' PR content is attacker-controllable, and the
     review is published. At most `cap` per poll to bound cost; the rest wait in a persisted queue (the
-    seen-state already counts them as announced, so they would otherwise never be reviewed)."""
+    seen-state already counts them as announced, so they would otherwise never be reviewed). A PR touched in
+    the last `settle` seconds stays queued, so a run of quick pushes costs one review of the last head."""
+    now = time.time() if now is None else now
     queue = store.kv_get(session, QUEUE_KEY, [])
     for p in prs:
         if p["author"].lower() == user.lower():
             queue = [q for q in queue if pr_key(q) != pr_key(p)] + [p]  # a newer commit replaces an older one
-    take, rest = queue[:cap], queue[cap:]
-    store.kv_set(session, QUEUE_KEY, rest)
+    ready = [q for q in queue if _quiet_for(q, settle, now)]
+    take = ready[:cap]
+    store.kv_set(session, QUEUE_KEY, [q for q in queue if q not in take])
     return take
 
 

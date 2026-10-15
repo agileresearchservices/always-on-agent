@@ -39,6 +39,7 @@ class Settings:
     batch_window_seconds: float
     # notifications
     min_update_interval_seconds: int
+    review_settle_seconds: int
     quiet_start_hour: int
     quiet_end_hour: int
     # sandbox
@@ -79,6 +80,7 @@ class Settings:
             idle_sleep_seconds=_int("AOA_IDLE_SLEEP", 600),
             batch_window_seconds=_float("AOA_BATCH_WINDOW", 2.0),
             min_update_interval_seconds=_int("AOA_MIN_UPDATE_INTERVAL", 1800),
+            review_settle_seconds=max(0, _int("AOA_REVIEW_SETTLE_SECONDS", 300)),
             quiet_start_hour=_int("AOA_QUIET_START", 22),
             quiet_end_hour=_int("AOA_QUIET_END", 7),
             shell_timeout_seconds=_int("AOA_SHELL_TIMEOUT", 60),
