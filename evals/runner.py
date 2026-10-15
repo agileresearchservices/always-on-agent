@@ -166,7 +166,9 @@ async def run_suite(
 
 def format_table(report: dict[str, Any]) -> str:
     t = report["tokens"]
-    lines = [f"model {report['model']}  runs/case {report['runs_per_case']}  {report['seconds']}s",
+    b = report.get("batch")
+    mode = f"  batch mode ({b['requests']} requests in {b['batches']} batches, 50% price)" if b else ""
+    lines = [f"model {report['model']}  runs/case {report['runs_per_case']}  {report['seconds']}s{mode}",
              f"tokens: {t['input_tokens']} in, {t['output_tokens']} out, {t['cache_read']} cache read, {t['cache_write']} cache write", ""]
     for name, c in report["cases"].items():
         mark = "ok  " if c["passed"] == c["runs"] else ("FAIL" if c["hard"] else "warn")
