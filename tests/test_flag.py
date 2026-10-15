@@ -1,6 +1,7 @@
 """Flagging bad outcomes from stored traces (#54): no server, scripted model."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 
@@ -55,7 +56,8 @@ async def test_scan_flags_repeated_tool_errors_and_max_tokens(make_core, setting
     bad = lambda: tool("read_file", path="missing.txt")  # noqa: E731
     core, _ = make_core([[bad()], [bad()], [bad()], text("giving up")])
     await handle_events(core, "main", [usr_event("read it")])
-    assert [f["reason"] for f in flag.scan(core.store, settings)] == ["tool_errors:read_file"]
+    reasons = [f["reason"] for f in flag.scan(core.store, settings)]
+    assert len(reasons) == 1 and reasons[0].startswith("tool_errors:read_file:")
 
     core2, _ = make_core([])
     core2.store.step_put("c2", "llm:t.s0", {"content": [], "stop_reason": "max_tokens", "usage": {}, "tool_uses": [],
@@ -63,10 +65,8 @@ async def test_scan_flags_repeated_tool_errors_and_max_tokens(make_core, setting
     assert [f["reason"] for f in flag.scan(core2.store, settings)] == ["max_tokens:llm:t.s0"]
 
 
-async def test_scan_flags_a_turn_that_used_every_step(make_core, settings, monkeypatch):
-    monkeypatch.setenv("AOA_MAX_STEPS", "3")
-    from aoa.config import Settings
-    s = Settings.from_env()
+async def test_scan_flags_a_turn_that_used_every_step(make_core, settings):
+    s = dataclasses.replace(settings, max_steps_per_turn=3)
     core, _ = make_core([])
     for n in range(3):
         core.store.step_put("main", f"llm:abc.s{n}", {"content": [], "stop_reason": "tool_use", "usage": {},
@@ -82,7 +82,10 @@ async def test_scan_flags_cache_miss_and_ignores_healthy_traces(make_core, setti
     assert flag.scan(core.store, settings) == []
     core.store.step_put("main", "llm:zz.s0", {"content": [], "stop_reason": "end_turn", "usage": {},
                                               "tool_uses": [], "text": "x", "cache_miss": True})
-    assert [f["reason"] for f in flag.scan(core.store, settings)] == ["cache_miss:llm:zz.s0"]
+    core.store.step_put("main", "llm:zz.s1", {"content": [], "stop_reason": "end_turn", "usage": {},
+                                              "tool_uses": [], "text": "x", "cache_miss": True})
+    got = flag.scan(core.store, settings)
+    assert [f["reason"] for f in got] == ["cache_miss"] and "2 time(s)" in got[0]["evidence"]  # one flag per conversation
 
 
 async def test_render_trace_text_and_json(make_core):

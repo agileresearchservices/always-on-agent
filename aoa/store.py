@@ -357,6 +357,11 @@ class Store:
         with self._conn() as c:
             return c.execute("SELECT COUNT(*) AS n FROM eval_proposals WHERE ts>=?", (ts,)).fetchone()["n"]
 
+    def flags_count(self, conv_id: str, reason_prefix: str, status: str) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM flagged WHERE conv_id=? AND status=? AND substr(reason, 1, ?)=?",
+                             (conv_id, status, len(reason_prefix), reason_prefix)).fetchone()["n"]
+
     def flag_set_status(self, conv_id: str, reason: str, status: str) -> bool:
         with self._conn() as c:
             return c.execute("UPDATE flagged SET status=? WHERE conv_id=? AND reason=?",
