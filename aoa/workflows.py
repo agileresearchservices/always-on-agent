@@ -331,12 +331,20 @@ class PrReviewWorkflow:
     async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
         pr, session = inp["pr"], inp["session"]
         text, note = "", ""
+        material = ""
+        if workflow.patched("inline-diff"):
+            # one fetch here instead of the reviewer paging through a spilled file with a model call per slice
+            material = await workflow.execute_activity(
+                "fetch_pr_for_review", {"pr": pr}, start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=2, initial_interval=timedelta(seconds=2)),
+            )
         try:
             text = await workflow.execute_child_workflow(
                 "HelperWorkflow",
                 {"session": session, "cfg": inp["cfg"], "depth": 1,
                  "parent_conv": f"prreview/{pr['repo']}#{pr['number']}@{pr['sha'][:12]}",
-                 "tool_use": {"id": "review", "name": "spawn_helper", "input": {"task": build_task(pr)}}},
+                 "tool_use": {"id": "review", "name": "spawn_helper",
+                              "input": {"task": build_task(pr, material) if material else build_task(pr)}}},
                 id=f"{workflow.info().workflow_id}-reviewer",
             )
         except ChildWorkflowError as e:

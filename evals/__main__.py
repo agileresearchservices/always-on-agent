@@ -31,6 +31,7 @@ def main() -> int:
     ap.add_argument("--batch", action="store_true", help="use the Message Batches API (50%% price, slower)")
     ap.add_argument("--batch-poll", type=float, default=15.0, help="seconds between batch status checks")
     ap.add_argument("--tag", action="append", help="only cases with this tag (repeatable); the slow hard review set needs --tag review-hard")
+    ap.add_argument("--paged", action="store_true", help="review the old way: the reviewer fetches the PR itself and pages through the spilled diff (for comparison; production inlines it)")
     ap.add_argument("--second-pass", action="store_true", help="experiment: review each PR twice, the second pass hunting ordering/error-path/cross-file bugs")
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
@@ -49,6 +50,7 @@ def main() -> int:
     from . import runner
 
     runner.SECOND_PASS = a.second_pass
+    runner.INLINE_DIFF = not a.paged
 
     coord = None
     factory, concurrency = AnthropicLLM, a.concurrency

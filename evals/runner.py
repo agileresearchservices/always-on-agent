@@ -25,16 +25,18 @@ from aoa.direct import DirectOps, handle_events
 from aoa.llm import LLM
 from aoa.loop import run_agent_loop
 from aoa.memory import MemoryStore
-from aoa.pr_review import build_task, parse_verdict
+from aoa.pr_review import REVIEW_READ_CHARS, build_task, parse_verdict
 from aoa.pricing import cost_usd
 from aoa.store import Store
 from aoa.testing import MemoryScheduler
+from aoa.tools import read_github
 
 from .cases import Case
 from .graders import Run, ToolCall
 
 REVIEW_CONV = "prreview/eval"
 REVIEW_CONV2 = "prreview/eval-2"
+INLINE_DIFF = True  # as in production: the PR is fetched once and put in the reviewer's first message (--paged turns it off)
 SECOND_PASS = False  # experiment (--second-pass): a second, independent reviewer pass over the same PR
 SECOND_PASS_FOCUS = (
     "This is a second, independent review. Skip surface and style issues. Hunt specifically for: "
@@ -129,7 +131,8 @@ REVIEW_PR = {"repo": "agileresearchservices/demo", "number": 7, "sha": "01234567
 
 async def _review(core: AgentCore, case: Case) -> dict[str, Any] | None:
     """The same reviewer the PrReviewWorkflow runs: a helper with build_task, in-process."""
-    await core.prepare_helper(REVIEW_CONV, build_task(REVIEW_PR))
+    material = await read_github("pr", REVIEW_PR["repo"], REVIEW_PR["number"], REVIEW_READ_CHARS) if INLINE_DIFF else ""
+    await core.prepare_helper(REVIEW_CONV, build_task(REVIEW_PR, material))
     res = await run_agent_loop(
         DirectOps(core, SESSION), conv=REVIEW_CONV, role="helper", depth=1, turn_key="h",
         max_steps=core.s.max_helper_steps, max_helper_depth=core.s.max_helper_depth, trigger_user=False,
@@ -137,7 +140,7 @@ async def _review(core: AgentCore, case: Case) -> dict[str, Any] | None:
     first = parse_verdict(res.text or "")
     if not SECOND_PASS or first is None:
         return first
-    task2 = build_task(REVIEW_PR).replace('Recommend "approve" only if', SECOND_PASS_FOCUS + 'Recommend "approve" only if')
+    task2 = build_task(REVIEW_PR, material).replace('Recommend "approve" only if', SECOND_PASS_FOCUS + 'Recommend "approve" only if')
     assert SECOND_PASS_FOCUS in task2
     await core.prepare_helper(REVIEW_CONV2, task2)
     res2 = await run_agent_loop(

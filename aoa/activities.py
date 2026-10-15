@@ -22,7 +22,10 @@ from .gh_reviewer import forget as forget_reviewer_token, reviewer_token
 from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
 from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RESOLVED_KEY, RETRYABLE, check_summary, decide, report_text
 from .pr_resolve import AUTO_MERGE_ON, ResolveError, Resolver, resolve_root, with_heartbeat
-from .pr_review import check_citations, diff_index, github_body, load_focus, parse_verdict, slack_text
+from .tools import read_github
+from .pr_review import (
+    REVIEW_READ_CHARS, check_citations, diff_index, github_body, load_focus, parse_verdict, slack_text,
+)
 
 
 class AgentActivities:
@@ -108,6 +111,16 @@ class AgentActivities:
             if focus := load_focus(self.s.data_dir, pr["repo"]):
                 pr["review_focus"] = focus
         return {"announced": len(prs), "review": review, "search_attrs": search_attrs.registered()}
+
+    @activity.defn(name="fetch_pr_for_review")
+    async def fetch_pr_for_review(self, a: dict[str, Any]) -> str:
+        """The PR (untrusted-wrapped, up to REVIEW_READ_CHARS) for the reviewer's first message. Empty on any
+        failure: the reviewer then reads the PR itself with the github_read tool, as it did before this existed."""
+        pr = a["pr"]
+        try:
+            return await read_github("pr", pr["repo"], pr["number"], REVIEW_READ_CHARS)
+        except Exception:  # noqa: BLE001 - the fallback path covers every failure
+            return ""
 
     @activity.defn(name="publish_pr_review")
     async def publish_pr_review(self, a: dict[str, Any]) -> dict[str, Any]:
@@ -349,7 +362,7 @@ class AgentActivities:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
             self.maybe_compact, self.digest_status, self.flush_digest, self.approvals_next, self.approvals_tick, self.sandbox_sleep, self.warm_cache, self.report_failure,
-            self.deliver_routine_event, self.poll_github, self.publish_pr_review,
+            self.deliver_routine_event, self.poll_github, self.fetch_pr_for_review, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
             self.merge_issue_states, self.merge_report, self.resolve_conflicts,
         ]
