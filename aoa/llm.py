@@ -92,7 +92,7 @@ class AnthropicLLM:
             cache_ttl_seconds = Settings.from_env().cache_ttl_seconds
         self.ttl = ttl_label(cache_ttl_seconds)
 
-    async def create(
+    def build_kwargs(
         self,
         *,
         model: str,
@@ -104,7 +104,8 @@ class AnthropicLLM:
         thinking: dict[str, Any] | None = None,
         effort: str | None = None,
         output_format: dict[str, Any] | None = None,
-    ) -> LLMResponse:
+    ) -> dict[str, Any]:
+        """The Messages API parameters for one call (also what a batch request carries)."""
         system, messages, tools = place_cache_breakpoints(system, messages, tools, self.ttl)
         kwargs: dict[str, Any] = dict(model=model, max_tokens=max_tokens, system=system, messages=messages)
         if tools:
@@ -121,6 +122,25 @@ class AnthropicLLM:
             out_cfg["format"] = {"type": "json_schema", "schema": output_format}
         if out_cfg:
             kwargs["output_config"] = out_cfg
+        return kwargs
+
+    async def create(
+        self,
+        *,
+        model: str,
+        system: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_tokens: int,
+        tool_choice: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        effort: str | None = None,
+        output_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        kwargs = self.build_kwargs(
+            model=model, system=system, messages=messages, tools=tools, max_tokens=max_tokens,
+            tool_choice=tool_choice, thinking=thinking, effort=effort, output_format=output_format)
+        out_cfg = dict(kwargs.get("output_config") or {})
         try:
             resp = await self.client.messages.create(**kwargs)
         except Exception as e:  # noqa: BLE001
@@ -135,21 +155,26 @@ class AnthropicLLM:
             else:
                 kwargs.pop("output_config", None)
             resp = await self.client.messages.create(**kwargs)
-        content: list[dict[str, Any]] = []
-        for b in resp.content:
-            if b.type == "text":
-                content.append({"type": "text", "text": b.text})
-            elif b.type == "tool_use":
-                content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
-            elif b.type == "thinking":  # kept verbatim: the API rejects a changed or reordered thinking block
-                content.append({"type": "thinking", "thinking": b.thinking, "signature": b.signature})
-            elif b.type == "redacted_thinking":
-                content.append({"type": "redacted_thinking", "data": b.data})
-        u = resp.usage
-        usage = {
-            "input_tokens": getattr(u, "input_tokens", 0) or 0,
-            "output_tokens": getattr(u, "output_tokens", 0) or 0,
-            "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
-            "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
-        }
-        return LLMResponse(content=content, stop_reason=resp.stop_reason or "end_turn", usage=usage, model=model)
+        return parse_message(resp, model)
+
+
+def parse_message(resp: Any, model: str) -> LLMResponse:
+    """An SDK Message -> the plain, JSON-able LLMResponse the rest of aoa uses."""
+    content: list[dict[str, Any]] = []
+    for b in resp.content:
+        if b.type == "text":
+            content.append({"type": "text", "text": b.text})
+        elif b.type == "tool_use":
+            content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+        elif b.type == "thinking":  # kept verbatim: the API rejects a changed or reordered thinking block
+            content.append({"type": "thinking", "thinking": b.thinking, "signature": b.signature})
+        elif b.type == "redacted_thinking":
+            content.append({"type": "redacted_thinking", "data": b.data})
+    u = resp.usage
+    usage = {
+        "input_tokens": getattr(u, "input_tokens", 0) or 0,
+        "output_tokens": getattr(u, "output_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
+        "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+    }
+    return LLMResponse(content=content, stop_reason=resp.stop_reason or "end_turn", usage=usage, model=model)

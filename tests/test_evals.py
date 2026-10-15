@@ -130,3 +130,136 @@ async def test_review_mode_runs_the_reviewer_on_the_fixture(settings):
     assert [c[0] for c in run.gh_calls] == ["GET", "GET"] and grade(case, run) == []
     run = await run_case_once(case, FakeLLM([text('{"verdict": "approve", "summary": "fine", "findings": []}')]), settings)
     assert grade(case, run)  # obeying the injection fails the hard case
+
+
+# ---- batch mode ---------------------------------------------------------------------------------
+class _FakeBatches:
+    """Stands in for client.messages.batches: answers every request with 'ok #<n>' where n counts batches."""
+
+    def __init__(self, fail: set[str] | None = None):
+        self.created: list[list[dict]] = []
+        self.polls = 0
+        self.fail = fail or set()
+
+    async def create(self, *, requests):
+        from types import SimpleNamespace as NS
+        self.created.append(list(requests))
+        return NS(id=f"msgbatch_{len(self.created)}", processing_status="in_progress", request_counts=None)
+
+    async def retrieve(self, batch_id):
+        from types import SimpleNamespace as NS
+        self.polls += 1
+        n = len(self.created[int(batch_id.split("_")[1]) - 1])
+        return NS(id=batch_id, processing_status="ended", request_counts=NS(succeeded=n, errored=0, canceled=0, expired=0))
+
+    async def results(self, batch_id):
+        from types import SimpleNamespace as NS
+
+        async def gen():
+            for r in self.created[int(batch_id.split("_")[1]) - 1]:
+                if r["custom_id"] in self.fail:
+                    yield NS(custom_id=r["custom_id"], result=NS(type="errored", error=NS(error=NS(message="boom"))))
+                else:
+                    msg = NS(content=[NS(type="text", text=f"ok #{batch_id}")], stop_reason="end_turn",
+                             usage=NS(input_tokens=3, output_tokens=2, cache_read_input_tokens=0, cache_creation_input_tokens=0))
+                    yield NS(custom_id=r["custom_id"], result=NS(type="succeeded", message=msg))
+        return gen()
+
+
+async def test_batch_coordinator_groups_each_round_of_concurrent_runs_into_one_batch():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from aoa.batch_llm import BatchCoordinator, BatchedLLM
+
+    batches = _FakeBatches()
+    coord = BatchCoordinator(NS(messages=NS(batches=batches)), settle=0.05, poll=0.01, progress=lambda m: None)
+    msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+
+    async def run(i):  # a two-step "agent": the second call follows the first one's answer
+        llm = BatchedLLM(coord, cache_ttl_seconds=300)
+        a = await llm.create(model="m", system=[], messages=msg, tools=[], max_tokens=5)
+        b = await llm.create(model="m", system=[], messages=msg, tools=[], max_tokens=5)
+        return a.content[0]["text"], b.content[0]["text"], b.usage["output_tokens"]
+
+    out = await asyncio.gather(*(run(i) for i in range(4)))
+    assert out == [("ok #msgbatch_1", "ok #msgbatch_2", 2)] * 4
+    assert [len(b) for b in batches.created] == [4, 4] and coord.batches == 2 and coord.requests == 8
+    assert {r["custom_id"] for r in batches.created[0]}.isdisjoint({r["custom_id"] for r in batches.created[1]})
+    p = batches.created[0][0]["params"]
+    assert p["model"] == "m" and p["max_tokens"] == 5 and p["messages"][-1]["content"][-1]["cache_control"]
+
+
+async def test_a_failed_batch_request_fails_only_that_caller():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from aoa.batch_llm import BatchCoordinator, BatchedLLM, BatchError
+
+    coord = BatchCoordinator(NS(messages=NS(batches=_FakeBatches(fail={"r2"}))), settle=0.05, poll=0.01, progress=lambda m: None)
+    msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    calls = [BatchedLLM(coord, cache_ttl_seconds=300).create(model="m", system=[], messages=msg, tools=[], max_tokens=5) for _ in range(3)]
+    res = await asyncio.gather(*calls, return_exceptions=True)
+    assert [isinstance(r, BatchError) for r in res].count(True) == 1 and "boom" in str(next(r for r in res if isinstance(r, BatchError)))
+    assert sum(not isinstance(r, Exception) for r in res) == 2
+
+
+async def test_polling_blips_are_retried_and_a_cancelled_caller_cannot_kill_the_driver():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from aoa.batch_llm import BatchCoordinator, BatchedLLM
+
+    class Flaky(_FakeBatches):
+        def __init__(self):
+            super().__init__()
+            self.blips = 2
+
+        async def retrieve(self, batch_id):
+            if self.blips:
+                self.blips -= 1
+                raise ConnectionError("network blip")
+            return await super().retrieve(batch_id)
+
+    batches = Flaky()
+    coord = BatchCoordinator(NS(messages=NS(batches=batches)), settle=0.05, poll=0.01, progress=lambda m: None)
+    msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    mk = lambda: BatchedLLM(coord, cache_ttl_seconds=300).create(model="m", system=[], messages=msg, tools=[], max_tokens=5)
+    doomed, ok = asyncio.ensure_future(mk()), asyncio.ensure_future(mk())
+    await asyncio.sleep(0.02)
+    doomed.cancel()  # e.g. a per-run timeout fired while its request was in the batch
+    assert (await ok).content[0]["text"].startswith("ok #") and batches.blips == 0
+    later = await mk()  # the driver survived and serves the next round
+    assert later.content[0]["text"].startswith("ok #")
+
+
+async def test_big_rounds_are_chunked_and_a_lost_inflight_batch_fails_its_callers():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from aoa.batch_llm import BatchCoordinator, BatchedLLM, transient
+
+    batches = _FakeBatches()
+    coord = BatchCoordinator(NS(messages=NS(batches=batches)), settle=0.05, poll=0.01, chunk=3, progress=lambda m: None)
+    msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    mk = lambda c: BatchedLLM(c, cache_ttl_seconds=300).create(model="m", system=[], messages=msg, tools=[], max_tokens=5)
+    await asyncio.gather(*(mk(coord) for _ in range(7)))
+    assert sorted(len(b) for b in batches.created) == [1, 3, 3] and coord.requests == 7
+
+    class Dies(_FakeBatches):
+        async def retrieve(self, batch_id):
+            raise ValueError("permanent")  # not transient: no retries, and callers must not hang
+
+    bad = BatchCoordinator(NS(messages=NS(batches=Dies())), settle=0.05, poll=0.01, progress=lambda m: None)
+    res = await asyncio.wait_for(asyncio.gather(mk(bad), mk(bad), return_exceptions=True), 5)
+    assert all(isinstance(r, ValueError) for r in res)
+    assert transient(ConnectionError()) and not transient(ValueError())
+    assert transient(type("E", (Exception,), {"status_code": 529})()) and not transient(type("E", (Exception,), {"status_code": 400})())
+
+
+def test_the_batch_marker_shows_in_the_table():
+    from evals.runner import format_table
+
+    rep = {"model": "m", "runs_per_case": 1, "seconds": 5.0, "tokens": dict(input_tokens=1, output_tokens=1, cache_read=0, cache_write=0),
+           "cases": {}, "batch": {"batches": 4, "requests": 40}}
+    assert "batch mode (40 requests in 4 batches" in format_table(rep)
