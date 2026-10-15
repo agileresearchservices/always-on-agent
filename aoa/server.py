@@ -204,6 +204,57 @@ async def decide_proposal(sid: str, pid: str, d: ProposalDecision) -> dict[str, 
         raise HTTPException(502, f"could not write the branch: {e}") from e
 
 
+@app.post("/sessions/{sid}/proposals/{pid}/fix", status_code=202, dependencies=[Depends(require_token)])
+async def draft_fix(sid: str, pid: str) -> dict[str, Any]:
+    """The person clicked [Draft fix] on an accepted eval case. Starts FixPrWorkflow (a coding session that may
+    open a PR; it never merges). One at a time per proposal; a finished attempt that opened no PR may be retried."""
+    if not re.fullmatch(r"prop-[0-9a-f]{8}", pid):
+        raise HTTPException(404, "no such proposal")
+    p = store.proposal_get(pid)
+    if p is None:
+        raise HTTPException(404, "no such proposal")
+    if p["status"] == "fix_opened":
+        raise HTTPException(409, f"a fix PR is already open: {p['info'].get('pr')}")
+    if p["status"] != "accepted":
+        raise HTTPException(409, f"the case is {p['status']}; accept it first")
+    if settings.fix_budget_usd <= 0 or settings.fix_per_day <= 0:
+        raise HTTPException(409, "fix PRs are off (AOA_FIX_BUDGET_USD or AOA_FIX_PER_DAY is 0)")
+    day_key = "fixcount:" + time.strftime("%Y-%m-%d", time.gmtime())
+    if store.kv_update("flywheel", day_key, lambda n: (n or 0) + 1, 0) > settings.fix_per_day:  # atomic: claim a slot first
+        store.kv_update("flywheel", day_key, lambda n: max(0, (n or 1) - 1), 0)
+        raise HTTPException(409, f"already drafted {settings.fix_per_day} fixes today (AOA_FIX_PER_DAY); try tomorrow")
+    try:
+        await app.state.client.start_workflow(
+            "FixPrWorkflow", {"session": sid, "id": pid}, id=f"fix-{pid}", task_queue=settings.task_queue,
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL, id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE)
+    except BaseException as e:
+        store.kv_update("flywheel", day_key, lambda n: max(0, (n or 1) - 1), 0)  # not started: give the slot back
+        if isinstance(e, WorkflowAlreadyStartedError):
+            raise HTTPException(409, "a fix for this case is already running") from e
+        raise
+    return {"status": "started"}
+
+
+class OpenFixRequest(BaseModel):
+    token: str = Field(max_length=16)  # names the attempt whose diff the person read; a stale button does nothing
+
+
+@app.post("/sessions/{sid}/proposals/{pid}/fix/open", status_code=202, dependencies=[Depends(require_token)])
+async def open_fix_pr(sid: str, pid: str, o: OpenFixRequest) -> dict[str, Any]:
+    """The person read the local fix and clicked [Run checks + open PR]: tell the waiting FixPrWorkflow (the signal
+    is ignored unless the token is that run's and the workflow is waiting)."""
+    p = store.proposal_get(pid) if re.fullmatch(r"prop-[0-9a-f]{8}", pid) else None
+    if p is None:
+        raise HTTPException(404, "no such proposal")
+    if p["status"] != "accepted":
+        raise HTTPException(409, f"the case is {p['status']}")
+    try:
+        await app.state.client.get_workflow_handle(f"fix-{pid}").signal("open_pr", o.token)
+    except RPCError as e:
+        raise HTTPException(409, "no fix is waiting to be opened for this case") from e
+    return {"status": "signalled"}
+
+
 @app.get("/sessions/{sid}/state", dependencies=[Depends(require_token)])
 async def state(sid: str) -> dict[str, Any]:
     from .delivery import session_workflow_id

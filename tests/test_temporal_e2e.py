@@ -340,3 +340,141 @@ async def test_eval_proposal_workflow_drafts_validates_and_posts_a_card(client, 
     assert len(cards) == 1 and cards[0]["payload"]["proposal_id"] == out["id"]
     assert "flywheel_e2e_case" in cards[0]["payload"]["text"]
     assert store.flags_list("proposed")[0]["reason"] == "approval_denied:apr-e2e"
+
+
+def _fix_fixtures(env, monkeypatch, open_results, verify=None):
+    from aoa import fix_pr
+    from evals.spec import validate_spec
+
+    spec = validate_spec({"name": "flywheel_e2e_fix", "description": "An e2e case for the fix flow.", "turns": [[{"from": "person", "text": "hi"}]],
+                          "graders": [{"type": "no_error"}], "origin": {"conv": "main", "reason": "r"}})
+    wt = env.data_dir / "fake-fix" / "wt"
+    wt.mkdir(parents=True, exist_ok=True)
+    (wt / ".git").write_text("gitdir: nowhere\n")  # fix_open_pr only checks that the worktree is still there
+    result = {"ok": True, "slug": "e2e-fix", "branch": "fix/e2e-fix", "worktree": str(wt), "tmp": str(wt.parent),
+              "before": {"passed": 0, "runs": 2}, "after": {"passed": 2, "runs": 2}, "files": ["aoa/store.py"], "guardrails": [],
+              "pytest": {"ok": True}, "suite": {"cases": 3, "hard_failures": [], "soft_misses": {}}}
+
+    async def fake_run_fix(spec_, pid, settings, author, **kw):
+        assert author.budget == env.fix_budget_usd
+        return result
+
+    async def fake_open_pr(res, spec_, pid, origin, **kw):
+        out = open_results.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    async def fake_verify(res, spec_, settings, **kw):  # the real-model checks, which need the API key
+        return verify(res) if verify else res | {"ok": True, "after": {"passed": 2, "runs": 2},
+                                                  "suite": {"cases": 3, "hard_failures": [], "soft_misses": {}}}
+
+    monkeypatch.setattr(fix_pr, "run_fix", fake_run_fix)
+    monkeypatch.setattr(fix_pr, "open_pr", fake_open_pr)
+    monkeypatch.setattr(fix_pr, "verify_fix", fake_verify)
+    return spec, fix_pr
+
+
+async def _wait_for(pred, timeout=20):
+    end = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < end:
+        if pred():
+            return
+        await asyncio.sleep(0.2)
+    raise AssertionError("condition not reached")
+
+
+async def test_fix_workflow_waits_for_the_click_then_opens_the_pr(client, env, monkeypatch):
+    """Draft: committed locally, reported as ready, NOTHING pushed. A failed push can be retried. [Open PR] opens it."""
+    from aoa.fix_pr import FixError
+
+    url = "https://github.com/agileresearchservices/always-on-agent/pull/99"
+    spec, _ = _fix_fixtures(env, monkeypatch, [FixError("push failed"), url])
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    store = Store(env.db_path)
+    pid = store.proposal_create("main", "r")
+    store.proposal_update(pid, "accepted", spec=spec, info={})
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), FakeLLM([]), TemporalScheduler(client, env))
+    kinds = lambda: [o["payload"] for o in store.outbox_since(sid) if o["kind"] == "eval_fix"]  # noqa: E731
+    async with await build_worker(env, client, core):
+        h = await client.start_workflow("FixPrWorkflow", {"session": sid, "id": pid}, id=f"fix-{sid}", task_queue=env.task_queue)
+        try:
+            await _run_fix_clicks(h, store, pid, kinds)
+        except BaseException:
+            await h.terminate("test failed")  # never leave a waiting workflow in the shared dev server
+            raise
+        out = await h.result()
+    assert out == {"ok": True, "stage": None, "pr": url}
+    assert "pull/99" in kinds()[2]["text"] and not kinds()[2]["ready"]
+    assert store.proposal_get(pid)["status"] == "fix_opened"
+
+
+async def _run_fix_clicks(h, store, pid, kinds):
+    await _wait_for(lambda: len(kinds()) == 1)
+    ready = kinds()[0]
+    assert ready["ready"] and "nothing is pushed" in ready["text"] and ready["token"]
+    assert store.proposal_get(pid)["status"] == "accepted"  # no PR yet
+    await h.signal("open_pr", "stale000")  # a button from an earlier attempt does nothing
+    await asyncio.sleep(1.0)
+    assert len(kinds()) == 1
+    await h.signal("open_pr", ready["token"])  # first real click: the push fails, the branch is kept, the button comes back
+    await _wait_for(lambda: len(kinds()) == 2)
+    assert kinds()[1]["ready"] and "push failed" in kinds()[1]["text"] and kinds()[1]["token"] == ready["token"]
+    await h.signal("open_pr", ready["token"])  # second click works
+
+
+async def test_fix_workflow_discards_when_nobody_opens_it(client, env, monkeypatch):
+    spec, _ = _fix_fixtures(env, monkeypatch, [])
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    store = Store(env.db_path)
+    pid = store.proposal_create("main", "r")
+    store.proposal_update(pid, "accepted", spec=spec, info={})
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), FakeLLM([]), TemporalScheduler(client, env))
+    async with await build_worker(env, client, core):
+        out = await client.execute_workflow("FixPrWorkflow", {"session": sid, "id": pid, "open_wait_seconds": 1},
+                                            id=f"fix-{sid}", task_queue=env.task_queue)
+    assert out["stage"] == "expired"
+    texts = [o["payload"]["text"] for o in store.outbox_since(sid) if o["kind"] == "eval_fix"]
+    assert len(texts) == 2 and "discarded" in texts[1]
+
+
+async def test_fix_workflow_reports_a_failed_attempt_without_a_pr(client, env, monkeypatch):
+    from aoa import fix_pr
+
+    async def crashes(*a, **k):
+        raise RuntimeError("eval run failed: boom")  # not a FixError: the workflow must still report
+
+    monkeypatch.setattr(fix_pr, "run_fix", crashes)
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    store = Store(env.db_path)
+    pid = store.proposal_create("main", "r")
+    store.proposal_update(pid, "accepted", spec={"name": "x"}, info={})
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), FakeLLM([]), TemporalScheduler(client, env))
+    async with await build_worker(env, client, core):
+        out = await client.execute_workflow("FixPrWorkflow", {"session": sid, "id": pid}, id=f"fix-{sid}", task_queue=env.task_queue)
+    assert out["ok"] is False and out["pr"] is None
+    msg = [o for o in store.outbox_since(sid) if o["kind"] == "eval_fix"][0]["payload"]
+    assert "No fix PR" in msg["text"] and "boom" in msg["text"] and msg["retry"] is True
+
+
+async def test_fix_workflow_a_failed_real_model_check_discards_and_offers_a_retry(client, env, monkeypatch):
+    spec, _ = _fix_fixtures(env, monkeypatch, [], verify=lambda res: res | {
+        "ok": False, "terminal": True, "stage": "after", "reason": "the case still fails (1/2 runs pass)"})
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    store = Store(env.db_path)
+    pid = store.proposal_create("main", "r")
+    store.proposal_update(pid, "accepted", spec=spec, info={})
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), FakeLLM([]), TemporalScheduler(client, env))
+    kinds = lambda: [o["payload"] for o in store.outbox_since(sid) if o["kind"] == "eval_fix"]  # noqa: E731
+    async with await build_worker(env, client, core):
+        h = await client.start_workflow("FixPrWorkflow", {"session": sid, "id": pid}, id=f"fix-{sid}", task_queue=env.task_queue)
+        try:
+            await _wait_for(lambda: len(kinds()) == 1)
+            await h.signal("open_pr", kinds()[0]["token"])
+            out = await h.result()
+        except BaseException:
+            await h.terminate("test failed")
+            raise
+    assert out == {"ok": False, "stage": "verify", "pr": None}
+    last = kinds()[-1]
+    assert "did not pass the real-model checks" in last["text"] and last["retry"] and not last["ready"]

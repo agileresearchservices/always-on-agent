@@ -1,4 +1,4 @@
-"""python -m evals [--runs N] [--case NAME ...] [--concurrency K] [--batch] [--spec FILE [--json]]   (needs ANTHROPIC_API_KEY; costs real tokens)
+"""python -m evals [--runs N] [--case NAME ...] [--concurrency K] [--batch] [--spec FILE] [--json]   (needs ANTHROPIC_API_KEY; costs real tokens)
 
 Cases tagged "slow" (the hard review set) run only when named with --case or selected with --tag review-hard (or slow);
 --tag review alone gives the quick seed review cases.
@@ -36,7 +36,7 @@ def main() -> int:
     ap.add_argument("--paged", action="store_true", help="review the old way: the reviewer fetches the PR itself and pages through the spilled diff (for comparison; production inlines it)")
     ap.add_argument("--second-pass", action="store_true", help="experiment: review each PR twice, the second pass hunting ordering/error-path/cross-file bugs")
     ap.add_argument("--spec", help="run the one case in this JSON spec file instead of the suite (used to validate a flywheel proposal)")
-    ap.add_argument("--json", action="store_true", help="print the report as JSON on stdout (with --spec)")
+    ap.add_argument("--json", action="store_true", help="print the report as JSON on stdout instead of the table")
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     if a.list:
@@ -76,7 +76,7 @@ def main() -> int:
     report = asyncio.run(run_suite(cases, a.runs, factory, concurrency))
     if coord is not None:
         report["batch"] = {"batches": coord.batches, "requests": coord.requests}
-    if a.spec and a.json:
+    if a.json:
         print(json.dumps({k: report[k] for k in ("model", "runs_per_case", "est_cost_usd", "cases")}))
         return 0
     print(format_table(report))

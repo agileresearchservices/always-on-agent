@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import secrets
 import time
+from pathlib import Path
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -384,6 +385,77 @@ class AgentActivities:
         self.core.store.outbox_push(a["session"], "eval_proposal", {"text": card_text(p), "proposal_id": p["id"]},
                                     client_key=f"evalprop:{p['id']}")
 
+    @activity.defn(name="fix_run")
+    async def fix_run(self, a: dict[str, Any]) -> dict[str, Any]:
+        """Draft and check a fix for an accepted eval case in a worktree (flywheel step 3). Returns the result; a
+        failed attempt is a normal result (ok False), not an exception."""
+        from .fix_pr import ClaudeCodeAuthor, FixError, run_fix
+
+        p = self.core.store.proposal_get(a["id"])
+        if p is None or p["status"] != "accepted" or not p["spec"]:
+            return {"ok": False, "stage": "setup", "reason": "that proposal is not an accepted eval case"}
+        if self.s.fix_budget_usd <= 0:
+            return {"ok": False, "stage": "setup", "reason": "fix PRs are off (AOA_FIX_BUDGET_USD=0)"}
+        try:
+            # heartbeat on a timer: the coding session alone can run for 40 minutes without a stage boundary
+            return await with_heartbeat(
+                run_fix(p["spec"], p["id"], self.s, ClaudeCodeAuthor(self.s.claude_bin, self.s.fix_budget_usd)), activity.heartbeat)
+        except FixError as e:
+            return {"ok": False, "stage": "setup", "reason": str(e)}
+        except Exception as e:  # noqa: BLE001 - the workflow must still report: a failed eval run is a result, not a crash
+            activity.logger.exception("fix_run crashed")
+            return {"ok": False, "stage": "error", "reason": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    @activity.defn(name="fix_open_pr")
+    async def fix_open_pr(self, a: dict[str, Any]) -> dict[str, Any]:
+        from .fix_pr import FixError, cleanup, open_pr, verify_fix
+
+        p = self.core.store.proposal_get(a["id"])
+        res = a["result"]
+        repo = Path(__file__).resolve().parent.parent
+        if p is None or not p["spec"]:
+            return {"ok": False, "terminal": True, "reason": "that proposal no longer exists"}
+        if not (Path(res["worktree"]) / ".git").exists():
+            return {"ok": False, "terminal": True, "reason": "the worktree is gone (the system cleaned its temp dir)"}
+        if not res.get("verified"):  # a retry after a failed push keeps the verified result: no second paid run
+            try:  # the person has read this diff: now it may run against the real model with the API key
+                res = await with_heartbeat(verify_fix(res, p["spec"], self.s), activity.heartbeat)
+            except Exception as e:  # noqa: BLE001 - an eval failure is a result; keep the fix so the click can be retried
+                activity.logger.exception("fix verification crashed")
+                return {"ok": False, "reason": f"the real-model checks could not run: {type(e).__name__}: {str(e)[:150]}"}
+            if not res["ok"]:
+                cleanup(repo, res["tmp"], res["branch"])
+                return {"ok": False, "terminal": True, "reason": res["reason"]}
+        try:
+            url = await open_pr(res, p["spec"], p["id"], p["spec"].get("origin", {}))
+        except (FixError, gh.GithubError, httpx.HTTPError) as e:
+            return {"ok": False, "reason": str(e)[:300], "verified": res}  # kept (and verified) so the click can be retried
+        cleanup(repo, res["tmp"])  # pushed: the worktree goes, the branch stays
+        self.core.store.proposal_update(p["id"], "fix_opened", info={**p["info"], "pr": url})
+        return {"ok": True, "url": url}
+
+    @activity.defn(name="fix_discard")
+    async def fix_discard(self, a: dict[str, Any]) -> None:
+        """Nobody opened the PR in time: remove the worktree and the unpushed fix branch."""
+        from .fix_pr import cleanup
+
+        res = a["result"]
+        cleanup(Path(__file__).resolve().parent.parent, res["tmp"], res["branch"])
+
+    @activity.defn(name="fix_report")
+    async def fix_report(self, a: dict[str, Any]) -> None:
+        from .fix_pr import ready_text, report_text
+
+        kind = a.get("phase", "final")
+        text = ready_text(a["id"], a["result"]) if kind == "ready" else (
+            a.get("note") or report_text(a["id"], a["result"], a.get("pr")))
+        self.core.store.outbox_push(
+            a["session"], "eval_fix",
+            {"text": text, "proposal_id": a["id"], "token": a.get("token"),
+             "ready": kind == "ready" or (a.get("pr") is not None and not a["pr"].get("ok") and not a["pr"].get("terminal")),
+             "retry": kind == "final" and ((a.get("pr") is None and not a["result"].get("ok")) or bool((a.get("pr") or {}).get("terminal")))},
+            client_key=f"evalfix:{a['id']}:{a['run_id']}:{a.get('seq', 0)}")
+
     def all(self) -> list:
         return [
             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
@@ -391,4 +463,5 @@ class AgentActivities:
             self.deliver_routine_event, self.poll_github, self.fetch_pr_for_review, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
             self.merge_issue_states, self.merge_report, self.resolve_conflicts, self.eval_draft, self.eval_post_card,
+            self.fix_run, self.fix_open_pr, self.fix_discard, self.fix_report,
         ]

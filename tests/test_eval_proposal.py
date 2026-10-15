@@ -167,7 +167,7 @@ async def test_run_proposal_without_an_api_key_is_unvalidated_but_still_proposed
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     out = await ep.run_proposal(core.store, settings, core.llm, _seed_flag(core.store), "main")
     assert out["status"] == "proposed"
-    assert "Validation: not run" in ep.card_text(core.store.proposal_get(out["id"]))
+    assert "NOT VALIDATED" in ep.card_text(core.store.proposal_get(out["id"]))
 
 
 async def test_run_proposal_declined_and_invalid_and_capped(make_core, settings, monkeypatch):
@@ -317,3 +317,90 @@ async def test_bridge_posts_the_decision_and_updates_the_card(tmp_path):
     await bridge.handle_interactive(payload)
     assert seen == [("/sessions/main/proposals/prop-1234abcd", b'{"accept":true}')]
     assert web.updated[0]["ts"] == "5.5" and "eval/x" in json.dumps(web.updated[0]["blocks"])
+
+
+async def test_a_failed_validation_run_still_shows_the_paid_draft_and_is_not_retried(make_core, settings, monkeypatch):
+    core, llm = make_core([text(draft_json())])
+    calls = []
+
+    async def boom(spec_, runs, **kw):
+        calls.append(1)
+        raise RuntimeError("eval run failed: rate limited")
+
+    monkeypatch.setattr(ep, "validate_on_agent", boom)
+    out = await ep.run_proposal(core.store, settings, core.llm, _seed_flag(core.store), "main")
+    assert out["status"] == "proposed" and len(calls) == 1 and len(llm.calls) == 1
+    card = ep.card_text(core.store.proposal_get(out["id"]))
+    assert "NOT VALIDATED" in card and "rate limited" in card
+
+
+async def test_a_retry_reuses_the_saved_draft_instead_of_drafting_again(make_core, settings, monkeypatch):
+    core, llm = make_core([text(draft_json())])
+    flag_ = _seed_flag(core.store)
+    pid = core.store.proposal_create(flag_["conv_id"], flag_["reason"])
+    core.store.proposal_update(pid, "drafting", spec=validate_spec(GOOD), info={"notes": "n"})  # drafted, then the activity died
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    out = await ep.run_proposal(core.store, settings, core.llm, flag_, "main")
+    assert out == {"id": pid, "status": "proposed"} and llm.calls == []
+
+
+def test_card_text_cannot_ping_or_link_from_trace_text():
+    p = {"id": "prop-1", "conv_id": "main", "reason": "r", "status": "proposed", "info": {},
+         "spec": validate_spec(spec(turns=[[{"from": "email", "text": "<!channel> click <https://evil.example|here> & more"}]]))}
+    card = ep.card_text(p)
+    assert "<!channel>" not in card and "<https://evil" not in card and "&lt;!channel&gt;" in card and "&amp; more" in card
+
+
+def test_accept_is_idempotent_and_leaves_no_stray_branch(make_core, tmp_path):
+    core, _ = make_core([])
+    repo, run = _repo(tmp_path)
+    spec_ = validate_spec(GOOD)
+    assert ep.write_accepted_branch(spec_, "p1", repo) == "eval/send-needs-card"
+    assert ep.write_accepted_branch(spec_, "p1", repo) == "eval/send-needs-card"  # same spec already there: done
+    other = validate_spec(spec(description="A different description of the same name."))
+    with pytest.raises(RuntimeError):
+        ep.write_accepted_branch(other, "p2", repo)  # a different case on that name is not overwritten
+    # a commit that fails leaves no branch behind
+    run("config", "user.useConfigOnly", "true"), run("config", "--unset", "user.email"), run("config", "--unset", "user.name")
+    fresh = validate_spec(spec(name="flywheel_other_case"))
+    import os
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(tmp_path)  # no global identity either
+    try:
+        with pytest.raises(RuntimeError):
+            ep.write_accepted_branch(fresh, "p3", repo)
+    finally:
+        os.environ["HOME"] = old_home or ""
+    assert "eval/other-case" not in subprocess.run(["git", "branch", "--list"], cwd=repo, capture_output=True, text=True).stdout
+
+
+async def test_run_evals_kills_the_child_when_cancelled(monkeypatch):
+    import asyncio
+
+    started = {}
+
+    class Proc:
+        returncode = None
+
+        async def communicate(self):
+            started["running"] = True
+            await asyncio.sleep(60)
+
+        def kill(self):
+            started["killed"] = True
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_exec(*a, **k):
+        return Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    task = asyncio.create_task(ep.run_evals(["--runs", "1"], key="k"))
+    while "running" not in started:
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert started.get("killed")

@@ -36,6 +36,7 @@ PREFIX = {
     "pr_review": ":mag: ",
     "pr_merge": "",
     "eval_proposal": ":test_tube: ",
+    "eval_fix": ":hammer_and_wrench: ",
 }
 TYPED_DECISION = re.compile(r"^\s*(approve|deny)\s+(apr-[0-9a-f]+)\s*$", re.IGNORECASE)
 
@@ -107,10 +108,57 @@ def parse_proposal_action(payload: dict[str, Any], cfg: BridgeConfig) -> tuple[s
     return None
 
 
-def proposal_blocks(text: str, pid: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+def parse_fix_action(payload: dict[str, Any], cfg: BridgeConfig) -> str | None:
+    """[Draft fix] click on an accepted eval-case card -> proposal id, only from the allowed user in our channel."""
+    if payload.get("type") != "block_actions" or (payload.get("user") or {}).get("id") != cfg.user:
+        return None
+    if (payload.get("channel") or {}).get("id") != cfg.channel:
+        return None
+    for act in payload.get("actions", []):
+        if act.get("action_id") == "aoa_case_fix" and act.get("value"):
+            return act["value"]
+    return None
+
+
+def parse_fix_open_action(payload: dict[str, Any], cfg: BridgeConfig) -> tuple[str, str] | None:
+    """[Run checks + open PR] click -> (proposal id, attempt token); the button value is "<proposal id>:<token>"."""
+    if payload.get("type") != "block_actions" or (payload.get("user") or {}).get("id") != cfg.user:
+        return None
+    if (payload.get("channel") or {}).get("id") != cfg.channel:
+        return None
+    for act in payload.get("actions", []):
+        if act.get("action_id") == "aoa_fix_open" and ":" in (act.get("value") or ""):
+            pid, token = act["value"].split(":", 1)
+            return pid, token
+    return None
+
+
+def open_pr_button(pid: str, token: str) -> dict[str, Any]:
+    return {"type": "actions", "block_id": f"aoa_fixopen_{pid}", "elements": [
+        {"type": "button", "action_id": "aoa_fix_open", "style": "primary", "value": f"{pid}:{token}",
+         "text": {"type": "plain_text", "text": "Run checks + open PR"},
+         "confirm": {"title": {"type": "plain_text", "text": "Have you read the diff?"},
+                     "text": {"type": "mrkdwn", "text": "Runs the fix against the real model with the API key (costs a little), then, only if it passes, pushes the branch and opens a PR. aoa will review it; merging stays your call."},
+                     "confirm": {"type": "plain_text", "text": "Run and open"}, "deny": {"type": "plain_text", "text": "Cancel"}}},
+    ]}
+
+
+def fix_button(pid: str) -> dict[str, Any]:
+    return {"type": "actions", "block_id": f"aoa_fix_{pid}", "elements": [
+        {"type": "button", "action_id": "aoa_case_fix", "value": pid, "text": {"type": "plain_text", "text": "Draft fix"},
+         "confirm": {"title": {"type": "plain_text", "text": "Draft a fix PR?"},
+                     "text": {"type": "mrkdwn", "text": "Runs a coding session (up to its dollar cap) and real-model eval runs, "
+                                                        "then opens a PR only if every check passes. It never merges."},
+                     "confirm": {"type": "plain_text", "text": "Draft fix"}, "deny": {"type": "plain_text", "text": "Cancel"}}},
+    ]}
+
+
+def proposal_blocks(text: str, pid: str | None = None, status: str | None = None, fix_for: str | None = None) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
     if status:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": status}]})
+    if fix_for:
+        blocks.append(fix_button(fix_for))
     if pid:
         blocks.append({"type": "actions", "block_id": f"aoa_{pid}", "elements": [
             {"type": "button", "action_id": "aoa_case_accept", "style": "primary", "value": pid,
@@ -151,6 +199,9 @@ def render_outbox_item(item: dict[str, Any]) -> tuple[str, list[dict[str, Any]] 
     """Outbox row -> (fallback text, Block Kit blocks or None)."""
     kind, p = item["kind"], item["payload"]
     text = PREFIX.get(kind, f"_{kind}_ ") + to_mrkdwn(str(p.get("text", "")))
+    if kind == "eval_fix" and p.get("proposal_id") and (p.get("ready") or p.get("retry")):
+        btn = open_pr_button(p["proposal_id"], p.get("token") or "") if p.get("ready") else fix_button(p["proposal_id"])
+        return text, [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}, btn]
     if kind == "eval_proposal" and p.get("proposal_id"):
         return text, proposal_blocks(text, p["proposal_id"])
     if kind == "pr_review" and p.get("merge_offer"):
@@ -183,7 +234,7 @@ class Bridge:
         self.cfg, self.web, self.http, self.cursor_path = cfg, web, http, cursor_path
         self._decided: set[str] = set()  # Slack can deliver one click twice; act on each approval once
         self._cards: dict[str, tuple[str, str]] = {}  # approval_id -> (message ts, text) of its posted card
-        self._deciding: set[str] = set()  # eval-case clicks in flight (Slack may deliver twice)
+        self._deciding: set[Any] = set()  # eval-case clicks in flight (Slack may deliver twice)
         self._merging: set[str] = set()  # merge offers clicked and not yet reported (Slack may deliver twice)
 
     # ---- Slack -> agent --------------------------------------------------------------
@@ -203,6 +254,16 @@ class Bridge:
         if offer is not None:
             msg = payload.get("message") or {}
             await self._merge(offer, msg.get("ts"), msg.get("text", ""))
+            return
+        opened = parse_fix_open_action(payload, self.cfg)
+        if opened is not None:
+            msg = payload.get("message") or {}
+            await self._open_fix(opened[0], opened[1], msg.get("ts"), msg.get("text", ""))
+            return
+        fix = parse_fix_action(payload, self.cfg)
+        if fix is not None:
+            msg = payload.get("message") or {}
+            await self._fix(fix, msg.get("ts"), msg.get("text", ""))
             return
         prop = parse_proposal_action(payload, self.cfg)
         if prop is not None:
@@ -270,12 +331,15 @@ class Bridge:
     async def _proposal(self, pid: str, accept: bool, ts: str | None, text: str) -> None:
         if pid in self._deciding:
             return
-        self._deciding.add(pid)
+        self._deciding.add(pid)  # kept after success: Slack can deliver one click twice
         try:
             r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}", json={"accept": accept})
-        finally:
+        except httpx.HTTPError:
             self._deciding.discard(pid)
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: could not reach the aoa server; click again._")
+            return
         if r.status_code >= 400:
+            self._deciding.discard(pid)
             self._check(r, "decide proposal")
             try:
                 detail = str(r.json().get("detail") or "")
@@ -288,9 +352,63 @@ class Bridge:
                   else ":no_entry: Rejected")
         if ts:
             try:
-                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text, blocks=proposal_blocks(text, None, status))
+                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text,
+                                           blocks=proposal_blocks(text, None, status, fix_for=pid if accept else None))
             except Exception:  # noqa: BLE001 - cosmetic only
                 log.warning("could not update eval-case card", exc_info=True)
+
+    async def _fix(self, pid: str, ts: str | None, text: str) -> None:
+        if ("fix", pid) in self._deciding:
+            return
+        self._deciding.add(("fix", pid))
+        try:
+            r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}/fix")
+        except httpx.HTTPError:
+            self._deciding.discard(("fix", pid))
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: could not reach the aoa server; click again._")
+            return
+        if r.status_code >= 400:
+            self._deciding.discard(("fix", pid))
+            self._check(r, "start fix")
+            try:
+                detail = str(r.json().get("detail") or "")
+            except ValueError:
+                detail = ""
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: {detail or r.status_code}_")
+            return
+        if ts:
+            try:  # take the button away while it runs; the result arrives as its own message
+                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text, blocks=proposal_blocks(
+                    text, None, ":hourglass_flowing_sand: Drafting a fix; the result will be posted here"))
+            except Exception:  # noqa: BLE001 - cosmetic only
+                log.warning("could not update eval-case card", exc_info=True)
+
+    async def _open_fix(self, pid: str, token: str, ts: str | None, text: str) -> None:
+        key = ("open", pid)
+        if key in self._deciding:
+            return
+        self._deciding.add(key)
+        try:
+            r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}/fix/open", json={"token": token})
+        except httpx.HTTPError:
+            self._deciding.discard(key)
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: could not reach the aoa server; click again._")
+            return
+        if r.status_code >= 400:
+            self._deciding.discard(key)
+            self._check(r, "open fix PR")
+            try:
+                detail = str(r.json().get("detail") or "")
+            except ValueError:
+                detail = ""
+            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: {detail or r.status_code}_")
+            return
+        if ts:
+            try:
+                await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text, blocks=proposal_blocks(
+                    text, None, ":hourglass_flowing_sand: Running the real-model checks, then opening the PR; the result will be posted here"))
+            except Exception:  # noqa: BLE001 - cosmetic only
+                log.warning("could not update fix card", exc_info=True)
 
     async def _merge_result(self, p: dict[str, Any]) -> None:
         """A merge finished: update the card it started from (button back only if a retry can help)."""
@@ -347,6 +465,9 @@ class Bridge:
                         self._cards[aid] = (ts, text)
                     if item["kind"] == "pr_merge":
                         await self._merge_result(item["payload"])
+                    if item["kind"] == "eval_fix":  # a result arrived: its buttons may be clicked again
+                        pid = item["payload"].get("proposal_id")
+                        self._deciding.discard(("fix", pid)), self._deciding.discard(("open", pid))
                     after = item["seq"]
                     self._save_cursor(after)  # after posting: a crash re-sends at most one item
             except httpx.HTTPError:
