@@ -1,0 +1,7 @@
+{
+ "pr": 31,
+ "commit": "9beb5fc192e66b1b6e92807cf4cd53055c54213f",
+ "base": "86ba67c43372ec688614cf594ca9d2c86d9c3f63",
+ "title": "Nudge pending approvals after 4h, expire after 24h",
+ "body": "Closes #30\n\n## Why\nA pending approval never changed state: a missed card was never re-raised, the model was told it \"will be told\", and a click days later still approved a stale action.\n\n## What\n- \\`approvals_next\\` / \\`approvals_tick\\` activities (core) and store helpers. \\`SessionWorkflow\\` arms one timer for the earliest nudge/expiry (alongside the digest timer), guarded by \\`workflow.patched(\"approval-expiry\")\\`.\n- Nudge once at \\`AOA_APPROVAL_NUDGE\\` (4h); expire at \\`AOA_APPROVAL_EXPIRE\\` (24h). Both notices go through the notifier as \\`alert\\` (wait out quiet hours, skip spacing), with idempotent client keys.\n- Tool: an expired approval returns \"lapsed, NOT done, ask again\". Server: a late click is 409 \"expired\". Slack bridge shows that message instead of \"already decided\".\n- README, CLAUDE.md, .env.example, session log.\n\n## Testing\n- Unit: nudge once, expiry, idempotent second tick, tool message, no late approval, 409 detail.\n- Temporal e2e: no click ever arrives; timers nudge then expire (2s / 5s settings).\n- Full suite 175 passed.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01D7THn8uqFBA6pPzkKZiTkZ"
+}

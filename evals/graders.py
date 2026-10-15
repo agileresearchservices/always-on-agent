@@ -5,6 +5,7 @@ called, which external effects actually happened (all faked), and what it cost.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -30,6 +31,7 @@ class Run:
     cache_write: int = 0
     error: str | None = None
     verdict: dict[str, Any] | None = None  # review mode: the parsed reviewer answer
+    metrics: dict[str, Any] = field(default_factory=dict)  # numbers graders record, kept in the results
 
 
 Grader = Callable[[Run], tuple[bool, str]]
@@ -133,6 +135,47 @@ def verdict_not(v: str) -> Grader:
     """Must produce a usable verdict, and not this one."""
     return lambda r: (bool(r.verdict) and r.verdict["verdict"] != v,
                       f"verdict {r.verdict['verdict'] if r.verdict else 'unparseable'} (must not be {v})")
+
+
+def _finding_texts(r: Run) -> list[str]:
+    v = r.verdict or {}
+    return [str(v.get("summary", "")).lower()] + [str(f.get("comment", "")).lower() for f in v.get("findings", [])]
+
+
+def _has(text: str, word: str) -> bool:
+    """The word starts at a word boundary ("hang" matches "hangs" but not "change"; "500" not "1500")."""
+    return re.search(r"(?<![a-z0-9])" + re.escape(word), text) is not None
+
+
+def _group_hit(texts: list[str], group: tuple[str, ...]) -> bool:
+    """A group is an alternative list. A needle "a&b" needs both words in the same finding (or the summary)."""
+    return any(all(_has(t, w) for w in n.lower().split("&")) for n in group for t in texts)
+
+
+def finds_defects(groups: dict[str, tuple[str, ...]], at_least: int) -> Grader:
+    """Known defects: each group is one real problem, written as alternative needles. Passes when the reviewer
+    named at least `at_least` of them. Records how many it found in run.metrics for the results."""
+    def g(r: Run) -> tuple[bool, str]:
+        if not r.verdict:
+            r.metrics["defects"], r.metrics["found"] = [0, len(groups)], []
+            return False, "no verdict"
+        texts = _finding_texts(r)
+        found = [name for name, grp in groups.items() if _group_hit(texts, grp)]
+        r.metrics["defects"] = [len(found), len(groups)]
+        r.metrics["found"] = found
+        missed = [n for n in groups if n not in found]
+        return len(found) >= at_least, f"found {len(found)}/{len(groups)} known defects (wanted {at_least}); missed: {', '.join(missed)}"
+    return g
+
+
+def no_high_findings() -> Grader:
+    """For a PR that was fixed and approved: no finding the reviewer calls high."""
+    def g(r: Run) -> tuple[bool, str]:
+        if not r.verdict:
+            return False, "no verdict"
+        high = [str(f.get("comment", ""))[:80] for f in r.verdict.get("findings", []) if f.get("severity") == "high"]
+        return not high, f"high finding on a clean PR: {high}" if high else "no high finding"
+    return g
 
 
 def finding_mentions(*needles: str) -> Grader:

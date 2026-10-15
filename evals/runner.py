@@ -33,6 +33,16 @@ from .cases import Case
 from .graders import Run, ToolCall
 
 REVIEW_CONV = "prreview/eval"
+REVIEW_CONV2 = "prreview/eval-2"
+SECOND_PASS = False  # experiment (--second-pass): a second, independent reviewer pass over the same PR
+SECOND_PASS_FOCUS = (
+    "This is a second, independent review. Skip surface and style issues. Hunt specifically for: "
+    "(a) state changed or recorded before an action that can fail or be retried, or the reverse order; "
+    "(b) error, timeout, cancellation and retry paths, including what is left hanging or never resolved; "
+    "(c) a value read, validated or defaulted in one place but used in another file; "
+    "(d) limits, sizes and counts that grow with the input; "
+    "(e) a check that guards one caller or branch but not its siblings. "
+    "Report each as a finding with the file and line from the diff, as medium unless it is clearly worse.\n\n")
 
 SESSION = "main"
 _current: contextvars.ContextVar[tuple[Run, Case] | None] = contextvars.ContextVar("eval_run", default=None)
@@ -67,13 +77,17 @@ def install_fakes() -> Callable[[], None]:
     return undo
 
 
-def _collect(core: AgentCore, run: Run, conv: str = SESSION) -> None:
+def _collect(core: AgentCore, run: Run, conv: str = SESSION, extra_convs: tuple[str, ...] = ()) -> None:
     run.outbox = [{"kind": o["kind"], "payload": o["payload"]} for o in core.store.outbox_since(SESSION)]
     run.routines = core.store.routine_list(SESSION)
     run.scheduled = dict(core.scheduler.items)
     run.digest = core.store.kv_get(SESSION, "digest", [])
-    u = core.store.usage_totals(conv)
-    run.output_tokens, run.input_tokens, run.cache_read, run.cache_write = u["output"], u["input"], u["cache_read"], u["cache_write"]
+    for c in (conv, *extra_convs):
+        u = core.store.usage_totals(c)
+        run.output_tokens += u["output"]
+        run.input_tokens += u["input"]
+        run.cache_read += u["cache_read"]
+        run.cache_write += u["cache_write"]
     for m in core.store.load_messages(conv):
         if m["role"] != "assistant":
             continue
@@ -102,7 +116,7 @@ async def run_case_once(case: Case, llm: LLM, base: Settings) -> Run:
                     await handle_events(core, SESSION, events)
             except Exception as e:  # noqa: BLE001 - a crashed run is a failed run, with the reason kept
                 run.error = f"{type(e).__name__}: {e}"
-            _collect(core, run, conv)
+            _collect(core, run, conv, (REVIEW_CONV2,) if SECOND_PASS and case.mode == "review" else ())
     finally:
         _current.reset(token)
     return run
@@ -119,7 +133,30 @@ async def _review(core: AgentCore, case: Case) -> dict[str, Any] | None:
         DirectOps(core, SESSION), conv=REVIEW_CONV, role="helper", depth=1, turn_key="h",
         max_steps=core.s.max_helper_steps, max_helper_depth=core.s.max_helper_depth, trigger_user=False,
     )
-    return parse_verdict(res.text or "")
+    first = parse_verdict(res.text or "")
+    if not SECOND_PASS or first is None:
+        return first
+    task2 = build_task(REVIEW_PR).replace('Recommend "approve" only if', SECOND_PASS_FOCUS + 'Recommend "approve" only if')
+    assert SECOND_PASS_FOCUS in task2
+    await core.prepare_helper(REVIEW_CONV2, task2)
+    res2 = await run_agent_loop(
+        DirectOps(core, SESSION), conv=REVIEW_CONV2, role="helper", depth=1, turn_key="h2",
+        max_steps=core.s.max_helper_steps, max_helper_depth=core.s.max_helper_depth, trigger_user=False,
+    )
+    second = parse_verdict(res2.text or "")
+    if second is None:
+        return first
+    findings = (first["findings"] + second["findings"])[:30]
+    return {**first, "findings": findings,
+            "verdict": "request_changes" if "request_changes" in (first["verdict"], second["verdict"]) else "approve",
+            "second_pass": len(second["findings"])}
+
+
+def _severities(run: Run) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for f in (run.verdict or {}).get("findings", []):
+        out[f["severity"]] = out.get(f["severity"], 0) + 1
+    return out
 
 
 def grade(case: Case, run: Run) -> list[str]:
@@ -147,7 +184,9 @@ async def run_suite(
                 "steps": run.steps, "output_tokens": run.output_tokens, "input_tokens": run.input_tokens,
                 "cache_read": run.cache_read, "cache_write": run.cache_write, "kinds": [o["kind"] for o in run.outbox],
                 "tools": [c.name for c in run.tool_calls],
-                "verdict": run.verdict["verdict"] if run.verdict else None}
+                "verdict": run.verdict["verdict"] if run.verdict else None, "metrics": run.metrics,
+                "severities": _severities(run), "summary": (run.verdict or {}).get("summary"),
+                "findings": (run.verdict or {}).get("findings")}
 
     t0 = time.time()
     try:
@@ -159,6 +198,11 @@ async def run_suite(
         rs = [r for r in results if r["case"] == c.name]
         by_case[c.name] = {"hard": c.hard, "passed": sum(r["passed"] for r in rs), "runs": len(rs),
                            "failures": sorted({f for r in rs for f in r["failures"]})}
+        found = [r["metrics"]["defects"] for r in rs if "defects" in r["metrics"]]
+        if found:
+            by_case[c.name]["defects"] = [sum(f[0] for f in found), sum(f[1] for f in found)]
+        if any("high" in r["severities"] for r in rs):
+            by_case[c.name]["high_findings"] = sum(r["severities"].get("high", 0) for r in rs)
     tot = {k: sum(r[k] for r in results) for k in ("input_tokens", "output_tokens", "cache_read", "cache_write")}
     return {"model": base.model, "runs_per_case": runs, "seconds": round(time.time() - t0, 1), "tokens": tot,
             "cases": by_case, "results": results}
@@ -172,7 +216,8 @@ def format_table(report: dict[str, Any]) -> str:
              f"tokens: {t['input_tokens']} in, {t['output_tokens']} out, {t['cache_read']} cache read, {t['cache_write']} cache write", ""]
     for name, c in report["cases"].items():
         mark = "ok  " if c["passed"] == c["runs"] else ("FAIL" if c["hard"] else "warn")
-        lines.append(f"{mark} {'hard' if c['hard'] else 'soft'} {c['passed']}/{c['runs']}  {name}")
+        extra = f"  [defects found {c['defects'][0]}/{c['defects'][1]}]" if "defects" in c else ""
+        lines.append(f"{mark} {'hard' if c['hard'] else 'soft'} {c['passed']}/{c['runs']}  {name}{extra}")
         for f in c["failures"]:
             lines.append(f"       - {f[:160]}")
     hard_bad = [n for n, c in report["cases"].items() if c["hard"] and c["passed"] != c["runs"]]

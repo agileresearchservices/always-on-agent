@@ -1,0 +1,593 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 038a410..dc7ce76 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -42,7 +42,7 @@ Things that are easy to break:
+ - **Tools run at most once** (`NO_RETRY` in `WorkflowOps.run_tool`); a failed tool is reported to the model as "effects unknown", never re-run. Model calls are retried. Keep new tool handlers consistent with this.
+ - **Prompt-cache stability** (`prompt.py`, `llm.place_cache_breakpoints`): the system prompt and tool block must be a fixed, ordered prefix; volatile context (time, scratchpad, recent log) goes into the new user message via `volatile_context_block`, not the system prompt. `core.llm_step` logs a warning on a cache miss within the TTL, which is treated as a bug. Compaction and `warm_cache` deliberately reuse the exact main-agent prefix via `_setup("main", 0)`.
+ - **Tools** (`tools.py`): core tools ship full schemas; deferred tools appear only by name in the prompt and are reached via `tool_search` / `call_deferred`. `spawn_helper` is declared in `tools.py` but executed by the loop, not a handler. Handlers raise `ToolError` with an actionable message for the model; results over `tool_result_max_chars` are spilled to a sandbox file by `core._cap`.
+-- **Trust**: external event text is rendered/wrapped as untrusted data (`events.render_event_text`, `safety.wrap_untrusted`); commands pass a denylist then a reviewer model that fails closed (`safety.py`); `external_send` goes through the approval flow; only user-started turns (`trigger_user`) may create routines. Merging a PR is never a model tool: only a Slack [Merge] click on an approved review card (an opaque offer id stored by `publish_pr_review`) starts `MergePrWorkflow`, which pins the reviewed commit. On conflicts it resolves them in a temp clone and pushes (`pr_resolve.py`; token only via `GIT_CONFIG_*` env, tests run with an allowlisted env), and the new commit needs its own review and click. Per-repo test command: `AOA_TEST_COMMANDS` > `.aoa/test-command` as it is on the base branch (never the PR's) > pytest in a fresh venv.
++- **Trust**: external event text is rendered/wrapped as untrusted data (`events.render_event_text`, `safety.wrap_untrusted`); commands pass a denylist then a reviewer model that fails closed (`safety.py`); `external_send` goes through the approval flow; only user-started turns (`trigger_user`) may create routines. Merging a PR is never a model tool: only a Slack [Merge] click on an approved review card (an opaque offer id stored by `publish_pr_review`) starts `MergePrWorkflow`, which pins the reviewed commit. On conflicts it resolves them in a temp clone and pushes (`pr_resolve.py`; token only via `GIT_CONFIG_*` env, tests run with an allowlisted env), and the new commit needs its own review and click. It refuses while GitHub auto-merge is on (checked before cloning and again before the push), never pushes a clean merge (`no_conflict`: GitHub's status was stale), and requires every line outside the conflict hunks to survive verbatim (`finish_resolution`). Failure `action`s in `pr_merge.RETRYABLE` bring the card's Merge button back; `needs_human`, `stale` and `tests_failed` do not. Per-repo test command: `AOA_TEST_COMMANDS` > `.aoa/test-command` as it is on the base branch (never the PR's) > pytest in a fresh venv.
+ - `notify.Notifier` decides whether outbound messages go now or are held in a digest (min interval, quiet hours); replies/questions/approvals/urgent always go.
+ - `sandbox.LocalSandbox` is not isolation (runs as your user in a directory); `memory.py` is file-based (profile, dated log, scratchpad, skills) under `<data_dir>/memory`.
+ 
+diff --git a/README.md b/README.md
+index 94a3343..20cead2 100644
+--- a/README.md
++++ b/README.md
+@@ -94,4 +94,4 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
+ - **Conflict resolution runs the repo's tests as your user.** After aoa resolves a PR's conflicts it runs the
+   repo's test command on this machine (allowlisted env, throwaway HOME, clone outside the data dir), which is
+   the repo's own code, as if you ran it. Only your own reviewed PRs get there, and the command comes from config
+-  or the base branch, never the PR. Run it in a container before using this on code you do not trust.
++  or the base branch, never the PR. Running it in a container is #21; until then, do not use this on code you do not trust.
+diff --git a/aoa/activities.py b/aoa/activities.py
+index 5dfdb5a..101df7b 100644
+--- a/aoa/activities.py
++++ b/aoa/activities.py
+@@ -2,9 +2,7 @@
+ from __future__ import annotations
+ 
+ import secrets
+-import tempfile
+ import uuid
+-from pathlib import Path
+ from typing import Any
+ from urllib.parse import quote
+ 
+@@ -19,7 +17,7 @@ from .events import Event
+ from . import github_monitor as gh
+ from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
+ from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RESOLVED_KEY, RETRYABLE, check_summary, decide, report_text
+-from .pr_resolve import Resolver, with_heartbeat
++from .pr_resolve import AUTO_MERGE_ON, ResolveError, Resolver, resolve_root, with_heartbeat
+ from .pr_review import github_body, parse_verdict, slack_text
+ 
+ 
+@@ -257,8 +255,17 @@ class AgentActivities:
+         if not a["same_repo"] or a["head_ref"] in a.get("protected_refs", []):
+             return {"status": "failed", "action": "needs_human",
+                     "reason": "the PR comes from a fork or its head is a base/default branch; resolve the conflicts by hand"}
+-        # outside the data dir: the tests are repo code, and nothing should sit next to .env or the store
+-        workdir = Path(tempfile.gettempdir()) / "aoa-resolve" / uuid.uuid4().hex[:12]
++
++        async def auto_merge_off() -> None:  # with auto-merge on, the push alone could merge a model-written commit
++            pr = (await gh.gh_call("GET", f"/repos/{repo}/pulls/{a['number']}")).json()
++            if pr.get("auto_merge"):
++                raise ResolveError(AUTO_MERGE_ON, "auto_merge")
++
++        try:
++            await auto_merge_off()
++        except ResolveError as e:
++            return {"status": "failed", "action": e.action, "reason": str(e)}
++        workdir = resolve_root() / uuid.uuid4().hex[:12]
+         mark = lambda sha, files: self.core.store.kv_set(  # noqa: E731
+             a["session"], f"{RESOLVED_KEY}{repo}#{a['number']}@{sha}", files)
+         r = Resolver(repo=repo, sha=a["sha"], head_ref=a["head_ref"], base_ref=a["base_ref"], workdir=workdir,
+@@ -266,7 +273,7 @@ class AgentActivities:
+                      llm=self.core.llm, model=self.s.helper_model, max_tokens=self.s.max_tokens,
+                      protected_refs=tuple(a.get("protected_refs", [])),
+                      on_usage=lambda m, u: self.core.store.usage_add(f"resolve/{repo}#{a['number']}", m, u),
+-                     on_commit=mark)
++                     on_commit=mark, before_push=auto_merge_off)
+         out = await with_heartbeat(r.run(), activity.heartbeat)
+         if out["status"] == "resolved":
+             mark(out["new_sha"], out["files"])  # also on a retry that found its earlier push
+diff --git a/aoa/github_monitor.py b/aoa/github_monitor.py
+index 170c323..70e19b5 100644
+--- a/aoa/github_monitor.py
++++ b/aoa/github_monitor.py
+@@ -41,9 +41,14 @@ def _clean(s: str, limit: int = 200) -> str:
+     return re.sub(r"\s+", " ", s or "").strip()[:limit]
+ 
+ 
+-def slack_safe(s: str) -> str:
+-    """Untrusted text going into a Slack message: no mentions, links or markup."""
+-    return re.sub(r"[<>&\[\]`*_~|]", "", s)
++def slack_safe(s: str, label: bool = False) -> str:
++    """Untrusted text going into a Slack message, escaped rather than stripped (titles keep their `_` and
++    `[...]`): & < > become entities (no mentions or links), a backtick becomes ' (it would end aoa's code
++    spans), and `](` is split so `to_mrkdwn` cannot turn it into a masked link. In a link label
++    (label=True) brackets become parentheses, since a ] would end the label. Slack has no escape for
++    * _ ~ and only formats them at word boundaries, so they stay: cosmetic at worst."""
++    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "'")
++    return s.replace("[", "(").replace("]", ")") if label else s.replace("](", "] (")
+ 
+ 
+ def _headers(token: str, accept: str = "application/vnd.github+json") -> dict[str, str]:
+@@ -131,7 +136,7 @@ def notice_text(prs: list[dict[str, Any]]) -> str:
+     lines = [f"*{n} PR{'s' if n != 1 else ''} ready for review*"]
+     for pr in prs[:MAX_LISTED]:
+         tail = " (new commits)" if pr["why"] == "new commits" else ""
+-        lines.append(f"• [{slack_safe(pr['repo'])}#{pr['number']} {slack_safe(pr['title'])}]({pr['url']}) "
++        lines.append(f"• [{slack_safe(pr['repo'], True)}#{pr['number']} {slack_safe(pr['title'], True)}]({pr['url']}) "
+                      f"by {slack_safe(pr['author'])}{tail}")
+     if n > MAX_LISTED:
+         lines.append(f"…and {n - MAX_LISTED} more")
+diff --git a/aoa/pr_merge.py b/aoa/pr_merge.py
+index a9c9afe..0ec7c2c 100644
+--- a/aoa/pr_merge.py
++++ b/aoa/pr_merge.py
+@@ -17,7 +17,8 @@ RESOLVED_KEY = "aoa-resolved:"  # kv: aoa-resolved:<repo>#<n>@<sha> -> files aoa
+ 
+ FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+ # outcomes after which clicking Merge again on the same card can succeed (same commit, state may change)
+-RETRYABLE = {"checks_failed", "waited_too_long", "blocked", "draft", "error", "refused", "resolve_failed"}  # not needs_human / stale
++RETRYABLE = {"checks_failed", "waited_too_long", "blocked", "draft", "error", "refused", "resolve_failed",
++             "no_conflict", "auto_merge"}  # not needs_human / stale / tests_failed: the same click fails the same way
+ 
+ 
+ def check_summary(status: dict[str, Any], check_runs: dict[str, Any]) -> tuple[list[str], list[str]]:
+@@ -74,7 +75,8 @@ def decide(pr: dict[str, Any], sha: str, failing: list[str], pending: list[str])
+ 
+ 
+ def offer_head(offer: dict[str, Any]) -> str:
+-    return f"[{slack_safe(offer['repo'])}#{offer['number']} {slack_safe(offer.get('title', ''))}]({offer['url']})"
++    return (f"[{slack_safe(offer['repo'], True)}#{offer['number']} {slack_safe(offer.get('title', ''), True)}]"
++            f"({offer['url']})")
+ 
+ 
+ def report_text(offer: dict[str, Any], out: dict[str, Any]) -> str:
+@@ -106,11 +108,16 @@ def report_text(offer: dict[str, Any], out: dict[str, Any]) -> str:
+                  f"Files: {files}"]
+         for f, s in list((out.get("summaries") or {}).items())[:10]:
+             lines.append(f"• `{slack_safe(f)}`: {slack_safe(s)}")
+-        lines.append(f"Tests: {slack_safe(out.get('tests', 'unknown'))}")
++        cmd = f" (`{slack_safe(out['test_cmd'])}`)" if out.get("test_cmd") else ""
++        lines.append(f"Tests: {slack_safe(out.get('tests', 'unknown'))}{cmd}")
+         lines.append("The new commit will be reviewed again; merge it from the new card.")
+         return "\n".join(lines)
+     if status == "updated":
+         return (f":arrows_counterclockwise: {head} was behind its base, so I updated the branch. The new commit "
+                 "will be reviewed again and get its own Merge button.")
+-    again = " Click Merge on the card to try again." if out.get("action") in RETRYABLE else ""
++    again = {"tests_failed": " Fix the tests on the branch (or resolve the conflicts by hand); the new commit gets "
++                             "its own review.",
++             "needs_human": " Resolve it by hand; the new commit gets its own review."}.get(out.get("action"), "")
++    if out.get("action") in RETRYABLE:
++        again = " Click Merge on the card to try again."
+     return f":no_entry: *Not merged* {head}: {slack_safe(out.get('reason', 'unknown error'))}.{again}"
+diff --git a/aoa/pr_resolve.py b/aoa/pr_resolve.py
+index 257eb45..33695bf 100644
+--- a/aoa/pr_resolve.py
++++ b/aoa/pr_resolve.py
+@@ -2,7 +2,8 @@
+ 
+ Started only from a human [Merge] click that found conflicts. In a throwaway clone: check out the exact
+ reviewed commit, merge the base into it, have a model resolve each conflicted file (validated), commit, run
+-the repo's tests, and push to the PR branch without force. The new commit is then reviewed again and gets
++the repo's tests, and push to the PR branch without force (never while GitHub auto-merge is on: the push
++alone would merge). The new commit is then reviewed again and gets
+ its own Merge button, so no AI-written resolution reaches the base branch without a second human click.
+ 
+ Secrets: the GitHub token reaches git only through GIT_CONFIG_* environment variables (never argv, the
+@@ -19,15 +20,21 @@ import json
+ import os
+ import re
+ import shutil
++import tempfile
++import time
+ from pathlib import Path
+ from typing import Any, Awaitable, Callable
+ 
+ MAX_FILES = 10
+ MAX_FILE_BYTES = 40_000
+-TEST_TIMEOUT = 600
++TEST_TIMEOUT = 1200  # AOA_RESOLVE_TEST_TIMEOUT overrides; the activity's start-to-close is 30 min
+ GIT_TIMEOUT = 300
++TIMED_OUT = -1000  # _run's exit code for "killed at the timeout" (a real SIGKILL is -9)
++STALE_WORKDIR_SECONDS = 3600
+ MARKER = re.compile(r"^(<{7}|>{7})(\s|$)", re.MULTILINE)  # a lone ======= is a legit RST/Markdown underline
+ COMMIT_TAG = "conflicts resolved by aoa"
++AUTO_MERGE_ON = ("auto-merge is on for this PR, so pushing a resolution could merge it without a second click; "
++                 "turn auto-merge off first")
+ BOT_EMAIL = "aoa-agent@users.noreply.github.com"
+ BOT = ["-c", "user.name=aoa agent", "-c", f"user.email={BOT_EMAIL}"]
+ REPO_TEST_FILE = ".aoa/test-command"
+@@ -116,21 +123,98 @@ async def _run_bytes(args: list[str], cwd: Path, env: dict[str, str], timeout: f
+             pass
+         if isinstance(e, asyncio.CancelledError):
+             raise
+-        return -9, f"timed out after {timeout:.0f}s".encode()
++        return TIMED_OUT, f"timed out after {timeout:.0f}s".encode()
+     return p.returncode or 0, out
+ 
+ 
++def resolve_root() -> Path:
++    """Where work dirs live: outside the data dir (the tests are repo code; nothing should sit next to .env
++    or the store). One function for creating and cleaning, so both agree on TMPDIR."""
++    return Path(tempfile.gettempdir()) / "aoa-resolve"
++
++
++def clean_stale_workdirs(max_age: float = STALE_WORKDIR_SECONDS) -> int:
++    """Remove work dirs a killed worker left behind (a live attempt is never older than its 30 min timeout)."""
++    removed, cutoff = 0, time.time() - max_age
++    root = resolve_root()
++    for d in root.iterdir() if root.is_dir() else []:
++        try:
++            if d.is_dir() and not d.is_symlink() and d.stat().st_mtime < cutoff:
++                shutil.rmtree(d, ignore_errors=True)
++                removed += 1
++        except OSError:
++            pass
++    return removed
++
++
++def _is_marker(line: str, ch: str) -> bool:
++    return re.match(rf"{re.escape(ch)}{{7}}(\s|$)", line) is not None
++
++
++def conflict_context(conflicted: str) -> list[str]:
++    """The text outside the conflict hunks, as chunks in file order. `=======` only counts as a separator
++    inside a hunk (outside it is a legit RST/Markdown underline)."""
++    chunks, cur, state = [], [], "out"
++    for line in conflicted.splitlines(keepends=True):
++        if state == "out":
++            if _is_marker(line, "<"):
++                chunks.append("".join(cur))
++                cur, state = [], "ours"
++            else:
++                cur.append(line)
++        elif state == "ours" and _is_marker(line, "|"):
++            state = "base"
++        elif state in ("ours", "base") and line.rstrip("\r\n") == "=======":
++            state = "theirs"
++        elif state == "theirs" and _is_marker(line, ">"):
++            state = "out"
++    chunks.append("".join(cur))
++    return [c for c in chunks if c]
++
++
++def _lf(s: str) -> str:
++    return s.replace("\r\n", "\n")
++
++
++def _crlf(s: str) -> bool:
++    return "\r\n" in s and s.count("\r\n") == s.count("\n")
++
++
++def finish_resolution(content: str, texts: dict[str, str]) -> str:
++    """Check a model's resolution against the conflicted file and match the file's conventions.
++
++    Everything outside the conflict hunks must survive verbatim and in order (the model is told not to touch
++    it). Line endings follow the two sides (CRLF if both use it), and so does the trailing newline."""
++    lf = _lf(content)
++    ours, theirs = texts["ours"], texts["theirs"]
++    if ours.endswith("\n") and theirs.endswith("\n") and not lf.endswith("\n"):
++        lf += "\n"
++    elif not ours.endswith("\n") and not theirs.endswith("\n") and lf.endswith("\n"):
++        lf = lf[:-1]
++    pos = 0
++    for chunk in conflict_context(texts["conflicted"]):
++        i = lf.find(_lf(chunk), pos)
++        if i < 0:
++            first = _lf(chunk).strip().splitlines()[:1]
++            raise ResolveError("the resolution changed text outside the conflicting regions"
++                               + (f" (near {first[0][:60]!r})" if first else ""))
++        pos = i + len(_lf(chunk))
++    return lf.replace("\n", "\r\n") if _crlf(ours) and _crlf(theirs) else lf
++
++
+ class Resolver:
+     """One resolution attempt in its own work directory (deleted afterwards)."""
+ 
+     def __init__(self, *, repo: str, sha: str, head_ref: str, base_ref: str, workdir: Path, remote_url: str,
+                  token: str | None, llm: Any, model: str, max_tokens: int, protected_refs: tuple[str, ...] = (),
+                  on_usage: Callable[[str, dict[str, int]], None] = lambda m, u: None,
+-                 on_commit: Callable[[str, list[str]], None] = lambda sha, files: None):
++                 on_commit: Callable[[str, list[str]], None] = lambda sha, files: None,
++                 before_push: Callable[[], Awaitable[None]] | None = None):
+         self.repo, self.sha, self.head_ref, self.base_ref = repo, sha, head_ref, base_ref
+         self.dir, self.remote_url, self.genv = workdir / "clone", remote_url, git_env(token, workdir / "home")
+         self.workdir, self.llm, self.model, self.max_tokens, self.on_usage = workdir, llm, model, max_tokens, on_usage
+-        self.on_commit = on_commit
++        self.on_commit, self.before_push = on_commit, before_push  # before_push raises ResolveError to stop
++        self.test_cmd = ""
+         self.protected_refs = {base_ref, *protected_refs}
+ 
+     async def git(self, *args: str, check: bool = True) -> str:
+@@ -172,6 +256,9 @@ class Resolver:
+         files = list(unmerged)
+         if code != 0 and not files:
+             raise ResolveError(f"git merge failed: {out.strip()[-300:]}")
++        if not files:  # a clean merge, or the branch already has the base: GitHub's "dirty" was out of date
++            raise ResolveError("GitHub reported conflicts, but git merges the base cleanly, so GitHub's status "
++                               "was probably out of date; nothing was pushed", "no_conflict")
+         if len(files) > MAX_FILES:
+             raise ResolveError(f"{len(files)} conflicted files; more than {MAX_FILES} needs a human", "needs_human")
+         summaries = {}
+@@ -179,11 +266,12 @@ class Resolver:
+             summaries[f] = await self._resolve_file(f, unmerged[f])
+         if await self._unmerged():
+             raise ResolveError("conflicts remain after resolving")
+-        resolved = ", ".join(files) or "none"
+         await self.git(*BOT, "commit", "-q", "-m",
+-                       f"Merge {self.base_ref} into {self.head_ref}: {COMMIT_TAG}\n\nResolved files: {resolved}")
++                       f"Merge {self.base_ref} into {self.head_ref}: {COMMIT_TAG}\n\nResolved files: {', '.join(files)}")
+         new_sha = (await self.git("rev-parse", "HEAD")).strip()
+         tests, tail = await self._tests()
++        if self.before_push is not None:  # e.g. auto-merge was switched on meanwhile: the push alone could merge
++            await self.before_push()
+         self.on_commit(new_sha, files)  # before the push, so the poll can never see the commit unmarked
+         push_code, push_out = await _run(["git", "push", "-q", "origin", f"{new_sha}:refs/heads/{self.head_ref}"],
+                                          self.dir, self.genv, GIT_TIMEOUT)
+@@ -192,7 +280,7 @@ class Resolver:
+                 raise ResolveError("the PR branch moved while resolving; nothing was pushed", "stale")
+             raise ResolveError(f"push failed: {push_out.strip()[-300:]}")
+         return {"status": "resolved", "new_sha": new_sha, "files": files, "summaries": summaries,
+-                "tests": tests, "test_tail": tail}
++                "tests": tests, "test_cmd": self.test_cmd[:120], "test_tail": tail}
+ 
+     async def _unmerged(self) -> dict[str, dict[int, str]]:
+         """Unmerged paths -> {stage: file mode}, NUL-separated so odd file names survive."""
+@@ -215,8 +303,9 @@ class Resolver:
+             raise ResolveError(f"{path}: a side added, deleted or renamed it; that needs a human", "needs_human")
+         if any(m not in ("100644", "100755") for m in modes.values()):
+             raise ResolveError(f"{path} is a symlink or submodule; that needs a human", "needs_human")
+-        target = (self.dir / path).resolve()
+-        if not target.is_relative_to(self.dir.resolve()) or target.is_symlink() or not target.is_file():
++        target = (self.dir / path).resolve()  # resolve() follows links, so test the path itself for one
++        if ((self.dir / path).is_symlink() or not target.is_relative_to(self.dir.resolve())
++                or not target.is_file()):
+             raise ResolveError(f"{path} is not a regular file in the clone; that needs a human", "needs_human")
+         blobs = {}
+         for n, name in ((1, "base"), (2, "ours"), (3, "theirs")):
+@@ -237,8 +326,9 @@ class Resolver:
+         prompt = (f"Repository {self.repo}; pull request branch {self.head_ref} merging in {self.base_ref}.\n"
+                   f"File: {path}\n\n" + "".join(f"<{k}>\n{v}\n</{k}>\n\n" for k, v in texts.items()))
+         resp = await self._call_model(prompt)
+-        if resp.stop_reason == "max_tokens":
+-            raise ResolveError(f"{path}: the model's answer was cut off")
++        if resp.stop_reason == "max_tokens":  # trying again will not help: this file is too big for one answer
++            raise ResolveError(f"{path}: the model's answer was cut off at the output limit; resolve it by hand",
++                               "needs_human")
+         call = next((b for b in resp.content if b["type"] == "tool_use" and b["name"] == "submit_resolution"), None)
+         content = (call or {}).get("input", {}).get("content")
+         if not isinstance(content, str):
+@@ -247,6 +337,10 @@ class Resolver:
+             raise ResolveError(f"{path}: the resolution still has conflict markers")
+         if len(content.strip()) < 0.5 * min(len(texts["ours"].strip()), len(texts["theirs"].strip())):
+             raise ResolveError(f"{path}: the resolution is much shorter than either side, so it was not trusted")
++        try:
++            content = finish_resolution(content, texts)
++        except ResolveError as e:
++            raise ResolveError(f"{path}: {e}") from None
+         target.write_bytes(content.encode("utf-8"))
+         await self.git("add", "--", path)
+         return str(call["input"].get("summary", ""))[:300]
+@@ -265,7 +359,7 @@ class Resolver:
+                 return resp
+             except Exception as e:  # noqa: BLE001 - provider hiccup (5xx/529): a few tries, then give up
+                 status = getattr(e, "status_code", None)
+-                if isinstance(status, int) and 400 <= status < 500 and status != 429:
++                if isinstance(status, int) and 400 <= status < 500 and status not in (408, 409, 429):
+                     raise ResolveError(f"the model API refused the request ({status}): {str(e)[:200]}") from None
+                 if attempt == 3:
+                     raise ResolveError(f"the model call kept failing: {str(e)[:200]}") from None
+@@ -276,13 +370,18 @@ class Resolver:
+         cmd = repo_test_command(self.repo, self.dir, base_file if code == 0 else None)
+         if not cmd:
+             return "none (no test command for this repo)", ""
++        self.test_cmd = cmd
+         home = self.workdir / "home"
+         home.mkdir(exist_ok=True)
+-        code, out = await _run([cmd], self.dir, safe_env() | {"HOME": str(home)}, TEST_TIMEOUT, shell=True)
++        timeout = float(os.environ.get("AOA_RESOLVE_TEST_TIMEOUT") or TEST_TIMEOUT)
++        code, out = await _run([cmd], self.dir, safe_env() | {"HOME": str(home)}, timeout, shell=True)
+         tail = out.strip()[-1200:]
+-        if code != 0:
+-            raise ResolveError(f"tests failed after resolving, so nothing was pushed. Last output: {tail[-500:]}")
+-        return f"passed (`{cmd[:120]}`)", tail[-300:]
++        if code == TIMED_OUT:  # maybe a cold install: worth another click (or a bigger AOA_RESOLVE_TEST_TIMEOUT)
++            raise ResolveError(f"the tests timed out after {timeout:.0f}s, so nothing was pushed")
++        if code != 0:  # the same resolution would fail the same way: fix the branch or resolve by hand
++            raise ResolveError(f"tests failed after resolving, so nothing was pushed. Last output: {tail[-500:]}",
++                               "tests_failed")
++        return "passed", tail[-300:]
+ 
+ 
+ async def with_heartbeat(coro: Awaitable[Any], beat: Callable[[], None], every: float = 30) -> Any:
+diff --git a/aoa/pr_review.py b/aoa/pr_review.py
+index 45b13be..1e029c5 100644
+--- a/aoa/pr_review.py
++++ b/aoa/pr_review.py
+@@ -110,7 +110,7 @@ def github_body(v: dict[str, Any]) -> str:
+ def slack_text(v: dict[str, Any] | None, pr: dict[str, Any], posted: bool, note: str = "") -> str:
+     from .github_monitor import slack_safe
+ 
+-    head = f"[{slack_safe(pr['repo'])}#{pr['number']} {slack_safe(pr['title'])}]({pr['url']})"
++    head = f"[{slack_safe(pr['repo'], True)}#{pr['number']} {slack_safe(pr['title'], True)}]({pr['url']})"
+     if v is None:
+         return f"Review failed for {head}: the reviewer did not return a usable verdict. Nothing was posted. {note}".strip()
+     icon = ":white_check_mark:" if v["verdict"] == "approve" else ":x:"
+diff --git a/aoa/worker.py b/aoa/worker.py
+index 14df911..e442b94 100644
+--- a/aoa/worker.py
++++ b/aoa/worker.py
+@@ -13,6 +13,7 @@ from .config import Settings
+ from .core import AgentCore
+ from .llm import AnthropicLLM
+ from .memory import MemoryStore
++from .pr_resolve import clean_stale_workdirs
+ from .scheduling import TemporalScheduler, ensure_github_schedule
+ from .store import Store
+ from .workflows import (
+@@ -38,6 +39,8 @@ async def build_worker(settings: Settings, client: Client, core: AgentCore | Non
+ 
+ async def main() -> None:
+     logging.basicConfig(level=logging.INFO)
++    if n := clean_stale_workdirs():
++        logging.info("removed %d stale conflict-resolution work dir(s)", n)
+     settings = Settings.from_env()
+     client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
+     worker = await build_worker(settings, client)
+diff --git a/tests/test_github_monitor.py b/tests/test_github_monitor.py
+index f51ea59..5a74a9e 100644
+--- a/tests/test_github_monitor.py
++++ b/tests/test_github_monitor.py
+@@ -99,9 +99,19 @@ async def test_old_list_state_is_ignored_not_crashing(gh, tmp_path):
+ 
+ 
+ def test_titles_cannot_ping_or_inject_markup():
+-    assert slack_safe("<!channel> [click](http://evil) *bold* `x`") == "!channel click(http://evil) bold x"
+-    pr = {"repo": f"{USER}/demo", "number": 3, "title": slack_safe("<!channel> hi"), "author": "o", "url": "https://github.com/x/pull/3", "why": "new"}
+-    assert "<!channel>" not in notice_text([pr])
++    from aoa.slack_bridge import to_mrkdwn
++    # escaped, not stripped: no mention, no masked link, no broken code span
++    assert slack_safe("<!channel> [click](http://evil) `x`") == "&lt;!channel&gt; [click] (http://evil) 'x'"
++    assert "<http://evil|" not in to_mrkdwn(slack_safe("[click](http://evil)"))
++    for s, want in (("tool_choice", "tool_choice"), ("a & b", "a &amp; b"), ("<!here>", "&lt;!here&gt;"),
++                    ('pip install -e ".[dev]"', 'pip install -e ".[dev]"')):
++        assert slack_safe(s) == want
++    assert slack_safe("[WIP] x] y", label=True) == "(WIP) x) y"
++    pr = {"repo": f"{USER}/demo", "number": 3, "title": "<!channel> [WIP] fix tool_choice", "author": "o",
++          "url": "https://github.com/x/pull/3", "why": "new"}
++    out = to_mrkdwn(notice_text([pr]))
++    assert "<!channel>" not in out and "&lt;!channel&gt;" in out
++    assert "<https://github.com/x/pull/3|" in out and "(WIP) fix tool_choice>" in out  # the link survives
+ 
+ 
+ async def test_bad_token_is_a_clear_error(gh, tmp_path):
+diff --git a/tests/test_pr_merge.py b/tests/test_pr_merge.py
+index c8fc42e..bc2a38c 100644
+--- a/tests/test_pr_merge.py
++++ b/tests/test_pr_merge.py
+@@ -73,14 +73,19 @@ def test_report_merged_without_linked_issue_warns():
+ def test_report_failure_offers_retry_only_when_it_can_help():
+     assert "try again" in report_text(OFFER, {"status": "failed", "action": "checks_failed", "reason": "failing checks: x"})
+     assert "try again" not in report_text(OFFER, {"status": "failed", "action": "stale", "reason": "new commits"})
++    for action in ("no_conflict", "auto_merge", "resolve_failed"):
++        assert "try again" in report_text(OFFER, {"status": "failed", "action": action, "reason": "r"})
++    t = report_text(OFFER, {"status": "failed", "action": "tests_failed", "reason": "tests failed"})
++    assert "try again" not in t and "Fix the tests" in t
+ 
+ 
+ def test_report_resolved_lists_files_tests_and_next_step():
+     out = {"status": "resolved", "new_sha": "1234567890", "files": ["app.py"], "summaries": {"app.py": "kept both"},
+-           "tests": "passed (`pytest`)"}
++           "tests": "passed", "test_cmd": 'pip install -e ".[dev]" && pytest -k `x`'}
+     t = report_text(OFFER, out)
+     assert "Resolved merge conflicts" in t and "`1234567`" in t and "not merged" in t
+-    assert "app.py" in t and "kept both" in t and "Tests: passed" in t and "new card" in t
++    assert "app.py" in t and "kept both" in t and "new card" in t
++    assert """Tests: passed (`pip install -e ".[dev]" &amp;&amp; pytest -k 'x'`)""" in t  # escaped, not mangled
+ 
+ 
+ def test_reviewer_is_told_about_an_aoa_resolution():
+@@ -92,8 +97,8 @@ def test_reviewer_is_told_about_an_aoa_resolution():
+ 
+ 
+ def test_report_escapes_titles():
+-    t = report_text(OFFER | {"title": "<!channel> *boom*"}, {"status": "updated"})
+-    assert "<!channel>" not in t and "*boom*" not in t
++    t = report_text(OFFER | {"title": "<!channel> [WIP] fix tool_choice"}, {"status": "updated"})
++    assert "<!channel>" not in t and "&lt;!channel&gt; (WIP) fix tool_choice](" in t
+ 
+ 
+ # ---- activities against a fake GitHub ---------------------------------------------------------
+@@ -301,3 +306,14 @@ def test_merge_endpoint_rejects_unknown_wrong_session_and_out_of_scope(api):
+     assert client.post("/sessions/main/merges/mrg-bbbbbbbbbbbb", json={}).status_code == 403
+     assert client.post("/sessions/main/merges/mrg-cccccccccccc", json={}).status_code == 404
+     assert fake.started == []
++
++
++async def test_resolve_refuses_while_auto_merge_is_on(acts, monkeypatch):
++    fake = use(monkeypatch, FakeGitHub({
++        ("GET", "/repos/agileresearchservices/demo/pulls/7"): (200, ghpr() | {"auto_merge": {"merge_method": "squash"}}),
++    }))
++    out = await acts.resolve_conflicts({"session": "main", "repo": OFFER["repo"], "number": 7, "sha": SHA,
++                                        "head_ref": "feat/x", "base_ref": "main", "same_repo": True,
++                                        "protected_refs": ["main"]})
++    assert out["action"] == "auto_merge" and "auto-merge is on" in out["reason"]
++    assert [c[0] for c in fake.calls] == ["GET"]  # stopped before cloning anything
+diff --git a/tests/test_pr_resolve.py b/tests/test_pr_resolve.py
+index 9f6597c..23a3a01 100644
+--- a/tests/test_pr_resolve.py
++++ b/tests/test_pr_resolve.py
+@@ -212,3 +212,86 @@ async def test_tool_choice_is_not_forced_and_4xx_is_not_retried(tmp_path, remote
+     out = await resolver(tmp_path, remote, llm).run()
+     assert out["status"] == "failed" and "refused the request (400)" in out["reason"]
+     assert len(llm.calls) == 1 and llm.calls[0]["tool_choice"] is None  # forced tool use is rejected live
++
++
++async def test_clean_merge_is_reported_not_pushed(tmp_path, remote):
++    origin, _, seed = remote
++    git(seed, "checkout", "-q", "-b", "clean", "main")
++    (seed / "other.py").write_text("y = 1\n")
++    git(seed, "add", ".")
++    git(seed, "commit", "-qm", "unrelated")
++    git(seed, "push", "-q", "origin", "clean")
++    sha = git(seed, "rev-parse", "clean")
++    llm = FakeLLM([])
++    r = Resolver(repo=REPO, sha=sha, head_ref="clean", base_ref="main", workdir=tmp_path / "w", remote_url=str(origin),
++                 token=None, llm=llm, model="m", max_tokens=1000)
++    out = await r.run()
++    assert out["action"] == "no_conflict" and "out of date" in out["reason"] and not llm.calls
++    assert git(origin, "rev-parse", "clean") == sha
++
++
++async def test_text_outside_the_conflict_must_survive(tmp_path, remote):
++    origin, sha, _ = remote
++    out = await resolver(tmp_path, remote, FakeLLM([resolution("a = 1\nx = 2  # feat\nx3 = 3  # main\nz = 9\n")])).run()
++    assert out["status"] == "failed" and "outside the conflicting regions" in out["reason"]
++    assert out["action"] == "resolve_failed"  # a second model run may do better
++    assert git(origin, "rev-parse", "feat") == sha
++
++
++async def test_trailing_newline_is_restored(tmp_path, remote):
++    origin, _, _ = remote
++    out = await resolver(tmp_path, remote, FakeLLM([resolution("a = 0\nx = 2  # feat\nx3 = 3  # main\nz = 9")])).run()
++    assert out["status"] == "resolved", out
++    assert subprocess.run(["git", "show", "feat:app.py"], cwd=origin, capture_output=True, text=True).stdout.endswith("z = 9\n")
++
++
++def test_conflict_context_and_line_endings():
++    from aoa.pr_resolve import ResolveError, conflict_context, finish_resolution
++
++    conflicted = ("Title\r\n=======\r\n<<<<<<< HEAD\r\nours\r\n||||||| base\r\nold\r\n=======\r\ntheirs\r\n"
++                  ">>>>>>> origin/base\r\ntail\r\n")
++    assert conflict_context(conflicted) == ["Title\r\n=======\r\n", "tail\r\n"]  # an underline is not a separator
++    texts = {"conflicted": conflicted, "ours": "Title\r\n=======\r\nours\r\ntail\r\n",
++             "theirs": "Title\r\n=======\r\ntheirs\r\ntail\r\n"}
++    assert finish_resolution("Title\n=======\nours\ntheirs\ntail", texts) == "Title\r\n=======\r\nours\r\ntheirs\r\ntail\r\n"
++    with pytest.raises(ResolveError):
++        finish_resolution("Title\n=======\nours\ntheirs\n", texts)  # dropped "tail"
++
++
++async def test_test_failures_are_final_but_timeouts_can_be_retried(tmp_path, remote, tests_cmd, monkeypatch):
++    tests_cmd("exit 1")
++    out = await resolver(tmp_path, remote, FakeLLM([resolution()])).run()
++    assert out["action"] == "tests_failed"
++    tests_cmd("sleep 5")
++    monkeypatch.setenv("AOA_RESOLVE_TEST_TIMEOUT", "0.5")
++    out = await resolver(tmp_path, remote, FakeLLM([resolution()])).run()
++    assert out["action"] == "resolve_failed" and "timed out" in out["reason"]
++
++
++async def test_before_push_can_stop_the_push(tmp_path, remote):
++    from aoa.pr_resolve import ResolveError
++
++    origin, sha, _ = remote
++
++    async def auto_merge_on():
++        raise ResolveError("auto-merge is on", "auto_merge")
++
++    r = resolver(tmp_path, remote, FakeLLM([resolution()]), marks=(marks := []))
++    r.before_push = auto_merge_on
++    out = await r.run()
++    assert out["action"] == "auto_merge" and marks == []  # not marked, not pushed
++    assert git(origin, "rev-parse", "feat") == sha
++
++
++def test_stale_work_dirs_are_cleaned(tmp_path, monkeypatch):
++    import os
++    import tempfile
++
++    from aoa.pr_resolve import clean_stale_workdirs, resolve_root
++
++    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
++    old, new = resolve_root() / "old", resolve_root() / "new"
++    for d in (old, new):
++        (d / "clone").mkdir(parents=True)
++    os.utime(old, (0, 0))
++    assert clean_stale_workdirs() == 1 and not old.exists() and new.exists()

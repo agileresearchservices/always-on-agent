@@ -1,0 +1,683 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 7a8a34b..768c77c 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -39,6 +39,7 @@ The key design: **the agent logic is written once as `AgentCore` methods and dri
+ 
+ Things that are easy to break:
+ 
++- **Workflow changes must stay replay-compatible.** `SessionWorkflow` runs for days and PR workflows run across deploys, so any change to the commands a workflow issues (a new activity, timer, child start, reordering) needs a `workflow.patched("name")` guard. `tests/test_replay.py` replays the recorded histories in `tests/histories/` (including two recorded by an older worker) and fails if a change would break them; never re-record a history to make it pass. Add a scenario to `tests/histories/capture.py` when you add a new workflow path (needs the local Temporal server). PR workflows carry search attributes `Repo`, `PrNumber`, `Sha`, `Session` (registered by `search_attrs.ensure_registered` at worker and server start): `temporal workflow list --query 'PrNumber=27'`.
+ - **Tools run at most once** (`NO_RETRY` in `WorkflowOps.run_tool`); a failed tool is reported to the model as "effects unknown", never re-run. Model calls are retried. Keep new tool handlers consistent with this.
+ - **Prompt-cache stability** (`prompt.py`, `llm.place_cache_breakpoints`): the system prompt and tool block must be a fixed, ordered prefix; volatile context (time, scratchpad, recent log) goes into the new user message via `volatile_context_block`, not the system prompt. `core.llm_step` logs a warning on a cache miss within the TTL, which is treated as a bug. Compaction and `warm_cache` deliberately reuse the exact main-agent prefix via `_setup("main", 0)`.
+ - **Tools** (`tools.py`): core tools ship full schemas; deferred tools appear only by name in the prompt and are reached via `tool_search` / `call_deferred`. `spawn_helper` is declared in `tools.py` but executed by the loop, not a handler. Handlers raise `ToolError` with an actionable message for the model; results over `tool_result_max_chars` are spilled to a sandbox file by `core._cap`.
+diff --git a/aoa/activities.py b/aoa/activities.py
+index 946cc37..147d139 100644
+--- a/aoa/activities.py
++++ b/aoa/activities.py
+@@ -17,6 +17,7 @@ from .core import AgentCore
+ from .delivery import deliver_event
+ from .events import Event
+ from . import github_monitor as gh
++from . import search_attrs
+ from .gh_reviewer import forget as forget_reviewer_token, reviewer_token
+ from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
+ from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RESOLVED_KEY, RETRYABLE, check_summary, decide, report_text
+@@ -104,7 +105,7 @@ class AgentActivities:
+             files = self.core.store.kv_get(a["session"], f"{RESOLVED_KEY}{pr['repo']}#{pr['number']}@{pr['sha']}")
+             if files is not None:
+                 pr["resolved_files"] = files
+-        return {"announced": len(prs), "review": review}
++        return {"announced": len(prs), "review": review, "search_attrs": search_attrs.registered()}
+ 
+     @activity.defn(name="publish_pr_review")
+     async def publish_pr_review(self, a: dict[str, Any]) -> dict[str, Any]:
+diff --git a/aoa/core.py b/aoa/core.py
+index 13e0d60..060e11b 100644
+--- a/aoa/core.py
++++ b/aoa/core.py
+@@ -259,6 +259,12 @@ class AgentCore:
+             self.memory.append_log(f"compacted conversation ({mode}, ~{tokens} tokens before)", self.now())
+         return mode if ok else "none"
+ 
++    @staticmethod
++    def _dur(seconds: int) -> str:
++        if seconds >= 3600 and seconds % 3600 == 0:
++            return f"{seconds // 3600}h"
++        return f"{seconds // 60}m" if seconds >= 120 else f"{seconds}s"
++
+     def _approval_times(self, a: dict[str, Any], nudged: bool) -> list[float]:
+         out = [a["ts"] + self.s.approval_expire_seconds]
+         if not nudged:
+@@ -284,7 +290,7 @@ class AgentCore:
+                 # failed send leave the person never told
+                 self.notifier.send(
+                     session, "alert", f"Approval {a['id']} ({what}) lapsed after "
+-                    f"{self.s.approval_expire_seconds // 3600}h without an answer, so it was NOT done. "
++                    f"{self._dur(self.s.approval_expire_seconds)} without an answer, so it was NOT done. "
+                     "Ask me again if you still want it.", now, client_key=f"apr-expired:{a['id']}")
+                 if self.store.approval_expire(a["id"]):
+                     done["expired"].append(a["id"])
+@@ -292,7 +298,7 @@ class AgentCore:
+                 if not self.store.kv_get(session, f"apr_nudged:{a['id']}", False):
+                     self.notifier.send(
+                         session, "alert", f"Still waiting on your decision for approval {a['id']} ({what}). "
+-                        f"It lapses after {self.s.approval_expire_seconds // 3600}h.", now,
++                        f"It lapses after {self._dur(self.s.approval_expire_seconds)}.", now,
+                         client_key=f"apr-nudge:{a['id']}")
+                     self.store.kv_set(session, f"apr_nudged:{a['id']}", True)
+                     done["nudged"].append(a["id"])
+diff --git a/aoa/search_attrs.py b/aoa/search_attrs.py
+new file mode 100644
+index 0000000..e1c1150
+--- /dev/null
++++ b/aoa/search_attrs.py
+@@ -0,0 +1,58 @@
++"""Search attributes for the PR workflows, so `temporal workflow list --query 'PrNumber=27'` (and the
++Temporal UI) can find them. They must be registered on the server before a workflow uses them."""
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++from temporalio.common import SearchAttributeKey, SearchAttributePair, TypedSearchAttributes
++
++REPO = SearchAttributeKey.for_keyword("Repo")
++PR_NUMBER = SearchAttributeKey.for_int("PrNumber")
++SHA = SearchAttributeKey.for_keyword("Sha")
++SESSION = SearchAttributeKey.for_keyword("Session")
++
++log = logging.getLogger(__name__)
++_registered = False
++
++
++def registered() -> bool:
++    """True once this process has confirmed the server knows the attributes (workflows only use them then)."""
++    return _registered
++
++
++def pr_attrs(repo: str, number: int, sha: str, session: str) -> TypedSearchAttributes:
++    return TypedSearchAttributes([
++        SearchAttributePair(REPO, repo), SearchAttributePair(PR_NUMBER, int(number)),
++        SearchAttributePair(SHA, sha), SearchAttributePair(SESSION, session),
++    ])
++
++
++async def ensure_registered(client: Any) -> bool:
++    """Register the attributes if the server does not know them yet. Safe to call on every start. Returns
++    False (and logs) when the server refuses, so callers can carry on without attributes."""
++    from temporalio.api.enums.v1 import IndexedValueType
++    from temporalio.api.operatorservice.v1 import AddSearchAttributesRequest, ListSearchAttributesRequest
++    from temporalio.service import RPCError, RPCStatusCode
++
++    global _registered
++    want = {k.name: k.indexed_value_type for k in (REPO, PR_NUMBER, SHA, SESSION)}
++    ops = client.operator_service
++    try:
++        have = await ops.list_search_attributes(ListSearchAttributesRequest(namespace=client.namespace))
++        missing = {n: t for n, t in want.items() if n not in have.custom_attributes}
++        if missing:
++            await ops.add_search_attributes(AddSearchAttributesRequest(
++                namespace=client.namespace,
++                search_attributes={n: IndexedValueType.Value(f"INDEXED_VALUE_TYPE_{t.name}") for n, t in missing.items()},
++            ))
++        _registered = True
++    except RPCError as e:
++        # the worker and the server both register at start: the loser of that race sees AlreadyExists
++        _registered = e.status == RPCStatusCode.ALREADY_EXISTS
++        if not _registered:
++            log.warning("could not register search attributes (%s); PR workflows start without them", e.status)
++    except Exception as e:  # noqa: BLE001 - never block startup over a visibility nicety
++        _registered = False
++        log.warning("could not register search attributes (%s); PR workflows start without them", type(e).__name__)
++    return _registered
+diff --git a/aoa/server.py b/aoa/server.py
+index 7ab8b21..6427b8b 100644
+--- a/aoa/server.py
++++ b/aoa/server.py
+@@ -19,12 +19,14 @@ from pydantic import BaseModel, Field
+ from temporalio.client import Client
+ from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+ from temporalio.exceptions import WorkflowAlreadyStartedError
++from temporalio.service import RPCError, RPCStatusCode
+ 
+ from .config import Settings
+ from .delivery import deliver_event, signal_typing
+ from .events import Event, approval_event, user_event
+ from .github_monitor import GithubError, check_repo_in_scope
+ from .pr_merge import OFFER_ID_RE, OFFER_KEY
++from .search_attrs import ensure_registered, pr_attrs
+ from .store import Store
+ 
+ settings = Settings.from_env()
+@@ -47,6 +49,7 @@ def check_auth_configured() -> None:
+ async def lifespan(app: FastAPI):
+     check_auth_configured()
+     app.state.client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
++    await ensure_registered(app.state.client)
+     yield
+ 
+ 
+@@ -158,13 +161,22 @@ async def merge(sid: str, offer_id: str, m: MergeRequest) -> dict[str, Any]:
+     except GithubError as e:
+         raise HTTPException(403, str(e)) from e
+     try:
+-        await app.state.client.start_workflow(
+-            "MergePrWorkflow",
+-            {"session": sid, "offer_id": offer_id, "offer": offer, "card_ts": m.card_ts},
++        args = dict(
+             id=f"merge-{sid}-{offer_id}", task_queue=settings.task_queue,
+             id_conflict_policy=WorkflowIDConflictPolicy.FAIL,  # running: refuse the double click
+             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,  # finished: a retry may run (it re-checks GitHub)
+         )
++        inp = {"session": sid, "offer_id": offer_id, "offer": offer, "card_ts": m.card_ts}
++        try:
++            attrs = pr_attrs(offer["repo"], offer["number"], offer["sha"], sid)
++        except (KeyError, TypeError, ValueError):  # an odd stored offer: the merge itself must still start
++            attrs = None
++        try:
++            await app.state.client.start_workflow("MergePrWorkflow", inp, **({"search_attributes": attrs} if attrs else {}), **args)
++        except RPCError as e:  # the server does not know the attributes yet: a merge must not depend on them
++            if attrs is None or e.status != RPCStatusCode.INVALID_ARGUMENT:
++                raise
++            await app.state.client.start_workflow("MergePrWorkflow", inp, **args)
+     except WorkflowAlreadyStartedError as e:
+         raise HTTPException(409, "a merge of this PR is already running") from e
+     return {"status": "started"}
+diff --git a/aoa/worker.py b/aoa/worker.py
+index e442b94..e524cb2 100644
+--- a/aoa/worker.py
++++ b/aoa/worker.py
+@@ -15,6 +15,7 @@ from .llm import AnthropicLLM
+ from .memory import MemoryStore
+ from .pr_resolve import clean_stale_workdirs
+ from .scheduling import TemporalScheduler, ensure_github_schedule
++from .search_attrs import ensure_registered
+ from .store import Store
+ from .workflows import (
+     GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow,
+@@ -28,6 +29,7 @@ async def build_worker(settings: Settings, client: Client, core: AgentCore | Non
+             TemporalScheduler(client, settings),
+         )
+     acts = AgentActivities(core, client, settings)
++    await ensure_registered(client)  # the PR workflows set Repo/PrNumber/Sha/Session; the server must know them
+     return Worker(
+         client,
+         task_queue=settings.task_queue,
+diff --git a/aoa/workflows.py b/aoa/workflows.py
+index 39072a5..c59c6be 100644
+--- a/aoa/workflows.py
++++ b/aoa/workflows.py
+@@ -23,6 +23,7 @@ from temporalio.exceptions import ActivityError, ChildWorkflowError, WorkflowAlr
+ with workflow.unsafe.imports_passed_through():
+     from .loop import run_agent_loop
+     from .pr_review import build_task
++    from .search_attrs import pr_attrs
+ 
+ LLM_RETRY = RetryPolicy(
+     maximum_attempts=6, initial_interval=timedelta(seconds=2), maximum_interval=timedelta(seconds=60),
+@@ -306,11 +307,16 @@ class GithubPollWorkflow:
+             return res
+         for pr in res["review"]:
+             wid = f"pr-review-{inp['session']}-{pr['repo'].replace('/', '-')}-{pr['number']}-{pr['sha'][:12]}"
++            # only when the worker confirmed the server knows them: a child start that names an unknown attribute
++            # fails the workflow task (it cannot be caught here), which would stop every later poll
++            attrs = ({"search_attributes": pr_attrs(pr["repo"], pr["number"], pr["sha"], inp["session"])}
++                     if res.get("search_attrs") and workflow.patched("pr-search-attrs") else {})
+             try:
+                 await workflow.start_child_workflow(
+                     "PrReviewWorkflow", {"session": inp["session"], "cfg": inp["cfg"], "pr": pr}, id=wid,
+                     parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+                     id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
++                    **attrs,
+                 )
+             except WorkflowAlreadyStartedError:
+                 pass  # this commit was already reviewed (or is being reviewed)
+diff --git a/docs/session-log.md b/docs/session-log.md
+index 11bbdf6..b694a8d 100644
+--- a/docs/session-log.md
++++ b/docs/session-log.md
+@@ -169,3 +169,4 @@ planned eval flywheel).
+ - Review of Temporal/Anthropic features produced six work items (issues below). Order: timers, replay tests + search attributes, 1h cache TTL, thinking blocks, native tool search + structured outputs, batch evals.
+ - **#28 digest flush timer:** `Notifier.next_flush_at` / `flush_digest`; `SessionWorkflow` waits with `min(idle_sleep, time to flush)` and flushes held updates when quiet hours end or the spacing passes (previously they waited for the next message).
+ - **#30 approval expiry:** `approvals_next` / `approvals_tick` activities; `SessionWorkflow` wakes at the earliest nudge/expiry, nudges once (4h) and expires (24h), telling the person via an `alert`. The tool tells the model it lapsed; a late click gets 409 "expired".
++- **#32 replay tests + search attributes:** recorded histories (session with digest/approval timers, poll, review, three merge paths, plus two recorded with pre-patch code) replay in `tests/test_replay.py` without a server; verified that removing a `patched()` guard fails them. `Repo`/`PrNumber`/`Sha`/`Session` search attributes on PR workflows. Approval notices now format short durations (5s, 90m) correctly.
+diff --git a/tests/histories/capture.py b/tests/histories/capture.py
+new file mode 100644
+index 0000000..7a8e2c5
+--- /dev/null
++++ b/tests/histories/capture.py
+@@ -0,0 +1,181 @@
++"""Record workflow histories for the replay test (tests/test_replay.py).
++
++    .venv/bin/python tests/histories/capture.py [--only NAME ...]
++
++Needs a local Temporal server (the launchd one is fine; it uses its own task queue and throwaway data dir).
++Model calls are scripted (FakeLLM) and the GitHub-facing activities are replaced by stubs, so nothing leaves the
++machine. Re-record only to ADD a scenario for a new code path. Never re-record an existing file to make a failing
++replay pass: a failure means in-flight workflows would break, so guard the change with workflow.patched().
++"""
++from __future__ import annotations
++
++import argparse
++import asyncio
++import json
++import os
++import sys
++import tempfile
++import uuid
++from pathlib import Path
++from typing import Any
++
++from temporalio import activity
++from temporalio.client import Client
++from temporalio.worker import Worker
++
++from aoa.activities import AgentActivities
++from aoa.config import Settings
++from aoa.core import AgentCore
++from aoa.delivery import deliver_event, workflow_cfg
++from aoa.events import Event, user_event
++from aoa.memory import MemoryStore
++from aoa.search_attrs import ensure_registered, pr_attrs
++from aoa.store import Store
++from aoa.testing import FakeLLM, text, tool
++from aoa.testing import MemoryScheduler
++from aoa.workflows import (
++    GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow,
++)
++
++HERE = Path(__file__).parent
++PR = {"repo": "agileresearchservices/demo", "number": 7, "sha": "a" * 40, "title": "Add thing", "author": "agileresearchservices"}
++VERDICT = json.dumps({"verdict": "approve", "summary": "Looks fine.", "findings": []})
++GH_STUBBED = {"poll_github", "publish_pr_review", "merge_inspect", "merge_pr", "merge_update_branch",
++              "merge_delete_branch", "merge_issue_states", "resolve_conflicts", "merge_report"}
++
++
++def act_name(fn: Any) -> str:
++    return fn.__temporal_activity_definition.name
++
++
++def stub(name: str, results: Any):
++    """An activity that returns canned results in order (the last one repeats)."""
++    seq = list(results) if isinstance(results, list) else [results]
++
++    @activity.defn(name=name)
++    async def _a(arg: Any = None) -> Any:
++        return seq.pop(0) if len(seq) > 1 else seq[0]
++
++    return _a
++
++
++def mk_env() -> Settings:
++    os.environ.update(
++        AOA_DATA_DIR=tempfile.mkdtemp(prefix="aoa-capture-"), AOA_TASK_QUEUE=f"aoa-capture-{uuid.uuid4().hex[:6]}",
++        AOA_BATCH_WINDOW="0.2", AOA_MIN_UPDATE_INTERVAL="3", AOA_QUIET_START="0", AOA_QUIET_END="0",
++        AOA_APPROVAL_NUDGE="6", AOA_APPROVAL_EXPIRE="9",
++    )
++    return Settings.from_env()
++
++
++async def save(client: Client, name: str, workflow_id: str) -> None:
++    hist = await client.get_workflow_handle(workflow_id).fetch_history()
++    (HERE / f"{name}.json").write_text(json.dumps({"workflow_id": workflow_id, "history": json.loads(hist.to_json())}, indent=1))
++    print(f"saved {name}.json ({len(hist.events)} events)")
++
++
++async def wait_for(pred, timeout: float = 40, show=None):
++    end = asyncio.get_event_loop().time() + timeout
++    while asyncio.get_event_loop().time() < end:
++        if pred():
++            return
++        await asyncio.sleep(0.2)
++    raise TimeoutError(f"scenario did not finish: {show() if show else ''}")
++
++
++async def worker_with(client: Client, s: Settings, llm: FakeLLM, stubs: list) -> tuple[Worker, Store]:
++    store = Store(s.db_path)
++    core = AgentCore(s, store, MemoryStore(s.memory_dir), llm, MemoryScheduler())
++    acts = AgentActivities(core, client, s)
++    real = [a for a in acts.all() if act_name(a) not in GH_STUBBED]
++    flows = [SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow]
++    return Worker(client, task_queue=s.task_queue, workflows=flows, activities=real + stubs), store
++
++
++async def session(client: Client) -> None:
++    """A background turn that sends an update, holds a second (digest timer), files an approval that is nudged and
++    expires (approval timers), then a person's message that gets a reply."""
++    s = mk_env()
++    script = [
++        [tool("send_user", kind="update", text="first")], [tool("send_user", kind="update", text="second")],
++        [tool("call_deferred", name="external_send", arguments={"channel": "email:bob", "text": "hi"})],
++        text("waiting for the approval"),
++        [tool("send_user", text="pong")], text("done"),
++    ]
++    w, store = await worker_with(client, s, FakeLLM(script), [])
++    sid = f"cap-{uuid.uuid4().hex[:6]}"
++    async with w:
++        await deliver_event(client, s, sid, Event(source="webhook", text="news", dedupe_key=f"w:{sid}").to_dict())
++        await wait_for(lambda: any(a for a in [store.approval_get(o["payload"]["approval_id"]) for o in store.outbox_since(sid) if o["kind"] == "approval"] if a["status"] == "expired")
++                       and any("Held updates" in o["payload"].get("text", "") for o in store.outbox_since(sid)),
++                       show=lambda: [(o["kind"], o["payload"].get("text", "")[:60]) for o in store.outbox_since(sid)])
++        await deliver_event(client, s, sid, user_event("ping").to_dict())
++        await wait_for(lambda: any(o["payload"].get("text") == "pong" for o in store.outbox_since(sid)))
++        handle = client.get_workflow_handle(f"session-{sid}")
++        await handle.signal("stop")
++        await asyncio.wait_for(handle.result(), 30)
++    await save(client, "session_timers_and_reply", f"session-{sid}")
++
++
++async def poll_and_review(client: Client) -> None:
++    """GithubPollWorkflow starts a PrReviewWorkflow child (with search attributes), which runs the reviewer helper."""
++    s = mk_env()
++    stubs = [stub("poll_github", {"announced": 1, "review": [PR], "search_attrs": True}), stub("publish_pr_review", {"posted": True, "verdict": "approve"})]
++    w, _ = await worker_with(client, s, FakeLLM([text(VERDICT)]), stubs)
++    async with w:
++        wid = f"poll-{uuid.uuid4().hex[:6]}"
++        await client.execute_workflow("GithubPollWorkflow", {"session": "main", "user": "agileresearchservices", "cfg": workflow_cfg(s)},
++                                      id=wid, task_queue=s.task_queue)
++        child = f"pr-review-main-{PR['repo'].replace('/', '-')}-{PR['number']}-{PR['sha'][:12]}"
++        await client.get_workflow_handle(child).result()
++    await save(client, "github_poll", wid)
++    await save(client, "pr_review", child)
++
++
++def inspect(action: str, **kw: Any) -> dict[str, Any]:
++    base = {"action": action, "reason": action, "title": "Add thing", "head_ref": "feat", "base_ref": "main", "same_repo": True,
++            "default_base": True, "protected_refs": ["main"], "merge_sha": None, "issues": [{"number": 3, "state": "OPEN"}]}
++    return base | kw
++
++
++async def merge(client: Client, name: str, stubs: list) -> None:
++    s = mk_env()
++    w, _ = await worker_with(client, s, FakeLLM([]), stubs + [stub("merge_report", None)])
++    offer = {"repo": PR["repo"], "number": PR["number"], "sha": PR["sha"], "verdict": "approve", "card_text": "card"}
++    async with w:
++        wid = f"merge-main-{name}-{uuid.uuid4().hex[:6]}"
++        await client.execute_workflow(
++            "MergePrWorkflow", {"session": "main", "offer_id": "mrg-0123456789ab", "offer": offer, "card_ts": "1.0",
++                                "poll_seconds": 1, "issue_poll_seconds": 1},
++            id=wid, task_queue=s.task_queue, search_attributes=pr_attrs(PR["repo"], PR["number"], PR["sha"], "main"))
++    await save(client, name, wid)
++
++
++SCENARIOS = {
++    "session_timers_and_reply": session,
++    "github_poll": poll_and_review,
++    "merge_wait_then_merge": lambda c: merge(c, "merge_wait_then_merge", [
++        stub("merge_inspect", [inspect("wait"), inspect("merge")]), stub("merge_pr", {"merged": True, "merge_sha": "b" * 40}),
++        stub("merge_delete_branch", {"ref": "feat", "result": "deleted"}),
++        stub("merge_issue_states", [[{"number": 3, "state": "CLOSED"}]])]),
++    "merge_update_branch": lambda c: merge(c, "merge_update_branch", [
++        stub("merge_inspect", inspect("update_branch")), stub("merge_update_branch", {"ok": True})]),
++    "merge_conflict_resolved": lambda c: merge(c, "merge_conflict_resolved", [
++        stub("merge_inspect", inspect("conflict")),
++        stub("resolve_conflicts", {"status": "resolved", "new_sha": "c" * 40, "files": ["a.py"]})]),
++}
++
++
++async def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--only", nargs="*", choices=sorted(SCENARIOS) + ["pr_review"])
++    args = ap.parse_args()
++    client = await Client.connect(os.environ.get("AOA_TEMPORAL_ADDRESS", "localhost:7233"))
++    await ensure_registered(client)
++    for name, fn in SCENARIOS.items():
++        if not args.only or name in args.only or (name == "github_poll" and "pr_review" in args.only):
++            await fn(client)
++
++
++if __name__ == "__main__":
++    sys.exit(asyncio.run(main()))
+diff --git a/tests/histories/capture_legacy.py b/tests/histories/capture_legacy.py
+new file mode 100644
+index 0000000..8cd1203
+--- /dev/null
++++ b/tests/histories/capture_legacy.py
+@@ -0,0 +1,99 @@
++"""Record histories with an OLDER checkout, so the replay test proves today's workflows still replay what a
++worker built before a patched() change recorded.
++
++    git worktree add ../aoa-old <commit-before-the-change>
++    PYTHONPATH=../aoa-old .venv/bin/python tests/histories/capture_legacy.py
++
++Used for: legacy_session_pre_timers.json and legacy_poll_pre_search_attrs.json (commit 20e1c8b, before the digest /
++approval timers and PR search attributes). Only APIs that existed then are used.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import sys
++import tempfile
++import uuid
++from pathlib import Path
++
++from temporalio import activity
++from temporalio.client import Client
++from temporalio.worker import Worker
++
++import aoa
++from aoa.activities import AgentActivities
++from aoa.config import Settings
++from aoa.core import AgentCore
++from aoa.delivery import deliver_event, workflow_cfg
++from aoa.events import Event, user_event
++from aoa.memory import MemoryStore
++from aoa.store import Store
++from aoa.testing import FakeLLM, MemoryScheduler, text, tool
++from aoa.workflows import (
++    GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow,
++)
++
++HERE = Path(__file__).parent
++PR = {"repo": "agileresearchservices/demo", "number": 7, "sha": "a" * 40, "title": "Add thing", "author": "agileresearchservices"}
++VERDICT = json.dumps({"verdict": "approve", "summary": "Looks fine.", "findings": []})
++
++
++def stub(name, result):
++    @activity.defn(name=name)
++    async def _a(arg=None):
++        return result
++    return _a
++
++
++async def save(client, name, wid):
++    hist = await client.get_workflow_handle(wid).fetch_history()
++    (HERE / f"{name}.json").write_text(json.dumps({"workflow_id": wid, "history": json.loads(hist.to_json())}, indent=1))
++    print(f"saved {name}.json ({len(hist.events)} events) from {Path(aoa.__file__).parent}")
++
++
++def worker(client, s, llm, stubs):
++    core = AgentCore(s, Store(s.db_path), MemoryStore(s.memory_dir), llm, MemoryScheduler())
++    names = {s_.__temporal_activity_definition.name for s_ in stubs}
++    real = [a for a in AgentActivities(core, client, s).all() if a.__temporal_activity_definition.name not in names]
++    flows = [SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow]
++    return Worker(client, task_queue=s.task_queue, workflows=flows, activities=real + stubs), core.store
++
++
++def env():
++    os.environ.update(AOA_DATA_DIR=tempfile.mkdtemp(prefix="aoa-legacy-"), AOA_TASK_QUEUE=f"aoa-legacy-{uuid.uuid4().hex[:6]}",
++                      AOA_BATCH_WINDOW="0.2")
++    return Settings.from_env()
++
++
++async def main():
++    client = await Client.connect(os.environ.get("AOA_TEMPORAL_ADDRESS", "localhost:7233"))
++    s = env()
++    w, store = worker(client, s, FakeLLM([[tool("send_user", kind="update", text="fyi")], text("ok"),
++                                          [tool("send_user", text="pong")], text("done")]), [])
++    sid = f"leg-{uuid.uuid4().hex[:6]}"
++    async with w:
++        await deliver_event(client, s, sid, Event(source="webhook", text="news", dedupe_key=f"w:{sid}").to_dict())
++        await deliver_event(client, s, sid, user_event("ping").to_dict())
++        for _ in range(100):
++            if any(o["payload"].get("text") == "pong" for o in store.outbox_since(sid)):
++                break
++            await asyncio.sleep(0.2)
++        h = client.get_workflow_handle(f"session-{sid}")
++        await h.signal("stop")
++        await asyncio.wait_for(h.result(), 30)
++    await save(client, "legacy_session_pre_timers", f"session-{sid}")
++
++    s = env()
++    w, _ = worker(client, s, FakeLLM([text(VERDICT)]),
++                  [stub("poll_github", {"announced": 1, "review": [PR]}), stub("publish_pr_review", {"posted": True})])
++    async with w:
++        wid = f"poll-{uuid.uuid4().hex[:6]}"
++        await client.execute_workflow("GithubPollWorkflow", {"session": "main", "user": "agileresearchservices", "cfg": workflow_cfg(s)},
++                                      id=wid, task_queue=s.task_queue)
++        await client.get_workflow_handle(f"pr-review-main-{PR['repo'].replace('/', '-')}-{PR['number']}-{PR['sha'][:12]}").result()
++    await save(client, "legacy_poll_pre_search_attrs", wid)
++
++
++if __name__ == "__main__":
++    sys.exit(asyncio.run(main()))
+diff --git a/tests/test_edge.py b/tests/test_edge.py
+index 937aad4..e1691ba 100644
+--- a/tests/test_edge.py
++++ b/tests/test_edge.py
+@@ -295,3 +295,8 @@ def test_approval_settings_are_sane(monkeypatch):
+     monkeypatch.setenv("AOA_APPROVAL_EXPIRE", "-5")
+     s = Settings.from_env()
+     assert s.approval_nudge_seconds >= 1 and s.approval_expire_seconds > s.approval_nudge_seconds
++
++
++def test_durations_in_approval_notices_read_correctly():
++    from aoa.core import AgentCore
++    assert [AgentCore._dur(x) for x in (5, 90, 5400, 14400, 86400)] == ["5s", "90s", "90m", "4h", "24h"]
+diff --git a/tests/test_pr_merge.py b/tests/test_pr_merge.py
+index 297ef3b..a31f37c 100644
+--- a/tests/test_pr_merge.py
++++ b/tests/test_pr_merge.py
+@@ -293,6 +293,8 @@ def test_merge_endpoint_starts_one_workflow_for_a_stored_offer(api):
+     assert call["arg"]["offer"]["sha"] == SHA and call["arg"]["card_ts"] == "17.5"
+     assert call["id_conflict_policy"] == WorkflowIDConflictPolicy.FAIL
+     assert call["id_reuse_policy"] == WorkflowIDReusePolicy.ALLOW_DUPLICATE
++    sa = {p.key.name: p.value for p in call["search_attributes"]}
++    assert sa == {"Repo": OFFER["repo"], "PrNumber": OFFER["number"], "Sha": SHA, "Session": "main"}
+     assert client.post("/sessions/main/merges/mrg-0123456789ab", json={}).status_code == 409  # double click
+ 
+ 
+@@ -352,3 +354,27 @@ async def test_reviewer_identity_failure_falls_back_to_a_comment_review(acts, mo
+     assert fake.tokens == ["ghs_reviewer", None]  # the fallback uses GITHUB_TOKEN
+     text = acts.core.store.outbox_since("main")[-1]["payload"]["text"]
+     assert "as a comment review" in text and "could not post (422)" in text
++
++
++def test_merge_still_starts_when_the_server_does_not_know_the_search_attributes(api):
++    from temporalio.service import RPCError, RPCStatusCode
++
++    client, fake, store = api
++    real = fake.start_workflow
++
++    async def picky(workflow, arg, **kw):
++        if "search_attributes" in kw:
++            raise RPCError("rejected", RPCStatusCode.INVALID_ARGUMENT, b"")
++        return await real(workflow, arg, **kw)
++
++    fake.start_workflow = picky
++    store.kv_set("main", "merge-offer:mrg-0123456789ab", OFFER)
++    assert client.post("/sessions/main/merges/mrg-0123456789ab", json={}).status_code == 202
++    assert fake.started[0]["workflow"] == "MergePrWorkflow" and "search_attributes" not in fake.started[0]
++
++
++def test_merge_starts_even_if_the_stored_offer_lacks_a_field(api):
++    client, fake, store = api
++    store.kv_set("main", "merge-offer:mrg-0123456789ab", {k: v for k, v in OFFER.items() if k != "sha"})
++    assert client.post("/sessions/main/merges/mrg-0123456789ab", json={}).status_code == 202
++    assert "search_attributes" not in fake.started[0]
+diff --git a/tests/test_replay.py b/tests/test_replay.py
+new file mode 100644
+index 0000000..81c195e
+--- /dev/null
++++ b/tests/test_replay.py
+@@ -0,0 +1,59 @@
++"""Replay recorded workflow histories against the current workflow code (no Temporal server needed).
++
++A failure here means a worker running today's code could not resume workflows recorded by an older worker. Fix the
++workflow change (guard it with workflow.patched / keep the command order), do not re-record the history. To cover
++a NEW path, add a scenario to tests/histories/capture.py and record it. See tests/histories/capture.py.
++"""
++from __future__ import annotations
++
++import json
++from datetime import timedelta
++from pathlib import Path
++
++import pytest
++from temporalio import workflow
++from temporalio.client import WorkflowHistory
++from temporalio.worker import Replayer
++
++from aoa.workflows import (
++    GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow,
++)
++
++HISTORIES = sorted((Path(__file__).parent / "histories").glob("*.json"))
++FLOWS = [SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow]
++
++
++def test_histories_are_present():
++    names = {p.stem for p in HISTORIES}
++    assert {"session_timers_and_reply", "legacy_session_pre_timers", "pr_review", "github_poll",
++            "legacy_poll_pre_search_attrs", "merge_wait_then_merge", "merge_update_branch",
++            "merge_conflict_resolved"} <= names
++
++
++@pytest.mark.parametrize("path", HISTORIES, ids=lambda p: p.stem)
++async def test_history_replays(path: Path):
++    d = json.loads(path.read_text())
++    await Replayer(workflows=FLOWS).replay_workflow(WorkflowHistory.from_json(d["workflow_id"], d["history"]))
++
++
++@workflow.defn(name="MergePrWorkflow")
++class _ChangedMergeWorkflow:
++    @workflow.run
++    async def run(self, inp: dict) -> dict:
++        await workflow.execute_activity("a_step_that_was_not_recorded", inp, start_to_close_timeout=timedelta(seconds=5))
++        return {}
++
++
++async def test_replay_catches_a_nondeterministic_change():
++    """The harness itself: a workflow that issues different commands than the recorded history fails to replay."""
++    d = json.loads((Path(__file__).parent / "histories" / "merge_wait_then_merge.json").read_text())
++    with pytest.raises(Exception, match="(?i)determinis"):
++        await Replayer(workflows=[_ChangedMergeWorkflow]).replay_workflow(
++            WorkflowHistory.from_json(d["workflow_id"], d["history"]))
++
++
++@pytest.mark.parametrize("path", HISTORIES, ids=lambda p: p.stem)
++def test_histories_hold_no_secrets_or_local_paths(path: Path):
++    body = path.read_text()
++    for needle in ("/Users/", "/private/", "/var/folders", "sk-ant", "ghp_", "github_pat", "xoxb-", "xoxp-", "PRIVATE KEY"):
++        assert needle not in body, f"{path.name} contains {needle!r}"
+diff --git a/tests/test_temporal_e2e.py b/tests/test_temporal_e2e.py
+index 0ae04f4..c8bcab6 100644
+--- a/tests/test_temporal_e2e.py
++++ b/tests/test_temporal_e2e.py
+@@ -284,3 +284,24 @@ async def test_pending_approval_is_nudged_then_expires(client, env, monkeypatch)
+     assert any("lapsed" in t for t in texts)
+     aid = next(o["payload"]["approval_id"] for o in store.outbox_since(sid) if o["kind"] == "approval")
+     assert store.approval_get(aid)["status"] == "expired"
++
++
++async def test_pr_workflows_are_findable_by_search_attributes(client, env):
++    from aoa.search_attrs import ensure_registered, pr_attrs
++
++    assert await ensure_registered(client) and await ensure_registered(client)  # idempotent
++    repo, sha = f"agileresearchservices/demo-{uuid.uuid4().hex[:6]}", "d" * 40
++    handle = await client.start_workflow(
++        "MergePrWorkflow", {"session": "main", "offer_id": "x", "offer": {}}, id=f"merge-test-{uuid.uuid4().hex[:6]}",
++        task_queue=env.task_queue, search_attributes=pr_attrs(repo, 4242, sha, "main"),
++    )  # no worker: it just sits there, which is all the visibility query needs
++    try:
++        found = []
++        for _ in range(30):  # visibility is eventually consistent
++            found = [w.id async for w in client.list_workflows(f'Repo = "{repo}" AND PrNumber = 4242 AND Sha = "{sha}"')]
++            if found:
++                break
++            await asyncio.sleep(0.5)
++        assert found == [handle.id]
++    finally:
++        await handle.terminate("test done")
