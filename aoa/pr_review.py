@@ -139,19 +139,24 @@ def diff_index(diff: str) -> dict[str, list[tuple[int, int]]]:
 
 
 def check_citations(v: dict[str, Any], index: dict[str, list[tuple[int, int]]]) -> dict[str, Any]:
-    """Drop findings that cite a file the PR does not touch, and blank a cited line the diff never shows: the
-    reviewer only saw the diff, so those are guesses. The verdict is kept as it was (a dropped finding must
-    never turn into an approval); `dropped` / `unplaced` say what was removed, for the posted review."""
-    kept, dropped, unplaced = [], 0, 0
+    """Remove a location the diff cannot support: the reviewer only saw the diff, so a cited file the PR does
+    not touch or a line it never shows is a guess. The finding itself is always kept (it may be a real problem
+    in code the PR affects; a path git quotes, or a rename, can also be missing from the index), with the
+    original citation moved into the text. The verdict is never changed. `unplaced` counts the findings
+    whose location was removed, for the posted review."""
+    out, unplaced = [], 0
     for f in v["findings"]:
         path = f["file"].removeprefix("./").lstrip("/")
         if path and path not in index:
-            dropped += 1
-            continue
-        if path and f["line"] and not any(a <= f["line"] <= b for a, b in index[path]):
-            f, unplaced = {**f, "line": None}, unplaced + 1
-        kept.append({**f, "file": path})
-    return {**v, "findings": kept, "dropped": dropped, "unplaced": unplaced}
+            f = {**f, "file": "", "line": None, "comment": f"(cites `{path}`, which this PR does not change) {f['comment']}"}
+            unplaced += 1
+        elif path and f["line"] and not any(a <= f["line"] <= b for a, b in index[path]):
+            f = {**f, "file": path, "line": None, "comment": f"(cites line {f['line']}, which the diff does not show) {f['comment']}"}
+            unplaced += 1
+        else:
+            f = {**f, "file": path}
+        out.append(f)
+    return {**v, "findings": out, "unplaced": unplaced}
 
 
 def defang_links(s: str) -> str:
@@ -186,8 +191,8 @@ def github_body(v: dict[str, Any], formal: bool = False) -> str:
     lines = [head, "", v["summary"]]
     if v["findings"]:
         lines += ["", "**Findings**"] + [f"- **{f['severity']}** {_where(f)}{f['comment']}" for f in v["findings"]]
-    if v.get("dropped"):
-        lines += ["", f"_{v['dropped']} finding(s) cited files outside this PR's diff and were dropped._"]
+    if v.get("unplaced"):
+        lines += ["", f"_{v['unplaced']} finding(s) cited a file or line outside this PR's diff; the location was removed._"]
     lines += ["", "_Automated review by the aoa reviewer sub-agent._" if formal else
               "_Automated review by the aoa reviewer sub-agent. Posted as a comment review: GitHub does not "
               "let the PR author's account approve or request changes._"]
@@ -207,8 +212,8 @@ def slack_text(v: dict[str, Any] | None, pr: dict[str, Any], posted: bool, note:
         lines.append(f"• *{f['severity']}* {_slack_plain(_where(f) + f['comment'])}")
     if len(v["findings"]) > 5:
         lines.append(f"…{len(v['findings']) - 5} more on GitHub")
-    if v.get("dropped"):
-        lines.append(f"_{v['dropped']} finding(s) cited files outside the PR's diff and were dropped._")
+    if v.get("unplaced"):
+        lines.append(f"_{v['unplaced']} finding(s) cited a file or line outside the PR's diff; the location was removed._")
     lines.append(f"_Posted on GitHub as {posted_as}.{' ' + note if note else ''}_" if posted
                  else f"_Not posted on GitHub. {note}_")
     return "\n".join(lines)

@@ -161,16 +161,17 @@ class AgentActivities:
         return {"verdict": v["verdict"] if v else None, "posted": posted}
 
     async def _check_citations(self, pr: dict[str, Any], v: dict[str, Any]) -> dict[str, Any]:
-        """Drop findings the PR's diff cannot support. Skipped (the review is used as it is) when the diff is
-        unavailable, too large for GitHub, or the head moved since the review: a check must not lose findings."""
+        """Remove locations the PR's diff cannot support (the findings stay). Skipped (the review is used as it
+        is) when the diff is unavailable, too large for GitHub, or the head moved since the review: this check
+        must never stop a review from being published."""
         path = f"/repos/{pr['repo']}/pulls/{pr['number']}"
         try:
             if (await gh.gh_call("GET", path)).json()["head"]["sha"] != pr["sha"]:
                 return v
             diff = (await gh.gh_call("GET", path, accept="application/vnd.github.diff")).text
-        except (gh.GithubError, httpx.HTTPError, KeyError, ValueError):
+            return check_citations(v, diff_index(diff)) if diff.strip() else v
+        except Exception:  # noqa: BLE001 - an unexpected reply shape or network error must not fail the publish
             return v
-        return check_citations(v, diff_index(diff)) if diff.strip() else v
 
     def _merge_offer(self, session: str, pr: dict[str, Any], card: str) -> str:
         """An opaque id the [Merge] button carries. It names this PR at this reviewed commit, so a click can

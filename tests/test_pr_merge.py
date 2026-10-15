@@ -405,7 +405,7 @@ DIFF = """diff --git a/app/auth.py b/app/auth.py
 """
 
 
-async def test_publish_drops_findings_the_diff_cannot_support(acts, monkeypatch):
+async def test_publish_removes_locations_the_diff_cannot_support(acts, monkeypatch):
     fake = use(monkeypatch, FakeGitHub(REVIEW_READS | {("DIFF", PR7): (200, DIFF),
                                                        ("POST", PR7 + "/reviews"): (200, {})}))
     pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")} | {"author": "agileresearchservices"}
@@ -415,11 +415,11 @@ async def test_publish_drops_findings_the_diff_cannot_support(acts, monkeypatch)
         {"severity": "medium", "file": "other.py", "line": 1, "comment": "file not in the PR"}]})
     await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": text})
     body = posts(fake)[0][2]["body"]
-    assert "kept" in body and "line never shown" in body and "file not in the PR" not in body
-    assert "`app/auth.py:99`" not in body and "1 finding(s) cited files outside" in body
+    assert "kept" in body and "line never shown" in body and "file not in the PR" in body  # findings stay
+    assert "`app/auth.py:99`" not in body and "`other.py:1`" not in body and "2 finding(s) cited a file or line" in body
     assert posts(fake)[0][2]["event"] == "COMMENT"
     card = acts.core.store.outbox_since("main")[-1]["payload"]
-    assert card["verdict"] == "approve" and "were dropped" in card["text"]  # a drop never changes the verdict
+    assert card["verdict"] == "approve" and "location was removed" in card["text"]  # never changes the verdict
 
 
 async def test_publish_skips_the_check_when_the_head_moved_or_the_diff_is_unavailable(acts, monkeypatch):

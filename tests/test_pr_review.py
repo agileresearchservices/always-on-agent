@@ -129,19 +129,23 @@ def _v(*findings, verdict="request_changes"):
         {"severity": sev, "file": f, "line": line, "comment": c} for sev, f, line, c in findings]}
 
 
-def test_check_citations_drops_foreign_files_and_blanks_unseen_lines():
+def test_check_citations_keeps_every_finding_and_removes_unsupported_locations():
     v = check_citations(_v(("high", "app/auth.py", 12, "ok"), ("medium", "app/auth.py", 30, "unseen line"),
                            ("high", "elsewhere.py", 3, "foreign file"), ("low", "", None, "general"),
                            ("low", "./app/auth.py", 41, "dot-slash")), diff_index(DIFF))
-    assert [f["comment"] for f in v["findings"]] == ["ok", "unseen line", "general", "dot-slash"]
-    assert [f["line"] for f in v["findings"]] == [12, None, None, 41] and v["dropped"] == 1 and v["unplaced"] == 1
-    assert v["findings"][3]["file"] == "app/auth.py"
+    f = v["findings"]
+    assert len(f) == 5 and v["unplaced"] == 2 and [x["severity"] for x in f] == ["high", "medium", "high", "low", "low"]
+    assert (f[0]["file"], f[0]["line"], f[0]["comment"]) == ("app/auth.py", 12, "ok")
+    assert (f[1]["file"], f[1]["line"]) == ("app/auth.py", None) and "line 30" in f[1]["comment"]
+    assert (f[2]["file"], f[2]["line"]) == ("", None) and "`elsewhere.py`" in f[2]["comment"] and "foreign file" in f[2]["comment"]
+    assert (f[4]["file"], f[4]["line"]) == ("app/auth.py", 41)
 
 
-def test_a_dropped_finding_never_turns_into_an_approval():
-    only_foreign = check_citations(_v(("high", "elsewhere.py", 1, "x")), diff_index(DIFF))
-    assert only_foreign["findings"] == [] and only_foreign["verdict"] == "request_changes"
-    assert "dropped" in github_body(only_foreign) and "dropped" not in github_body(_v())
+def test_a_citation_check_never_changes_the_verdict():
+    for verdict in ("approve", "request_changes"):
+        v = check_citations(_v(("medium", "elsewhere.py", 1, "x"), verdict=verdict), diff_index(DIFF))
+        assert v["verdict"] == verdict and len(v["findings"]) == 1
+    assert "location was removed" in github_body(v) and "location was removed" not in github_body(_v())
 
 
 def test_focus_is_read_from_the_local_profile_only(tmp_path):
