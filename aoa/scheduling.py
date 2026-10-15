@@ -1,6 +1,8 @@
 """Routines as Temporal Schedules: a cron fires RoutineWorkflow, which hands the prompt to the session."""
 from __future__ import annotations
 
+import logging
+
 from temporalio.client import (
     Client,
     Schedule,
@@ -12,6 +14,26 @@ from temporalio.client import (
 from temporalio.service import RPCError, RPCStatusCode
 
 from .config import Settings
+
+log = logging.getLogger(__name__)
+
+POLL_FLOOR_SECONDS = 30
+POLL_DEFAULT_SECONDS = 600
+
+
+def poll_seconds(raw: str | None) -> int:
+    """AOA_GITHUB_POLL_SECONDS -> the poll interval: unset/empty 600, garbage 600 with a warning, floor 30."""
+    if raw is None or not raw.strip():
+        return POLL_DEFAULT_SECONDS
+    try:
+        v = int(raw.strip())
+    except ValueError:
+        log.warning("AOA_GITHUB_POLL_SECONDS=%r is not an integer; using %d", raw, POLL_DEFAULT_SECONDS)
+        return POLL_DEFAULT_SECONDS
+    if v < POLL_FLOOR_SECONDS:
+        log.warning("AOA_GITHUB_POLL_SECONDS=%d is below the %ds floor; using %d", v, POLL_FLOOR_SECONDS, POLL_FLOOR_SECONDS)
+        return POLL_FLOOR_SECONDS
+    return v
 
 
 class TemporalScheduler:
@@ -61,7 +83,7 @@ async def ensure_github_schedule(client: Client, settings: Settings) -> None:
     from .delivery import workflow_cfg
 
     session = os.environ.get("AOA_SESSION", "main")
-    every = int(os.environ.get("AOA_GITHUB_POLL_SECONDS", "600"))
+    every = poll_seconds(os.environ.get("AOA_GITHUB_POLL_SECONDS"))
     schedule = Schedule(
         action=ScheduleActionStartWorkflow(
             "GithubPollWorkflow",
