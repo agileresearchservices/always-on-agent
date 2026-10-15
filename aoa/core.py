@@ -158,6 +158,13 @@ class AgentCore:
         v = self.store.kv_get(session, f"fp:{conv}")
         return (v[0], v[1]) if v else None
 
+    def _thinking_for(self, conv: str) -> dict[str, Any]:
+        """Extended thinking only for PR reviews (the helper conversations under prreview/), when configured:
+        adaptive thinking, with the configured effort."""
+        if self.s.review_thinking and conv.startswith("prreview/"):
+            return {"thinking": {"type": "adaptive"}, "effort": self.s.review_thinking}
+        return {}
+
     # ---- the model step ----------------------------------------------------------------
     async def llm_step(self, session: str, conv: str, step_key: str, role: str, depth: int) -> dict[str, Any]:
         done = self.store.step_get(conv, f"llm:{step_key}")
@@ -167,9 +174,12 @@ class AgentCore:
         messages = self.store.load_messages(conv)
         prev = self.store.last_usage(conv)
         resp = await self.llm.create(
-            model=model, system=system, messages=messages, tools=tools, max_tokens=self.s.max_tokens
+            model=model, system=system, messages=messages, tools=tools, max_tokens=self.s.max_tokens,
+            **self._thinking_for(conv),
         )
-        content = resp.content or [{"type": "text", "text": "(no output)"}]
+        content = resp.content
+        if not any(b["type"] in ("text", "tool_use") for b in content):  # empty, or thinking only (cut off)
+            content = [*content, {"type": "text", "text": "(no output)"}]
         cache_miss = is_cache_miss(prev, resp.usage, self.s.cache_ttl_seconds)
         fp = request_fingerprint(system, tools, messages)
         prev_fp = self._fp.get(conv) or self._stored_fp(session, conv)

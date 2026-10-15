@@ -263,6 +263,73 @@ async def test_anthropic_llm_sends_the_ttl():
     assert seen["system"][-1]["cache_control"]["ttl"] == "1h" and seen["tools"][-1]["cache_control"]["ttl"] == "1h"
 
 
+def test_a_breakpoint_never_lands_on_a_thinking_block():
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "a"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "b"},
+                                              {"type": "thinking", "thinking": "t", "signature": "s"}]}]
+    _, m, _ = place_cache_breakpoints([], msgs, [])
+    assert "cache_control" in m[-1]["content"][0] and "cache_control" not in m[-1]["content"][1]
+
+
+async def test_anthropic_llm_keeps_thinking_blocks_and_sends_the_budget():
+    from types import SimpleNamespace as NS
+    from aoa.llm import AnthropicLLM
+
+    seen = {}
+
+    class Msgs:
+        async def create(self, **kw):
+            seen.update(kw)
+            return NS(content=[NS(type="thinking", thinking="hm", signature="sig=="), NS(type="redacted_thinking", data="blob"),
+                               NS(type="text", text="ok")], stop_reason="end_turn",
+                      usage=NS(input_tokens=1, output_tokens=1, cache_read_input_tokens=0, cache_creation_input_tokens=0))
+
+    llm = AnthropicLLM(NS(messages=Msgs()), cache_ttl_seconds=300)
+    r = await llm.create(model="m", system=[], tools=[], max_tokens=5000,
+                         thinking={"type": "adaptive"}, effort="high",
+                         messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    assert seen["thinking"] == {"type": "adaptive"} and seen["output_config"] == {"effort": "high"}
+    assert r.content == [{"type": "thinking", "thinking": "hm", "signature": "sig=="},
+                         {"type": "redacted_thinking", "data": "blob"}, {"type": "text", "text": "ok"}]
+    seen.clear()
+    await llm.create(model="m", system=[], tools=[], max_tokens=5,
+                     messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    assert "thinking" not in seen and "output_config" not in seen
+
+
+def test_review_thinking_setting_accepts_only_known_effort_levels(monkeypatch, tmp_path):
+    from aoa.config import Settings
+
+    monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
+    for raw, want in (("high", "high"), (" Medium ", "medium"), ("max", "max"), ("0", ""), ("4096", ""), ("on", ""), ("", "")):
+        monkeypatch.setenv("AOA_REVIEW_THINKING", raw)
+        assert Settings.from_env().review_thinking == want
+    monkeypatch.delenv("AOA_REVIEW_THINKING")
+    assert Settings.from_env().review_thinking == ""
+
+
+async def test_forced_tool_choice_drops_thinking_and_effort():
+    from types import SimpleNamespace as NS
+    from aoa.llm import AnthropicLLM
+
+    seen = {}
+
+    class Msgs:
+        async def create(self, **kw):
+            seen.clear(); seen.update(kw)
+            return NS(content=[NS(type="text", text="ok")], stop_reason="end_turn",
+                      usage=NS(input_tokens=1, output_tokens=1, cache_read_input_tokens=0, cache_creation_input_tokens=0))
+
+    llm = AnthropicLLM(NS(messages=Msgs()), cache_ttl_seconds=300)
+    base = dict(model="m", system=[], tools=[{"name": "x", "input_schema": {"type": "object"}}], max_tokens=5000,
+                thinking={"type": "adaptive"}, effort="high",
+                messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    await llm.create(**base, tool_choice={"type": "tool", "name": "x"})
+    assert "thinking" not in seen and "output_config" not in seen
+    await llm.create(**base, tool_choice={"type": "auto"})
+    assert seen["thinking"] == {"type": "adaptive"} and seen["output_config"] == {"effort": "high"}
+
+
 # ---- store --------------------------------------------------------------------------------------
 def test_commit_step_is_atomic_and_idempotent(settings):
     st = Store(settings.db_path)

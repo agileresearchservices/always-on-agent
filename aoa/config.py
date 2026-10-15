@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,11 +44,20 @@ class Settings:
     # sandbox
     shell_timeout_seconds: int
     approval_nudge_seconds: int
+    review_thinking: str
     approval_expire_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
         sonnet = os.environ.get("AOA_MODEL", "claude-sonnet-5-5")
+        max_tokens = _int("AOA_MAX_TOKENS", 16000)
+        # extended thinking for PR reviews: the effort level ("low".."max"); anything else (default) = off. The
+        # current models take adaptive thinking steered by effort, not a token budget.
+        review_thinking = os.environ.get("AOA_REVIEW_THINKING", "").strip().lower()
+        if review_thinking and review_thinking not in ("low", "medium", "high", "xhigh", "max"):
+            logging.getLogger(__name__).warning(
+                "AOA_REVIEW_THINKING=%r is not an effort level (low|medium|high|xhigh|max); thinking stays off", review_thinking)
+            review_thinking = ""
         nudge = max(1, _int("AOA_APPROVAL_NUDGE", 4 * 3600))  # expiry must come after the nudge
         return cls(
             data_dir=Path(os.environ.get("AOA_DATA_DIR", "./data")).resolve(),
@@ -61,7 +71,7 @@ class Settings:
             max_steps_per_turn=_int("AOA_MAX_STEPS", 40),
             max_helper_steps=_int("AOA_MAX_HELPER_STEPS", 30),
             max_helper_depth=_int("AOA_MAX_HELPER_DEPTH", 1),
-            max_tokens=_int("AOA_MAX_TOKENS", 16000),
+            max_tokens=max_tokens,
             tool_result_max_chars=_int("AOA_TOOL_RESULT_MAX_CHARS", 8000),
             context_hard_limit_tokens=_int("AOA_CONTEXT_HARD_LIMIT", 120_000),
             context_warm_compact_tokens=_int("AOA_CONTEXT_WARM_COMPACT", 50_000),
@@ -72,6 +82,7 @@ class Settings:
             quiet_start_hour=_int("AOA_QUIET_START", 22),
             quiet_end_hour=_int("AOA_QUIET_END", 7),
             shell_timeout_seconds=_int("AOA_SHELL_TIMEOUT", 60),
+            review_thinking=review_thinking,
             approval_nudge_seconds=nudge,
             approval_expire_seconds=max(nudge + 1, _int("AOA_APPROVAL_EXPIRE", 24 * 3600)),
         )

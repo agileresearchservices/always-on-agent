@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Always-on agent prototype: durable Temporal workflows, file memory, sandbox sleep/wake, cache-aware context"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic",
+    "anthropic>=1.13",  # output_config / adaptive thinking
     "temporalio",
     "fastapi",
     "uvicorn",
