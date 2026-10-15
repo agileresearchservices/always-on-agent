@@ -17,6 +17,7 @@ temporal server start-dev                 # terminal 1 (Temporal CLI)
 python -m aoa.worker                      # terminal 2
 uvicorn aoa.server:app --port 8000        # terminal 3
 python -m aoa.client_cli --session main   # terminal 4
+python -m aoa usage                       # estimated API spend per day (from the usage table)
 ```
 
 Trigger it from outside the chat:
