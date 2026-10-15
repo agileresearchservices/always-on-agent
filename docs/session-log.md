@@ -240,4 +240,5 @@ PRs merged (all squash, each bot-reviewed APPROVE with only low findings left): 
 - Validation runs in a subprocess with only the API key because `evals.runner.install_fakes` replaces `gh_call` process-wide. `evals` is not part of the installed package, so `eval_proposal` adds the repo root to `sys.path` before importing it.
 - New env: `AOA_EVAL_VALIDATE_RUNS`, `AOA_EVAL_PROPOSALS_PER_DAY`. A retried draft activity resumes a proposal stuck in `drafting` instead of double-counting it.
 - Not exercised against the real model yet: first live `aoa propose` will cost a few cents (one draft call plus the validation runs).
+- Follow-ups from aoa's review of #57 (folded in here, since #57 merged as `a1fc11e` on an APPROVE): `tool_errors` is now counted per turn (`tool_errors:<tool>:<turn>`), so scattered failures over months no longer add up; `cache_miss` is one flag per conversation (a restart that changes the tool index causes one expected miss); the open-report cap uses a SQL count. Left as is: evidence for a denied approval can include message text (local tool, noted).
 
