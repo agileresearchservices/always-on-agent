@@ -199,3 +199,8 @@ CASES += [
         tags=["review"],
     ),
 ]
+
+
+from .review_cases import hard_review_cases  # noqa: E402  (needs Case above)
+
+CASES += hard_review_cases(Case)

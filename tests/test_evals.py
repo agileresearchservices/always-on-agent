@@ -1,6 +1,8 @@
 """Grader and harness tests: canned runs and a scripted FakeLLM, no real model."""
 from __future__ import annotations
 
+import re
+
 from aoa.testing import FakeLLM, text, tool
 from evals import graders as g
 from evals.cases import CASES, Case
@@ -263,3 +265,41 @@ def test_the_batch_marker_shows_in_the_table():
     rep = {"model": "m", "runs_per_case": 1, "seconds": 5.0, "tokens": dict(input_tokens=1, output_tokens=1, cache_read=0, cache_write=0),
            "cases": {}, "batch": {"batches": 4, "requests": 40}}
     assert "batch mode (40 requests in 4 batches" in format_table(rep)
+
+
+def _rv(*findings, summary="s", verdict="request_changes"):
+    return Run(verdict={"verdict": verdict, "summary": summary, "findings": [
+        {"severity": sev, "file": "a.py", "line": 1, "comment": c} for sev, c in findings]})
+
+
+def test_finds_defects_counts_groups_and_records_the_score():
+    groups = {"order": ("before&send", "never told"), "cfg": ("keyerror",), "other": ("symlink",)}
+    r = _rv(("medium", "State is saved BEFORE the send, so a retry skips it."), ("low", "A KeyError is possible."))
+    ok, msg = g.finds_defects(groups, at_least=2)(r)
+    assert ok and r.metrics["defects"] == [2, 3]
+    ok, msg = g.finds_defects(groups, at_least=3)(r)
+    assert not ok and "found 2/3" in msg and "missed: other" in msg
+    # "a&b" needs both words in one finding, not spread over two
+    split = _rv(("low", "before it"), ("low", "send it"))
+    assert not g.finds_defects({"order": ("before&send",)}, 1)(split)[0]
+    assert g.finds_defects({"order": ("before&send",)}, 1)(_rv(summary="saved before the send"))[0]  # the summary counts
+    assert not g.finds_defects(groups, 1)(Run())[0]
+
+
+def test_no_high_findings():
+    assert g.no_high_findings()(_rv(("medium", "x"), ("low", "y")))[0]
+    assert not g.no_high_findings()(_rv(("high", "boom")))[0]
+    assert not g.no_high_findings()(Run())[0]
+
+
+def test_hard_review_fixtures_are_complete_and_safe():
+    from evals.review_cases import CLEAN, DIR, PRE
+
+    hard = [c for c in CASES if "review-hard" in c.tags]
+    assert len(hard) == len(PRE) + len(CLEAN) and all("slow" in c.tags and not c.hard for c in hard)
+    for c in hard:
+        fx = c.pr_fixture
+        assert fx["title"] and "diff --git" in fx["diff"] and len(fx["diff"]) < 60000  # the reviewer reads at most 60k chars
+    for p in DIR.glob("*/diff.patch"):
+        t = p.read_text()
+        assert not re.search(r"sk-ant-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_\w{20,}|xox[bp]-\d|-----BEGIN [A-Z ]*PRIVATE KEY", t), p

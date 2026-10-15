@@ -1,0 +1,369 @@
+diff --git a/.env.example b/.env.example
+index 15a3ed6..83aea17 100644
+--- a/.env.example
++++ b/.env.example
+@@ -49,3 +49,7 @@ AOA_WEBHOOK_SECRET=
+ # Test command run after aoa resolves a PR's merge conflicts (before it pushes), per repo; "" = none.
+ # Otherwise the base branch's .aoa/test-command is used, else pytest in a fresh venv for Python repos with tests.
+ # AOA_TEST_COMMANDS={"agileresearchservices/some-repo": "make test"}
++
++# Approvals: nudge once after this many seconds, expire after the second (defaults 4h / 24h)
++# AOA_APPROVAL_NUDGE=14400
++# AOA_APPROVAL_EXPIRE=86400
+diff --git a/CLAUDE.md b/CLAUDE.md
+index f0d0b64..7a8a34b 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -42,7 +42,7 @@ Things that are easy to break:
+ - **Tools run at most once** (`NO_RETRY` in `WorkflowOps.run_tool`); a failed tool is reported to the model as "effects unknown", never re-run. Model calls are retried. Keep new tool handlers consistent with this.
+ - **Prompt-cache stability** (`prompt.py`, `llm.place_cache_breakpoints`): the system prompt and tool block must be a fixed, ordered prefix; volatile context (time, scratchpad, recent log) goes into the new user message via `volatile_context_block`, not the system prompt. `core.llm_step` logs a warning on a cache miss within the TTL, which is treated as a bug. Compaction and `warm_cache` deliberately reuse the exact main-agent prefix via `_setup("main", 0)`.
+ - **Tools** (`tools.py`): core tools ship full schemas; deferred tools appear only by name in the prompt and are reached via `tool_search` / `call_deferred`. `spawn_helper` is declared in `tools.py` but executed by the loop, not a handler. Handlers raise `ToolError` with an actionable message for the model; results over `tool_result_max_chars` are spilled to a sandbox file by `core._cap`.
+-- **Trust**: external event text is rendered/wrapped as untrusted data (`events.render_event_text`, `safety.wrap_untrusted`); commands pass a denylist then a reviewer model that fails closed (`safety.py`); `external_send` goes through the approval flow; only user-started turns (`trigger_user`) may create routines, and `send_user` turns an `update` into a `reply` in those turns so quiet hours never hold an answer. PR reviews post as a real APPROVE / REQUEST_CHANGES only through the reviewer identity (`gh_reviewer.py`: `AOA_REVIEWER_APP_ID` + key file, or `AOA_REVIEWER_TOKEN`; off when unset), falling back to a comment review on any failure. Merging a PR is never a model tool: only a Slack [Merge] click on an approved review card (an opaque offer id stored by `publish_pr_review`) starts `MergePrWorkflow`, which pins the reviewed commit. On conflicts it resolves them in a temp clone and pushes (`pr_resolve.py`; token only via `GIT_CONFIG_*` env, tests run with an allowlisted env), and the new commit needs its own review and click. It refuses while GitHub auto-merge is on (checked before cloning and again before the push), never pushes a clean merge (`no_conflict`: GitHub's status was stale), and requires every line outside the conflict hunks to survive verbatim (`finish_resolution`). Failure `action`s in `pr_merge.RETRYABLE` bring the card's Merge button back; `needs_human`, `stale` and `tests_failed` do not. Per-repo test command: `AOA_TEST_COMMANDS` > `.aoa/test-command` as it is on the base branch (never the PR's) > pytest in a fresh venv. Those tests run as your user, not in a container (#21 was skipped on purpose), so the resolver is for your own PRs only.
++- **Trust**: external event text is rendered/wrapped as untrusted data (`events.render_event_text`, `safety.wrap_untrusted`); commands pass a denylist then a reviewer model that fails closed (`safety.py`); `external_send` goes through the approval flow (a pending approval gets one nudge after `AOA_APPROVAL_NUDGE`, default 4h, and expires after `AOA_APPROVAL_EXPIRE`, default 24h, driven by `SessionWorkflow` timers guarded by `workflow.patched("approval-expiry")`; an expired approval cannot be approved late); only user-started turns (`trigger_user`) may create routines, and `send_user` turns an `update` into a `reply` in those turns so quiet hours never hold an answer. PR reviews post as a real APPROVE / REQUEST_CHANGES only through the reviewer identity (`gh_reviewer.py`: `AOA_REVIEWER_APP_ID` + key file, or `AOA_REVIEWER_TOKEN`; off when unset), falling back to a comment review on any failure. Merging a PR is never a model tool: only a Slack [Merge] click on an approved review card (an opaque offer id stored by `publish_pr_review`) starts `MergePrWorkflow`, which pins the reviewed commit. On conflicts it resolves them in a temp clone and pushes (`pr_resolve.py`; token only via `GIT_CONFIG_*` env, tests run with an allowlisted env), and the new commit needs its own review and click. It refuses while GitHub auto-merge is on (checked before cloning and again before the push), never pushes a clean merge (`no_conflict`: GitHub's status was stale), and requires every line outside the conflict hunks to survive verbatim (`finish_resolution`). Failure `action`s in `pr_merge.RETRYABLE` bring the card's Merge button back; `needs_human`, `stale` and `tests_failed` do not. Per-repo test command: `AOA_TEST_COMMANDS` > `.aoa/test-command` as it is on the base branch (never the PR's) > pytest in a fresh venv. Those tests run as your user, not in a container (#21 was skipped on purpose), so the resolver is for your own PRs only.
+ - `notify.Notifier` decides whether outbound messages go now or are held in a digest (min interval, quiet hours); replies/questions/approvals/urgent always go. Held updates are delivered by a durable timer: `SessionWorkflow` asks `digest_status` for `Notifier.next_flush_at` after each turn and wakes at that time to run `flush_digest` (idempotent client key; guarded by `workflow.patched("digest-flush")`).
+ - `sandbox.LocalSandbox` is not isolation (runs as your user in a directory); `memory.py` is file-based (profile, dated log, scratchpad, skills) under `<data_dir>/memory`.
+ 
+diff --git a/README.md b/README.md
+index 779efba..fe64ac5 100644
+--- a/README.md
++++ b/README.md
+@@ -71,7 +71,7 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
+ | Compact inside the warm window | `compaction.py`: summariser reuses the exact cached prefix |
+ | Long output goes to a file | `sandbox._spill`, `core._cap` |
+ | Auto-review of commands by a second model | `safety.py`: denylist, then reviewer model, fail closed |
+-| Untrusted input is data; irreversible actions need approval | `events.render_event_text`, `safety.wrap_untrusted`, `external_send` approval flow |
++| Untrusted input is data; irreversible actions need approval | `events.render_event_text`, `safety.wrap_untrusted`, `external_send` approval flow; a pending approval is nudged once after `AOA_APPROVAL_NUDGE` (4h) and lapses after `AOA_APPROVAL_EXPIRE` (24h) via workflow timers |
+ | Errors written for agents | `ToolError` messages say what to do next |
+ | Watch, review, merge (PR flow) | `github_monitor.py` announces PRs; `PrReviewWorkflow` runs a reviewer sub-agent and posts its review (`pr_review.py`): a real APPROVE / REQUEST_CHANGES when a reviewer identity is configured (`gh_reviewer.py`, a GitHub App with per-repo tokens), else a comment review with a stated recommendation; an approved card gets a Slack [Merge] button that starts `MergePrWorkflow` (`pr_merge.py`): wait for checks, squash-merge pinned to the reviewed commit, delete the branch, confirm linked issues closed. On conflicts the click instead has `pr_resolve.py` resolve them in a throwaway clone (model per file, validated), run the repo's tests with no secrets in the environment, and push; the new commit is reviewed again and needs a second click. The model never has a merge tool |
+ 
+diff --git a/aoa/activities.py b/aoa/activities.py
+index ff91a9d..946cc37 100644
+--- a/aoa/activities.py
++++ b/aoa/activities.py
+@@ -54,6 +54,14 @@ class AgentActivities:
+     async def maybe_compact(self, a: dict[str, Any]) -> str:
+         return await self.core.maybe_compact(a["session"], a["conv"])
+ 
++    @activity.defn(name="approvals_next")
++    async def approvals_next(self, session: str) -> float | None:
++        return await self.core.approvals_next(session)
++
++    @activity.defn(name="approvals_tick")
++    async def approvals_tick(self, session: str) -> dict[str, Any]:
++        return await self.core.approvals_tick(session)
++
+     @activity.defn(name="digest_status")
+     async def digest_status(self, session: str) -> float | None:
+         return await self.core.digest_status(session)
+@@ -322,7 +330,7 @@ class AgentActivities:
+     def all(self) -> list:
+         return [
+             self.prepare_turn, self.prepare_helper, self.llm_step, self.run_tool, self.append_results,
+-            self.maybe_compact, self.digest_status, self.flush_digest, self.sandbox_sleep, self.warm_cache, self.report_failure,
++            self.maybe_compact, self.digest_status, self.flush_digest, self.approvals_next, self.approvals_tick, self.sandbox_sleep, self.warm_cache, self.report_failure,
+             self.deliver_routine_event, self.poll_github, self.publish_pr_review,
+             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
+             self.merge_issue_states, self.merge_report, self.resolve_conflicts,
+diff --git a/aoa/config.py b/aoa/config.py
+index f40fde7..d07ad8e 100644
+--- a/aoa/config.py
++++ b/aoa/config.py
+@@ -42,6 +42,8 @@ class Settings:
+     quiet_end_hour: int
+     # sandbox
+     shell_timeout_seconds: int
++    approval_nudge_seconds: int
++    approval_expire_seconds: int
+ 
+     @classmethod
+     def from_env(cls) -> "Settings":
+@@ -69,6 +71,8 @@ class Settings:
+             quiet_start_hour=_int("AOA_QUIET_START", 22),
+             quiet_end_hour=_int("AOA_QUIET_END", 7),
+             shell_timeout_seconds=_int("AOA_SHELL_TIMEOUT", 60),
++            approval_nudge_seconds=_int("AOA_APPROVAL_NUDGE", 4 * 3600),
++            approval_expire_seconds=_int("AOA_APPROVAL_EXPIRE", 24 * 3600),
+         )
+ 
+     # Derived paths -------------------------------------------------------
+diff --git a/aoa/core.py b/aoa/core.py
+index f0d74a7..26bfa7a 100644
+--- a/aoa/core.py
++++ b/aoa/core.py
+@@ -259,6 +259,43 @@ class AgentCore:
+             self.memory.append_log(f"compacted conversation ({mode}, ~{tokens} tokens before)", self.now())
+         return mode if ok else "none"
+ 
++    def _approval_times(self, a: dict[str, Any], nudged: bool) -> list[float]:
++        out = [a["ts"] + self.s.approval_expire_seconds]
++        if not nudged:
++            out.append(a["ts"] + self.s.approval_nudge_seconds)
++        return out
++
++    async def approvals_next(self, session: str) -> float | None:
++        """Earliest moment a pending approval needs a nudge or lapses (epoch seconds), or None."""
++        times = [t for a in self.store.approvals_pending(session)
++                 for t in self._approval_times(a, bool(self.store.kv_get(session, f"apr_nudged:{a['id']}", False)))]
++        return min(times) if times else None
++
++    async def approvals_tick(self, session: str) -> dict[str, Any]:
++        """Nudge approvals pending past the nudge age once, expire those past the expiry age, tell the person
++        (as an alert: it waits out quiet hours). Idempotent: the nudge flag and the pending->expired
++        transition each happen once."""
++        now = self.now()
++        done: dict[str, list[str]] = {"nudged": [], "expired": []}
++        for a in self.store.approvals_pending(session):
++            what = a["action"].get("tool", "action")
++            if now.timestamp() >= a["ts"] + self.s.approval_expire_seconds:
++                if self.store.approval_expire(a["id"]):
++                    self.notifier.send(
++                        session, "alert", f"Approval {a['id']} ({what}) lapsed after "
++                        f"{self.s.approval_expire_seconds // 3600}h without an answer, so it was NOT done. "
++                        "Ask me again if you still want it.", now, client_key=f"apr-expired:{a['id']}")
++                    done["expired"].append(a["id"])
++            elif now.timestamp() >= a["ts"] + self.s.approval_nudge_seconds:
++                if not self.store.kv_get(session, f"apr_nudged:{a['id']}", False):
++                    self.store.kv_set(session, f"apr_nudged:{a['id']}", True)
++                    self.notifier.send(
++                        session, "alert", f"Still waiting on your decision for approval {a['id']} ({what}). "
++                        f"It lapses after {self.s.approval_expire_seconds // 3600}h.", now,
++                        client_key=f"apr-nudge:{a['id']}")
++                    done["nudged"].append(a["id"])
++        return done | {"next": await self.approvals_next(session)}
++
+     async def digest_status(self, session: str) -> float | None:
+         """When the held digest may go out (epoch seconds), or None. The workflow arms a durable timer on it."""
+         return self.notifier.next_flush_at(session, self.now())
+diff --git a/aoa/server.py b/aoa/server.py
+index f2da782..16326d1 100644
+--- a/aoa/server.py
++++ b/aoa/server.py
+@@ -129,7 +129,10 @@ async def decide(sid: str, approval_id: str, d: Decision) -> dict[str, Any]:
+     if rec is None or rec["session"] != sid:
+         raise HTTPException(404, "no such approval")
+     if not store.approval_resolve(approval_id, d.approve):
+-        raise HTTPException(409, f"already {rec['status']}")
++        status = (store.approval_get(approval_id) or rec)["status"]  # re-read: it may have lapsed just now
++        if status == "expired":
++            raise HTTPException(409, "this approval expired unanswered; ask the agent again")
++        raise HTTPException(409, f"already {status}")
+     act = rec["action"]
+     summary = f"{act.get('tool')} to {act['channel']}" if act.get("channel") else f"{act.get('tool')} '{act.get('name')}'"
+     await deliver_event(app.state.client, settings, sid, approval_event(approval_id, d.approve, summary).to_dict())
+diff --git a/aoa/slack_bridge.py b/aoa/slack_bridge.py
+index b08950e..6a1f9eb 100644
+--- a/aoa/slack_bridge.py
++++ b/aoa/slack_bridge.py
+@@ -189,7 +189,12 @@ class Bridge:
+             f"/sessions/{self.cfg.session}/approvals/{approval_id}", json={"approve": approved}
+         )
+         if r.status_code == 409:
+-            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{approval_id} was already decided._")
++            try:
++                detail = str(r.json().get("detail") or "")
++            except ValueError:
++                detail = ""
++            what = detail if "expired" in detail else "was already decided"
++            await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{approval_id} {what}._")
+             return
+         self._check(r, "decide approval")
+         if r.status_code >= 400:
+diff --git a/aoa/store.py b/aoa/store.py
+index 6081f25..d190a3a 100644
+--- a/aoa/store.py
++++ b/aoa/store.py
+@@ -263,6 +263,16 @@ class Store:
+             )
+             return cur.rowcount == 1
+ 
++    def approvals_pending(self, session: str) -> list[dict[str, Any]]:
++        with self._conn() as c:
++            rows = c.execute("SELECT * FROM approvals WHERE session=? AND status='pending'", (session,)).fetchall()
++        return [dict(r) | {"action": json.loads(r["action"])} for r in rows]
++
++    def approval_expire(self, approval_id: str) -> bool:
++        with self._conn() as c:
++            cur = c.execute("UPDATE approvals SET status='expired' WHERE id=? AND status='pending'", (approval_id,))
++            return cur.rowcount == 1
++
+     # ---- routines ----------------------------------------------------------
+     def routine_put(self, session: str, name: str, cron: str, prompt: str) -> None:
+         with self._conn() as c:
+diff --git a/aoa/tools.py b/aoa/tools.py
+index bc9450b..7a0eebe 100644
+--- a/aoa/tools.py
++++ b/aoa/tools.py
+@@ -271,6 +271,8 @@ async def _approval_gate(
+         raise ToolError("the request differs from what was approved; request a new approval")
+     if rec["status"] == "pending":
+         return "still waiting for the person to decide. Do not proceed."
++    if rec["status"] == "expired":
++        return "this approval lapsed unanswered, so the action was NOT done. Do not proceed. Ask the person again if it still matters."
+     if rec["status"] == "denied":
+         return "the person denied this. Do not proceed. Ask what they would prefer."
+     return None
+diff --git a/aoa/workflows.py b/aoa/workflows.py
+index 1b36b5f..431abb6 100644
+--- a/aoa/workflows.py
++++ b/aoa/workflows.py
+@@ -92,6 +92,7 @@ class SessionWorkflow:
+         self._warm_requested = False
+         self._last_warm = -1e9
+         self._flush_at: float | None = None  # when the held digest may go out (epoch seconds)
++        self._apr_at: float | None = None  # when a pending approval next needs a nudge or lapses
+ 
+     # ---- signals / queries ------------------------------------------------------------
+     @workflow.signal
+@@ -134,12 +135,13 @@ class SessionWorkflow:
+         for ev in inp.get("carry", []):
+             self.submit_event(ev)
+         ops = WorkflowOps(session, cfg)
+-        await self._arm_flush(session)  # items held before a continue-as-new still need their timer
++        await self._arm_timers(session)  # items held / pending before a continue-as-new still need their timers
+ 
+         while not self._stop:
+             if not self._should_wake():
+                 idle = None if self._asleep else float(cfg["idle_sleep"])
+-                due = None if self._flush_at is None else max(1.0, self._flush_at - workflow.time())
++                nxt = [t for t in (self._flush_at, self._apr_at) if t is not None]
++                due = max(1.0, min(nxt) - workflow.time()) if nxt else None
+                 wait = idle if due is None else (due if idle is None else min(idle, due))
+                 try:
+                     if wait is None:
+@@ -147,8 +149,18 @@ class SessionWorkflow:
+                     else:
+                         await workflow.wait_condition(self._should_wake, timeout=timedelta(seconds=wait))
+                 except asyncio.TimeoutError:
++                    fired = False
+                     if self._flush_at is not None and workflow.time() >= self._flush_at:
+                         await self._flush_digest(session)
++                        fired = True
++                    if self._apr_at is not None and workflow.time() >= self._apr_at:
++                        res = await workflow.execute_activity(
++                            "approvals_tick", session, start_to_close_timeout=timedelta(seconds=30),
++                            retry_policy=STATE_RETRY,
++                        )
++                        self._apr_at = res.get("next")
++                        fired = True
++                    if fired:
+                         continue
+                     await workflow.execute_activity(
+                         "sandbox_sleep", session, start_to_close_timeout=timedelta(minutes=2),
+@@ -183,20 +195,24 @@ class SessionWorkflow:
+             else:
+                 events, self._bg_q = self._bg_q, []
+             await self._run_turn(ops, session, cfg, events)
+-            await self._arm_flush(session)
++            await self._arm_timers(session)
+ 
+             if workflow.info().is_continue_as_new_suggested() and workflow.all_handlers_finished():
+                 workflow.continue_as_new(
+                     {"session": session, "cfg": cfg, "carry": self._user_q + self._bg_q}
+                 )
+ 
+-    async def _arm_flush(self, session: str) -> None:
+-        """Ask when held updates may go out, so a durable timer (not the next message) delivers them."""
+-        if not workflow.patched("digest-flush"):
+-            return
+-        self._flush_at = await workflow.execute_activity(
+-            "digest_status", session, start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
+-        )
++    async def _arm_timers(self, session: str) -> None:
++        """Ask when held updates may go out and when a pending approval needs a nudge or lapses, so durable
++        timers (not the next message) act on them."""
++        if workflow.patched("digest-flush"):
++            self._flush_at = await workflow.execute_activity(
++                "digest_status", session, start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
++            )
++        if workflow.patched("approval-expiry"):
++            self._apr_at = await workflow.execute_activity(
++                "approvals_next", session, start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
++            )
+ 
+     async def _flush_digest(self, session: str) -> None:
+         res = await workflow.execute_activity(
+diff --git a/docs/session-log.md b/docs/session-log.md
+index ac0ce4a..11bbdf6 100644
+--- a/docs/session-log.md
++++ b/docs/session-log.md
+@@ -168,3 +168,4 @@ planned eval flywheel).
+ 
+ - Review of Temporal/Anthropic features produced six work items (issues below). Order: timers, replay tests + search attributes, 1h cache TTL, thinking blocks, native tool search + structured outputs, batch evals.
+ - **#28 digest flush timer:** `Notifier.next_flush_at` / `flush_digest`; `SessionWorkflow` waits with `min(idle_sleep, time to flush)` and flushes held updates when quiet hours end or the spacing passes (previously they waited for the next message).
++- **#30 approval expiry:** `approvals_next` / `approvals_tick` activities; `SessionWorkflow` wakes at the earliest nudge/expiry, nudges once (4h) and expires (24h), telling the person via an `alert`. The tool tells the model it lapsed; a late click gets 409 "expired".
+diff --git a/tests/test_edge.py b/tests/test_edge.py
+index 781605a..c412ce1 100644
+--- a/tests/test_edge.py
++++ b/tests/test_edge.py
+@@ -220,3 +220,45 @@ async def test_github_write_close_posts_comment_then_closes(make_core, monkeypat
+                      ("PATCH", "/repos/agileresearchservices/demo/issues/2", {"state": "closed", "state_reason": "not_planned"})]
+     with pytest.raises(ToolError, match="close_reason"):
+         await h(ctx, {**args, "close_reason": "whatever"})
++
++
++async def test_approval_nudge_then_expiry(make_core):
++    from conftest import AFTERNOON
++    from aoa.tools import REGISTRY
++
++    core, _ = make_core([text("ok")])
++    st, now = core.store, AFTERNOON.timestamp()
++
++    def put(aid, age):
++        st.approval_request(aid, "main", {"tool": "external_send", "channel": "email:bob", "text": "x"})
++        with st._conn() as c:
++            c.execute("UPDATE approvals SET ts=? WHERE id=?", (now - age, aid))
++
++    put("apr-new", 60)
++    put("apr-4h", 5 * 3600)
++    put("apr-old", 25 * 3600)
++    assert await core.approvals_next("main") == now - 25 * 3600 + core.s.approval_nudge_seconds  # already due
++    res = await core.approvals_tick("main")
++    assert res["nudged"] == ["apr-4h"] and res["expired"] == ["apr-old"]
++    assert st.approval_get("apr-old")["status"] == "expired"
++    assert st.approval_get("apr-4h")["status"] == "pending" and st.approval_get("apr-new")["status"] == "pending"
++    texts = [o["payload"]["text"] for o in st.outbox_since("main")]
++    assert any("apr-old" in t and "lapsed" in t for t in texts) and any("apr-4h" in t and "Still waiting" in t for t in texts)
++    again = await core.approvals_tick("main")  # idempotent: no second nudge, nothing left to expire
++    assert again["nudged"] == [] and again["expired"] == []
++    assert again["next"] == min(now - 5 * 3600 + core.s.approval_expire_seconds,
++                                now - 60 + core.s.approval_nudge_seconds)
++    # the tool tells the model it lapsed, and a lapsed approval cannot be approved late
++    ctx = core._ctx("main", "main", "main", 0, True)
++    out = await REGISTRY["external_send"].handler(
++        ctx, {"channel": "email:bob", "text": "x", "approval_id": "apr-old"})
++    assert "lapsed" in out and "NOT done" in out
++    assert st.approval_resolve("apr-old", True) is False
++
++
++def test_late_click_on_an_expired_approval_is_409_with_a_clear_message(api):
++    client, _ = api
++    server.store.approval_request("apr-x", "main", {"tool": "external_send", "channel": "email:bob", "text": "x"})
++    assert server.store.approval_expire("apr-x")
++    r = client.post("/sessions/main/approvals/apr-x", json={"approve": True})
++    assert r.status_code == 409 and "expired" in r.json()["detail"]
+diff --git a/tests/test_temporal_e2e.py b/tests/test_temporal_e2e.py
+index d02ae78..0ae04f4 100644
+--- a/tests/test_temporal_e2e.py
++++ b/tests/test_temporal_e2e.py
+@@ -266,3 +266,21 @@ async def test_held_update_is_flushed_by_a_timer(client, env, monkeypatch):
+     outs = store.outbox_since(sid)
+     assert outs[0]["payload"]["text"] == "first"
+     assert outs[1]["kind"] == "update" and "second" in outs[1]["payload"]["text"]
++
++
++async def test_pending_approval_is_nudged_then_expires(client, env, monkeypatch):
++    """No click ever comes: the workflow's timers nudge once, then expire the approval, with nothing else
++    arriving at the session."""
++    monkeypatch.setenv("AOA_APPROVAL_NUDGE", "2")
++    monkeypatch.setenv("AOA_APPROVAL_EXPIRE", "5")
++    monkeypatch.setenv("AOA_QUIET_START", "0")
++    monkeypatch.setenv("AOA_QUIET_END", "0")  # never quiet
++    s = Settings.from_env()
++    sid = f"t-{uuid.uuid4().hex[:6]}"
++    script = [[tool("call_deferred", name="external_send", arguments={"channel": "email:bob", "text": "hi"})], text("waiting for the approval")]
++    store, _ = await _run(client, s, script, sid, [user_event("send bob a note")], 3, timeout=30)
++    texts = [o["payload"].get("text", "") for o in store.outbox_since(sid)]
++    assert any("Still waiting on your decision" in t for t in texts), [(o["kind"], o["payload"]) for o in store.outbox_since(sid)]
++    assert any("lapsed" in t for t in texts)
++    aid = next(o["payload"]["approval_id"] for o in store.outbox_since(sid) if o["kind"] == "approval")
++    assert store.approval_get(aid)["status"] == "expired"

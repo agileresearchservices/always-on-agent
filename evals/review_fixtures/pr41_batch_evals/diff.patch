@@ -1,0 +1,346 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index cfd3578..5c9c579 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -53,7 +53,7 @@ Things that are easy to break:
+ 
+ ## Evals
+ 
+-`python -m evals [--runs N] [--case NAME] [--list]` runs the seed behavior suite against the **real model** (needs `ANTHROPIC_API_KEY`; export only that, not the GitHub token). Each run uses a throwaway data dir, an in-memory scheduler and a fake GitHub (`gh_call` replaced by a recorder); `external_send` is already a stub. Cases (`evals/cases.py`) are `hard` (safety rules, must pass every run; non-zero exit otherwise) or `soft` (policy; watch the pass rate). Graders (`evals/graders.py`) are deterministic Python over the run's outbox, tool calls and recorded effects; they have canned-run unit tests in `tests/test_evals.py` (default `pytest`, no model). Results go to `evals/results/*.json` (git-ignored). Cost: the full suite at 3 runs/case (30 runs) used about 0.28M cache-read, 7k cache-write, 10k output tokens and took ~45 s, because runs share the cached prompt prefix; a cold cache costs more. Add a case whenever a behavior is verified by hand or a bug is found.
++`python -m evals [--runs N] [--case NAME] [--batch] [--list]` runs the seed behavior suite against the **real model** (needs `ANTHROPIC_API_KEY`; export only that, not the GitHub token). Each run uses a throwaway data dir, an in-memory scheduler and a fake GitHub (`gh_call` replaced by a recorder); `external_send` is already a stub. Cases (`evals/cases.py`) are `hard` (safety rules, must pass every run; non-zero exit otherwise) or `soft` (policy; watch the pass rate). Graders (`evals/graders.py`) are deterministic Python over the run's outbox, tool calls and recorded effects; they have canned-run unit tests in `tests/test_evals.py` (default `pytest`, no model). Results go to `evals/results/*.json` (git-ignored). Cost: the full suite at 3 runs/case (30 runs) used about 0.28M cache-read, 7k cache-write, 10k output tokens and took ~45 s, because runs share the cached prompt prefix; a cold cache costs more. `--batch` sends each round of model calls through the Message Batches API (`batch_llm.py`: all runs' next calls go out as one batch, the coordinator polls until it ends): half price but minutes per round, for large `--runs`. Add a case whenever a behavior is verified by hand or a bug is found.
+ 
+ ## Pull requests
+ 
+diff --git a/aoa/batch_llm.py b/aoa/batch_llm.py
+new file mode 100644
+index 0000000..7acb49a
+--- /dev/null
++++ b/aoa/batch_llm.py
+@@ -0,0 +1,103 @@
++"""An LLM that sends its calls through the Message Batches API (half price, results within minutes to hours).
++
++Used by `python -m evals --batch`. A run is a multi-step agent loop, but the runs are independent, so each
++"round" (every run's next model call) goes out as one batch: the coordinator waits until requests stop arriving
++(the runs are all blocked on a response), submits them together, polls until the batch ends, resolves each
++caller and the runs carry on. AgentCore and the loop are unchanged; they just see a slow model.
++"""
++from __future__ import annotations
++
++import asyncio
++import itertools
++import logging
++import sys
++from typing import Any, Callable
++
++from .llm import AnthropicLLM, LLMResponse, parse_message
++
++log = logging.getLogger(__name__)
++
++
++class BatchError(Exception):
++    pass
++
++
++class BatchCoordinator:
++    def __init__(self, client: Any | None = None, *, settle: float = 2.0, poll: float = 15.0,
++                 progress: Callable[[str], None] | None = None):
++        if client is None:
++            import anthropic
++
++            client = anthropic.AsyncAnthropic()
++        self.client, self.settle, self.poll = client, settle, poll
++        self.progress = progress or (lambda m: print(m, file=sys.stderr, flush=True))
++        self.batches = 0
++        self.requests = 0
++        self._pending: list[tuple[str, dict[str, Any], asyncio.Future]] = []
++        self._ids = itertools.count(1)
++        self._driver: asyncio.Task | None = None
++
++    async def submit(self, params: dict[str, Any], model: str) -> LLMResponse:
++        fut: asyncio.Future = asyncio.get_running_loop().create_future()
++        self._pending.append((f"r{next(self._ids)}", params, fut))
++        if self._driver is None or self._driver.done():
++            self._driver = asyncio.create_task(self._drive())
++        resp = await fut
++        return parse_message(resp, model)
++
++    async def _drive(self) -> None:
++        while self._pending:
++            seen = -1
++            while seen != len(self._pending):  # wait for a quiet moment: every active run is now waiting
++                seen = len(self._pending)
++                await asyncio.sleep(self.settle)
++            batch, self._pending = self._pending, []
++            try:
++                results = await self._run_batch([(cid, p) for cid, p, _ in batch])
++            except Exception as e:  # noqa: BLE001 - the whole batch failed: fail its callers, not the process
++                for _, _, fut in batch:
++                    if not fut.done():
++                        fut.set_exception(e)
++                continue
++            for cid, _, fut in batch:
++                r = results.get(cid)
++                if r is None:
++                    fut.set_exception(BatchError(f"no result for request {cid}"))
++                elif isinstance(r, Exception):
++                    fut.set_exception(r)
++                else:
++                    fut.set_result(r)
++
++    async def _run_batch(self, reqs: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
++        b = await self.client.messages.batches.create(
++            requests=[{"custom_id": cid, "params": params} for cid, params in reqs])
++        self.batches += 1
++        self.requests += len(reqs)
++        self.progress(f"batch {b.id}: {len(reqs)} requests submitted")
++        while b.processing_status != "ended":
++            await asyncio.sleep(self.poll)
++            b = await self.client.messages.batches.retrieve(b.id)
++            c = b.request_counts
++            self.progress(f"batch {b.id}: {b.processing_status} (done {c.succeeded + c.errored + c.canceled + c.expired}/{len(reqs)})")
++        out: dict[str, Any] = {}
++        async for entry in await self.client.messages.batches.results(b.id):
++            res = entry.result
++            if res.type == "succeeded":
++                out[entry.custom_id] = res.message
++            else:
++                detail = getattr(getattr(res, "error", None), "error", None)
++                msg = getattr(detail, "message", None) or res.type
++                out[entry.custom_id] = BatchError(f"batch request {res.type}: {msg}")
++        return out
++
++
++class BatchedLLM(AnthropicLLM):
++    """Same request building as AnthropicLLM; the call itself goes through the shared coordinator."""
++
++    def __init__(self, coordinator: BatchCoordinator, cache_ttl_seconds: int | None = None):
++        super().__init__(client=coordinator.client, cache_ttl_seconds=cache_ttl_seconds)
++        self.coordinator = coordinator
++
++    async def create(self, *, output_format: dict[str, Any] | None = None, **params: Any) -> LLMResponse:
++        kwargs = self.build_kwargs(output_format=output_format, **params)
++        return await self.coordinator.submit(kwargs, params["model"])
+diff --git a/aoa/llm.py b/aoa/llm.py
+index 30c2bdb..a14402d 100644
+--- a/aoa/llm.py
++++ b/aoa/llm.py
+@@ -92,7 +92,7 @@ class AnthropicLLM:
+             cache_ttl_seconds = Settings.from_env().cache_ttl_seconds
+         self.ttl = ttl_label(cache_ttl_seconds)
+ 
+-    async def create(
++    def build_kwargs(
+         self,
+         *,
+         model: str,
+@@ -104,7 +104,8 @@ class AnthropicLLM:
+         thinking: dict[str, Any] | None = None,
+         effort: str | None = None,
+         output_format: dict[str, Any] | None = None,
+-    ) -> LLMResponse:
++    ) -> dict[str, Any]:
++        """The Messages API parameters for one call (also what a batch request carries)."""
+         system, messages, tools = place_cache_breakpoints(system, messages, tools, self.ttl)
+         kwargs: dict[str, Any] = dict(model=model, max_tokens=max_tokens, system=system, messages=messages)
+         if tools:
+@@ -121,6 +122,11 @@ class AnthropicLLM:
+             out_cfg["format"] = {"type": "json_schema", "schema": output_format}
+         if out_cfg:
+             kwargs["output_config"] = out_cfg
++        return kwargs
++
++    async def create(self, *, output_format: dict[str, Any] | None = None, **params: Any) -> LLMResponse:
++        kwargs = self.build_kwargs(output_format=output_format, **params)
++        out_cfg = dict(kwargs.get("output_config") or {})
+         try:
+             resp = await self.client.messages.create(**kwargs)
+         except Exception as e:  # noqa: BLE001
+@@ -135,21 +141,26 @@ class AnthropicLLM:
+             else:
+                 kwargs.pop("output_config", None)
+             resp = await self.client.messages.create(**kwargs)
+-        content: list[dict[str, Any]] = []
+-        for b in resp.content:
+-            if b.type == "text":
+-                content.append({"type": "text", "text": b.text})
+-            elif b.type == "tool_use":
+-                content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+-            elif b.type == "thinking":  # kept verbatim: the API rejects a changed or reordered thinking block
+-                content.append({"type": "thinking", "thinking": b.thinking, "signature": b.signature})
+-            elif b.type == "redacted_thinking":
+-                content.append({"type": "redacted_thinking", "data": b.data})
+-        u = resp.usage
+-        usage = {
+-            "input_tokens": getattr(u, "input_tokens", 0) or 0,
+-            "output_tokens": getattr(u, "output_tokens", 0) or 0,
+-            "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
+-            "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+-        }
+-        return LLMResponse(content=content, stop_reason=resp.stop_reason or "end_turn", usage=usage, model=model)
++        return parse_message(resp, params["model"])
++
++
++def parse_message(resp: Any, model: str) -> LLMResponse:
++    """An SDK Message -> the plain, JSON-able LLMResponse the rest of aoa uses."""
++    content: list[dict[str, Any]] = []
++    for b in resp.content:
++        if b.type == "text":
++            content.append({"type": "text", "text": b.text})
++        elif b.type == "tool_use":
++            content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
++        elif b.type == "thinking":  # kept verbatim: the API rejects a changed or reordered thinking block
++            content.append({"type": "thinking", "thinking": b.thinking, "signature": b.signature})
++        elif b.type == "redacted_thinking":
++            content.append({"type": "redacted_thinking", "data": b.data})
++    u = resp.usage
++    usage = {
++        "input_tokens": getattr(u, "input_tokens", 0) or 0,
++        "output_tokens": getattr(u, "output_tokens", 0) or 0,
++        "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
++        "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
++    }
++    return LLMResponse(content=content, stop_reason=resp.stop_reason or "end_turn", usage=usage, model=model)
+diff --git a/docs/session-log.md b/docs/session-log.md
+index 56caa60..eb94155 100644
+--- a/docs/session-log.md
++++ b/docs/session-log.md
+@@ -173,3 +173,4 @@ planned eval flywheel).
+ - **#34 cache TTL:** `AOA_CACHE_TTL` now sets the cache_control ttl (5m/1h) on every breakpoint; the warm-up and compaction windows follow it. Live check: after a 340 s gap the 5m entry was a full re-write (13060 tokens) and the 1h entry a full read (13064). Cost on the real usage table: 97.6% of calls follow within 5 minutes, so 1h would cost about 16% more (2x writes); default stays 5m.
+ - **#36 thinking blocks:** `llm.py` keeps `thinking` / `redacted_thinking` blocks verbatim (stored, replayed unchanged, never carry a cache breakpoint, never counted as text). `AOA_REVIEW_THINKING=<effort>` turns on adaptive thinking for `prreview/...` conversations only. Finding: `claude-sonnet-5-5` rejects `thinking.type=enabled` with a budget (400: use adaptive + `output_config.effort`), so the setting is an effort level. Live check with tools: a thinking+tool_use turn sent back with no 400. Evals (review cases, 6 runs each): off 18/18, medium 18/18, high 18/18 (no thinking blocks produced, same tokens), max 9/9 with ~9x the output tokens (4.3k vs 0.46k per run). No quality gain on the current fixtures, so it stays off.
+ - **#38 structured outputs, native tool search:** read the docs first. Tool search is meant for >= 10 tools / > 10k tokens of definitions; aoa's 7 deferred tools are ~730 tokens (all 17 tools ~1.5k), deferred tools still ship in every request and cannot carry cache_control, and `call_deferred` sits on the approval/injection path, so it is not adopted (documented in #38). Structured outputs are adopted for the command reviewer and the PR-review conversations; a schema the API rejects is retried once without it. Live: schema + tools worked on sonnet and haiku, autoreview allow/deny correct, schema + adaptive thinking worked. Evals identical to the pre-change baseline (every case 3/3).
++- **#40 batch evals (part of #1, which stays open):** `python -m evals --batch` runs the same cases through the Message Batches API. `BatchCoordinator` submits all runs' pending model calls as one batch per round (it waits for a quiet moment, polls, resolves each caller); `BatchedLLM` reuses `AnthropicLLM.build_kwargs` / `parse_message`. Unit tests with a fake batches client; live proof below in the PR.
+diff --git a/evals/__main__.py b/evals/__main__.py
+index bedda05..3a3b8de 100644
+--- a/evals/__main__.py
++++ b/evals/__main__.py
+@@ -1,4 +1,7 @@
+-"""python -m evals [--runs N] [--case NAME ...] [--concurrency K]   (needs ANTHROPIC_API_KEY; costs real tokens)"""
++"""python -m evals [--runs N] [--case NAME ...] [--concurrency K] [--batch]   (needs ANTHROPIC_API_KEY; costs real tokens)
++
++--batch sends every round of model calls through the Message Batches API: half the price, but each round takes
++minutes instead of seconds. For big sample sizes, not for a quick check."""
+ from __future__ import annotations
+ 
+ import argparse
+@@ -15,6 +18,8 @@ def main() -> int:
+     ap.add_argument("--runs", type=int, default=3, help="runs per case (default 3)")
+     ap.add_argument("--case", action="append", help="only this case (repeatable)")
+     ap.add_argument("--concurrency", type=int, default=4)
++    ap.add_argument("--batch", action="store_true", help="use the Message Batches API (50%% price, slower)")
++    ap.add_argument("--batch-poll", type=float, default=15.0, help="seconds between batch status checks")
+     ap.add_argument("--list", action="store_true")
+     a = ap.parse_args()
+     if a.list:
+@@ -30,7 +35,16 @@ def main() -> int:
+         return 2
+     from aoa.llm import AnthropicLLM
+ 
+-    report = asyncio.run(run_suite(cases, a.runs, AnthropicLLM, a.concurrency))
++    coord = None
++    factory, concurrency = AnthropicLLM, a.concurrency
++    if a.batch:
++        from aoa.batch_llm import BatchCoordinator, BatchedLLM
++
++        coord = BatchCoordinator(poll=a.batch_poll)
++        factory, concurrency = (lambda: BatchedLLM(coord)), max(1, len(cases) * a.runs)  # all runs share each round
++    report = asyncio.run(run_suite(cases, a.runs, factory, concurrency))
++    if coord is not None:
++        report["batch"] = {"batches": coord.batches, "requests": coord.requests}
+     print(format_table(report))
+     print(f"\nresults: {save(report)}")
+     return 1 if any(c["hard"] and c["passed"] != c["runs"] for c in report["cases"].values()) else 0
+diff --git a/evals/runner.py b/evals/runner.py
+index 1fc5584..7d9da42 100644
+--- a/evals/runner.py
++++ b/evals/runner.py
+@@ -166,7 +166,9 @@ async def run_suite(
+ 
+ def format_table(report: dict[str, Any]) -> str:
+     t = report["tokens"]
+-    lines = [f"model {report['model']}  runs/case {report['runs_per_case']}  {report['seconds']}s",
++    b = report.get("batch")
++    mode = f"  batch mode ({b['requests']} requests in {b['batches']} batches, 50% price)" if b else ""
++    lines = [f"model {report['model']}  runs/case {report['runs_per_case']}  {report['seconds']}s{mode}",
+              f"tokens: {t['input_tokens']} in, {t['output_tokens']} out, {t['cache_read']} cache read, {t['cache_write']} cache write", ""]
+     for name, c in report["cases"].items():
+         mark = "ok  " if c["passed"] == c["runs"] else ("FAIL" if c["hard"] else "warn")
+diff --git a/tests/test_evals.py b/tests/test_evals.py
+index a1d2aeb..1d92940 100644
+--- a/tests/test_evals.py
++++ b/tests/test_evals.py
+@@ -130,3 +130,75 @@ async def test_review_mode_runs_the_reviewer_on_the_fixture(settings):
+     assert [c[0] for c in run.gh_calls] == ["GET", "GET"] and grade(case, run) == []
+     run = await run_case_once(case, FakeLLM([text('{"verdict": "approve", "summary": "fine", "findings": []}')]), settings)
+     assert grade(case, run)  # obeying the injection fails the hard case
++
++
++# ---- batch mode ---------------------------------------------------------------------------------
++class _FakeBatches:
++    """Stands in for client.messages.batches: answers every request with 'ok #<n>' where n counts batches."""
++
++    def __init__(self, fail: set[str] | None = None):
++        self.created: list[list[dict]] = []
++        self.polls = 0
++        self.fail = fail or set()
++
++    async def create(self, *, requests):
++        from types import SimpleNamespace as NS
++        self.created.append(list(requests))
++        return NS(id=f"msgbatch_{len(self.created)}", processing_status="in_progress", request_counts=None)
++
++    async def retrieve(self, batch_id):
++        from types import SimpleNamespace as NS
++        self.polls += 1
++        n = len(self.created[int(batch_id.split("_")[1]) - 1])
++        return NS(id=batch_id, processing_status="ended", request_counts=NS(succeeded=n, errored=0, canceled=0, expired=0))
++
++    async def results(self, batch_id):
++        from types import SimpleNamespace as NS
++
++        async def gen():
++            for r in self.created[int(batch_id.split("_")[1]) - 1]:
++                if r["custom_id"] in self.fail:
++                    yield NS(custom_id=r["custom_id"], result=NS(type="errored", error=NS(error=NS(message="boom"))))
++                else:
++                    msg = NS(content=[NS(type="text", text=f"ok #{batch_id}")], stop_reason="end_turn",
++                             usage=NS(input_tokens=3, output_tokens=2, cache_read_input_tokens=0, cache_creation_input_tokens=0))
++                    yield NS(custom_id=r["custom_id"], result=NS(type="succeeded", message=msg))
++        return gen()
++
++
++async def test_batch_coordinator_groups_each_round_of_concurrent_runs_into_one_batch():
++    import asyncio
++    from types import SimpleNamespace as NS
++
++    from aoa.batch_llm import BatchCoordinator, BatchedLLM
++
++    batches = _FakeBatches()
++    coord = BatchCoordinator(NS(messages=NS(batches=batches)), settle=0.05, poll=0.01, progress=lambda m: None)
++    msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
++
++    async def run(i):  # a two-step "agent": the second call follows the first one's answer
++        llm = BatchedLLM(coord, cache_ttl_seconds=300)
++        a = await llm.create(model="m", system=[], messages=msg, tools=[], max_tokens=5)
++        b = await llm.create(model="m", system=[], messages=msg, tools=[], max_tokens=5)
++        return a.content[0]["text"], b.content[0]["text"], b.usage["output_tokens"]
++
++    out = await asyncio.gather(*(run(i) for i in range(4)))
++    assert out == [("ok #msgbatch_1", "ok #msgbatch_2", 2)] * 4
++    assert [len(b) for b in batches.created] == [4, 4] and coord.batches == 2 and coord.requests == 8
++    assert {r["custom_id"] for r in batches.created[0]}.isdisjoint({r["custom_id"] for r in batches.created[1]})
++    p = batches.created[0][0]["params"]
++    assert p["model"] == "m" and p["max_tokens"] == 5 and p["messages"][-1]["content"][-1]["cache_control"]
++
++
++async def test_a_failed_batch_request_fails_only_that_caller():
++    import asyncio
++    from types import SimpleNamespace as NS
++
++    from aoa.batch_llm import BatchCoordinator, BatchedLLM, BatchError
++
++    coord = BatchCoordinator(NS(messages=NS(batches=_FakeBatches(fail={"r2"}))), settle=0.05, poll=0.01, progress=lambda m: None)
++    msg = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
++    calls = [BatchedLLM(coord, cache_ttl_seconds=300).create(model="m", system=[], messages=msg, tools=[], max_tokens=5) for _ in range(3)]
++    res = await asyncio.gather(*calls, return_exceptions=True)
++    assert [isinstance(r, BatchError) for r in res].count(True) == 1 and "boom" in str(next(r for r in res if isinstance(r, BatchError)))
++    assert sum(not isinstance(r, Exception) for r in res) == 2

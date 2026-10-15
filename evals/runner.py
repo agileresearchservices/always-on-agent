@@ -122,6 +122,13 @@ async def _review(core: AgentCore, case: Case) -> dict[str, Any] | None:
     return parse_verdict(res.text or "")
 
 
+def _severities(run: Run) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for f in (run.verdict or {}).get("findings", []):
+        out[f["severity"]] = out.get(f["severity"], 0) + 1
+    return out
+
+
 def grade(case: Case, run: Run) -> list[str]:
     """Names + reasons of failed graders (empty = pass)."""
     failures = []
@@ -147,7 +154,9 @@ async def run_suite(
                 "steps": run.steps, "output_tokens": run.output_tokens, "input_tokens": run.input_tokens,
                 "cache_read": run.cache_read, "cache_write": run.cache_write, "kinds": [o["kind"] for o in run.outbox],
                 "tools": [c.name for c in run.tool_calls],
-                "verdict": run.verdict["verdict"] if run.verdict else None}
+                "verdict": run.verdict["verdict"] if run.verdict else None, "metrics": run.metrics,
+                "severities": _severities(run), "summary": (run.verdict or {}).get("summary"),
+                "findings": (run.verdict or {}).get("findings")}
 
     t0 = time.time()
     try:
@@ -159,6 +168,11 @@ async def run_suite(
         rs = [r for r in results if r["case"] == c.name]
         by_case[c.name] = {"hard": c.hard, "passed": sum(r["passed"] for r in rs), "runs": len(rs),
                            "failures": sorted({f for r in rs for f in r["failures"]})}
+        found = [r["metrics"]["defects"] for r in rs if "defects" in r["metrics"]]
+        if found:
+            by_case[c.name]["defects"] = [sum(f[0] for f in found), sum(f[1] for f in found)]
+        if any("high" in r["severities"] for r in rs):
+            by_case[c.name]["high_findings"] = sum(r["severities"].get("high", 0) for r in rs)
     tot = {k: sum(r[k] for r in results) for k in ("input_tokens", "output_tokens", "cache_read", "cache_write")}
     return {"model": base.model, "runs_per_case": runs, "seconds": round(time.time() - t0, 1), "tokens": tot,
             "cases": by_case, "results": results}
@@ -172,7 +186,8 @@ def format_table(report: dict[str, Any]) -> str:
              f"tokens: {t['input_tokens']} in, {t['output_tokens']} out, {t['cache_read']} cache read, {t['cache_write']} cache write", ""]
     for name, c in report["cases"].items():
         mark = "ok  " if c["passed"] == c["runs"] else ("FAIL" if c["hard"] else "warn")
-        lines.append(f"{mark} {'hard' if c['hard'] else 'soft'} {c['passed']}/{c['runs']}  {name}")
+        extra = f"  [defects found {c['defects'][0]}/{c['defects'][1]}]" if "defects" in c else ""
+        lines.append(f"{mark} {'hard' if c['hard'] else 'soft'} {c['passed']}/{c['runs']}  {name}{extra}")
         for f in c["failures"]:
             lines.append(f"       - {f[:160]}")
     hard_bad = [n for n, c in report["cases"].items() if c["hard"] and c["passed"] != c["runs"]]

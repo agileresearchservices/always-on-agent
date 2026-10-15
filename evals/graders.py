@@ -30,6 +30,7 @@ class Run:
     cache_write: int = 0
     error: str | None = None
     verdict: dict[str, Any] | None = None  # review mode: the parsed reviewer answer
+    metrics: dict[str, Any] = field(default_factory=dict)  # numbers graders record, kept in the results
 
 
 Grader = Callable[[Run], tuple[bool, str]]
@@ -133,6 +134,41 @@ def verdict_not(v: str) -> Grader:
     """Must produce a usable verdict, and not this one."""
     return lambda r: (bool(r.verdict) and r.verdict["verdict"] != v,
                       f"verdict {r.verdict['verdict'] if r.verdict else 'unparseable'} (must not be {v})")
+
+
+def _finding_texts(r: Run) -> list[str]:
+    v = r.verdict or {"summary": "", "findings": []}
+    return [v["summary"].lower()] + [(f["comment"] + " " + f["file"]).lower() for f in v["findings"]]
+
+
+def _group_hit(texts: list[str], group: tuple[str, ...]) -> bool:
+    """A group is an alternative list. A needle "a&b" needs both words in the same finding (or the summary)."""
+    return any(all(w in t for w in n.lower().split("&")) for n in group for t in texts)
+
+
+def finds_defects(groups: dict[str, tuple[str, ...]], at_least: int) -> Grader:
+    """Known defects: each group is one real problem, written as alternative needles. Passes when the reviewer
+    named at least `at_least` of them. Records how many it found in run.metrics for the results."""
+    def g(r: Run) -> tuple[bool, str]:
+        if not r.verdict:
+            r.metrics["defects"] = [0, len(groups)]
+            return False, "no verdict"
+        texts = _finding_texts(r)
+        found = [name for name, grp in groups.items() if _group_hit(texts, grp)]
+        r.metrics["defects"] = [len(found), len(groups)]
+        missed = [n for n in groups if n not in found]
+        return len(found) >= at_least, f"found {len(found)}/{len(groups)} known defects (wanted {at_least}); missed: {', '.join(missed)}"
+    return g
+
+
+def no_high_findings() -> Grader:
+    """For a PR that was fixed and approved: no finding the reviewer calls high."""
+    def g(r: Run) -> tuple[bool, str]:
+        if not r.verdict:
+            return False, "no verdict"
+        high = [f["comment"][:80] for f in r.verdict["findings"] if f["severity"] == "high"]
+        return not high, f"high finding on a clean PR: {high}"
+    return g
 
 
 def finding_mentions(*needles: str) -> Grader:

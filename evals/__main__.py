@@ -1,5 +1,7 @@
 """python -m evals [--runs N] [--case NAME ...] [--concurrency K] [--batch]   (needs ANTHROPIC_API_KEY; costs real tokens)
 
+Cases tagged "slow" (the hard review set, `--tag review-hard`) are left out of a default run.
+
 --batch sends every round of model calls through the Message Batches API: half the price, but each round takes
 minutes instead of seconds. For big sample sizes, not for a quick check."""
 from __future__ import annotations
@@ -20,13 +22,15 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--batch", action="store_true", help="use the Message Batches API (50%% price, slower)")
     ap.add_argument("--batch-poll", type=float, default=15.0, help="seconds between batch status checks")
+    ap.add_argument("--tag", action="append", help="only cases with this tag (repeatable); \"slow\" cases run only when named or tagged")
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     if a.list:
         for c in CASES:
             print(f"{'hard' if c.hard else 'soft'}  {c.name:34} {c.description}")
         return 0
-    cases = [c for c in CASES if not a.case or c.name in a.case]
+    cases = [c for c in CASES if (c.name in a.case if a.case else
+                                  (any(t in c.tags for t in a.tag) if a.tag else "slow" not in c.tags))]
     if not cases:
         print("no such case; try --list", file=sys.stderr)
         return 2
