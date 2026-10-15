@@ -45,7 +45,7 @@ Do not start hand-run copies next to the services: they would fight over ports 7
 | `data/temporal.db` | Temporal history |
 | `data/memory/` | Profile facts, dated logs, scratchpad, skills |
 | `data/sandbox/` | The agent's working directory |
-| `data/review-focus/` | Your per-repo review notes (`<owner>__<repo>.md`) |
+| `data/review-focus/` | Your per-repo review notes (`<owner>__<repo>.md`); created when you add the first one |
 | `data/logs/` | One log per service |
 | `evals/results/` | Eval run results (git-ignored) |
 
@@ -96,9 +96,12 @@ conversation.
 **Merge button did nothing or disappeared.** `pr_merge.RETRYABLE` failures restore it; `needs_human`, `stale` and
 `tests_failed` do not. The notice posted in Slack says which.
 
-**`aoa propose` prints "nothing to propose".** Every open flag already has a proposal row or a finished workflow with the
-same id. Check `python -m aoa proposals`. A `capped` workflow keeps its id, so that flag cannot be retried the same day
-through this command.
+**`aoa propose` prints "nothing to propose" although flags are open.** It takes the first `--limit` flags (default 1) that
+have no proposal row and tries to start a workflow for each. A flag whose earlier workflow already *completed* (a `capped`
+run, for example) has no proposal row but still owns its workflow id, so the start is refused and counts as nothing started.
+With the default limit that one flag can sit at the head of the list and hide the rest. Run `python -m aoa propose --limit N`
+with N at least the number of open flags, or check `python -m aoa proposals` and `temporal workflow list`. (This is a known
+rough edge in the command, not something to fix by deleting history.)
 
 **Scheduled evals alert.** The alert names the case. Read `evals/results/*.json` (`findings`, `failures`), re-run
 `python -m evals --case NAME --runs 3`, and decide whether the agent or the case is wrong. A "no case passed" alert is a

@@ -38,3 +38,9 @@ def test_every_relative_doc_link_resolves():
             if not (md.parent / target).resolve().exists():
                 bad.append(f"{md.relative_to(ROOT)} -> {target}")
     assert not bad, f"broken links: {bad}"
+
+
+def test_every_reference_page_is_linked_from_the_architecture_page():
+    arch = (DOCS / "architecture.md").read_text()
+    unlinked = [p.name for p in (DOCS / "reference").glob("*.md") if f"reference/{p.name}" not in arch]
+    assert not unlinked, f"link from docs/architecture.md: {unlinked}"

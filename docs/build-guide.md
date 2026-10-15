@@ -149,7 +149,7 @@ python -m evals --runs 1 --case send_needs_approval      # a real-model check, a
 
 ## Definition of done for a rebuild
 
-- `pytest -q` passes (422 tests at the time of writing) with no server and no key.
+- `pytest -q` passes (423 tests at the time of writing) with no server and no key.
 - `pytest -m temporal` passes against a local server and leaves only `session-main` running.
 - `python -m evals --runs 3` has no hard failures.
 - `tests/test_docs_in_sync.py` passes, so these docs still match the code.

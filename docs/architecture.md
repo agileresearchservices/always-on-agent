@@ -84,6 +84,16 @@ That is why most tests need no Temporal server and no API key: `testing.FakeLLM`
 The price is a rule that must be kept: `loop.py` and workflow code must stay **deterministic** (no clocks, randomness,
 or I/O), because Temporal replays them.
 
+## Where to go next
+
+| Question | Page |
+|---|---|
+| How does a turn run, and what makes it safe to retry? | [reference/core-and-loop.md](reference/core-and-loop.md) |
+| What does each tool do and who may call it? | [reference/tools.md](reference/tools.md) |
+| Which tables exist, what are the `kv` keys? | [reference/store.md](reference/store.md) |
+| How do notifications, quiet hours and memory work? | [reference/notifications-and-memory.md](reference/notifications-and-memory.md) |
+| Which environment variables exist and what do they bound? | [reference/configuration.md](reference/configuration.md) |
+
 ## Module map
 
 Everything in `aoa/`. Docstrings are the source of these one-liners.
@@ -128,7 +138,7 @@ Everything in `aoa/`. Docstrings are the source of these one-liners.
 | `server.py` | FastAPI: messages and webhooks in, outbox out, approvals, merges, proposals |
 | `slack_bridge.py` | Slack Socket Mode client; speaks only the HTTP API |
 | `client_cli.py` | A thin terminal client |
-| `__main__.py` | `python -m aoa usage | trace | flags | propose | proposals | evalruns` |
+| `__main__.py` | `python -m aoa` subcommands: `usage`, `trace`, `flags`, `propose`, `proposals`, `evalruns` |
 
 **GitHub pipeline** (see [reference/github-pipeline.md](reference/github-pipeline.md))
 

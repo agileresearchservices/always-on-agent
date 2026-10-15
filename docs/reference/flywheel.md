@@ -58,7 +58,9 @@ Caps and cost: `AOA_EVAL_PROPOSALS_PER_DAY` (default 3; 0 = off; a capped workfl
 estimated cost is on the card (evals are not in the usage table).
 
 Gotcha: a workflow that completed (including `capped`) keeps its id, so `aoa propose` cannot start the same flag again;
-the id-reuse policy allows a restart only after a *failed* run.
+the id-reuse policy allows a restart only after a *failed* run. A capped flag has no proposal row, so with the default
+`--limit 1` it can sit first in the list, be refused, and make the command print "nothing to propose" while other flags
+are open. Use a larger `--limit` to reach the rest.
 
 ## Step 3: fix PRs (`fix_pr.py`, #56)
 
