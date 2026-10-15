@@ -83,7 +83,9 @@ back. Only one allowed user in one channel is honored. Setup: `docs/slack-setup.
 - **Tools run at most once.** A worker dying mid-command is reported to the model as "effects unknown", never
   silently re-run. Model calls are retried safely.
 - **Not implemented:** computer use (screenshots, accessibility tree), fact garbage collection beyond a size cap,
-  voice, payments, real Slack/email connectors (`external_send` records instead of sending), eval/flywheel tooling.
+  voice, payments, email, an `external_send` that actually sends (it records instead; the Slack bridge is only the
+  user-facing client), and the eval flywheel (Langfuse capture, evals generated from traces, #1). The seed eval
+  suite and batch mode exist (`python -m evals`).
 - **Single host.** Workers share one SQLite file. For several hosts, move `store.py` to Postgres.
 - **Auth is minimal** (two shared secrets, required unless `AOA_ALLOW_INSECURE=1`). Put it behind real auth and TLS before exposing it.
 - `warm_cache` reliably warms the system and tool blocks; warming conversation history is best effort.
