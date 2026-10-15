@@ -81,11 +81,11 @@ async def test_scan_flags_cache_miss_and_ignores_healthy_traces(make_core, setti
     await handle_events(core, "main", [usr_event("hello")])
     assert flag.scan(core.store, settings) == []
     core.store.step_put("main", "llm:zz.s0", {"content": [], "stop_reason": "end_turn", "usage": {},
-                                              "tool_uses": [], "text": "x", "cache_miss": True})
+                                              "tool_uses": [], "text": "x", "cache_miss": True, "cache_miss_cause": "identical"})
     core.store.step_put("main", "llm:zz.s1", {"content": [], "stop_reason": "end_turn", "usage": {},
-                                              "tool_uses": [], "text": "x", "cache_miss": True})
+                                              "tool_uses": [], "text": "x", "cache_miss": True, "cache_miss_cause": "identical"})
     got = flag.scan(core.store, settings)
-    assert [f["reason"] for f in got] == ["cache_miss"] and "2 time(s)" in got[0]["evidence"]  # one flag per conversation
+    assert [f["reason"] for f in got] == ["cache_miss:zz"] and "cause: identical" in got[0]["evidence"]  # one flag per missed turn
 
 
 async def test_render_trace_text_and_json(make_core):
@@ -112,3 +112,39 @@ def test_cli_flags_and_trace(settings, make_core, capsys, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["aoa", "trace", "main", "--json"])
     main()
     assert json.loads(capsys.readouterr().out)["conv"] == "main"
+
+
+
+
+# --- #72: only unexplained cache misses are flags ---------------------------------------------------------------------
+
+def _miss(store, key, cause=None):
+    res = {"content": [], "stop_reason": "end_turn", "usage": {}, "tool_uses": [], "text": "x", "cache_miss": True}
+    if cause:
+        res["cache_miss_cause"] = cause
+    store.step_put("main", key, res)
+
+
+async def test_a_miss_caused_by_a_deploy_or_compaction_is_not_flagged(make_core, settings):
+    core, _ = make_core([])
+    _miss(core.store, "llm:a.s0", "tools_system")
+    _miss(core.store, "llm:b.s0", "history_shrank")
+    assert flag.scan(core.store, settings) == []
+
+
+async def test_each_unexplained_miss_is_its_own_flag_so_an_old_row_cannot_hide_a_new_one(make_core, settings):
+    core, _ = make_core([])
+    _miss(core.store, "llm:a.s0", "tools_system")  # explained: skipped
+    _miss(core.store, "llm:b.s0", "identical")
+    first = flag.scan(core.store, settings)
+    assert [f["reason"] for f in first] == ["cache_miss:b"]
+    core.store.flag_set_status("main", "cache_miss:b", "declined")  # the person closed it
+    _miss(core.store, "llm:c.s0", "message_changed")  # a later, real miss in the same conversation
+    later = flag.scan(core.store, settings)
+    assert [f["reason"] for f in later] == ["cache_miss:c"] and "cause: message_changed" in later[0]["evidence"]
+
+
+async def test_a_step_recorded_before_the_cause_was_kept_is_not_flagged(make_core, settings):
+    core, _ = make_core([])
+    _miss(core.store, "llm:old.s0")  # no cause: cannot be judged
+    assert flag.scan(core.store, settings) == []

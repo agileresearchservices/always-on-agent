@@ -27,7 +27,7 @@ It costs nothing: no model call. Reasons:
 | `approval_denied:<id>` | The person denied an approval. Often the gate working, not a mistake |
 | `max_tokens:<step key>` | A model output was cut off |
 | `tool_errors:<tool>:<turn>` | A tool failed 3 or more times (`TOOL_ERROR_REPEATS`) within one turn |
-| `cache_miss` | The prompt cache missed within its lifetime (one flag per conversation; one miss after a restart that changes the tool index is expected) |
+| `cache_miss:<turn>` | The prompt cache missed within its lifetime and **nothing on our side explains it**. `llm_step` stores a cause code with each miss (`tools_system`, `history_shrank`, `message_changed`, `identical`, `no_previous`); a deploy that changes the tools or system prompt, and compaction, are expected and not flagged (`flag.EXPECTED_MISS_CAUSES`), and a step recorded before the cause was kept is skipped. One flag per missed turn (#72) |
 | `reported:<kind>:<name>` | The model called `report_issue`. Unverified; capped at 20 open per conversation |
 | `max_steps:<turn>` | The turn used every one of `AOA_MAX_STEPS` and was still calling tools |
 

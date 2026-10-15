@@ -8,7 +8,7 @@ Source: `aoa/prompt.py`, `aoa/llm.py` (`place_cache_breakpoints`), `aoa/core.py`
 The model reads the system prompt, the tool block and the whole conversation on every call. Anthropic's prompt cache lets
 a byte-identical prefix be read at a fraction of the price, but only while it is unchanged and within its lifetime. This
 agent makes many calls per turn, so a stable prefix is most of the cost control. A cache miss within the lifetime is
-treated as a **bug**: `core.llm_step` logs a warning for it, and `flag.scan` records it.
+treated as a **bug** unless a deploy explains it: `core.llm_step` logs a warning and stores a cause code with the step, and `flag.scan` flags only misses nothing on our side explains (a changed tool block or system prompt, or compaction, is expected).
 
 ## The prefix is fixed and ordered
 

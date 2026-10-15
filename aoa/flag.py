@@ -21,6 +21,10 @@ TOOL_ERROR_REPEATS = 3  # the same tool failing this many times in one conversat
 REPORTED_OPEN_CAP = 20  # open model-reported issues per conversation, so a bad turn cannot flood the list
 EVIDENCE_CHARS = 500
 
+# A cache miss whose cause is on our side by design: a deploy changed the tool block or the system prompt (the first
+# call after a restart misses), or compaction replaced the history. Anything else is worth a look.
+EXPECTED_MISS_CAUSES = frozenset({"tools_system", "history_shrank"})
+
 REPORT_KINDS = ("wrong_answer", "bad_tool_use", "missed_rule", "too_noisy", "other")
 
 
@@ -48,7 +52,7 @@ def scan(store: Store, settings: Settings) -> list[dict[str, Any]]:
     for conv in store.conv_ids():
         steps = store.steps_for(conv)
         tool_names: dict[str, tuple[str, str]] = {}  # tool_use id -> (name, turn), from the model's own calls
-        misses: list[str] = []
+        misses: list[tuple[str, str]] = []  # (step key, cause) of misses nothing on our side explains
         turns: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         for key, res in steps:
             if not key.startswith("llm:"):
@@ -60,11 +64,15 @@ def scan(store: Store, settings: Settings) -> list[dict[str, Any]]:
                 turns[turn].append((key, res))
             if res.get("stop_reason") == "max_tokens":
                 added.append((conv, f"max_tokens:{key}", key, "the model's output was cut off at max_tokens"))
-            if res.get("cache_miss"):
-                misses.append(key)
-        if misses:  # one flag per conversation: a restart that changes the tool index makes one expected miss
-            added.append((conv, "cache_miss", misses[0],
-                          f"prompt cache missed within the TTL {len(misses)} time(s), first at {misses[0]} (a stability bug if not a restart)"))
+            cause = res.get("cache_miss_cause")
+            # a miss is a lead only when nothing on our side explains it. A deploy that changed the tools/prompt, or
+            # compaction, is by design; a step recorded before the cause was kept (no cause) cannot be judged, so it is skipped
+            if res.get("cache_miss") and cause and cause not in EXPECTED_MISS_CAUSES:
+                misses.append((key, cause))
+        for key, cause in misses:  # one flag per missed turn, so an old row can never hide a new miss
+            added.append((conv, f"cache_miss:{_turn_of(key) or key}", key,
+                          f"prompt cache missed within the TTL at {key} and nothing on our side explains it (cause: {cause}); "
+                          "a stability bug if the prefix was meant to be stable"))
         for turn, llm_steps in turns.items():
             last_key, last = llm_steps[-1]
             if len(llm_steps) >= settings.max_steps_per_turn and last.get("tool_uses"):
