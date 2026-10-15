@@ -27,7 +27,8 @@ def _int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        raise ValueError(f"{name} must be an integer, got {_shown(name, raw)}") from None
+        log.warning("%s must be an integer, got %s; using %s", name, _shown(name, raw), default)
+        return default
 
 
 def _float(name: str, default: float) -> float:
@@ -37,7 +38,8 @@ def _float(name: str, default: float) -> float:
     try:
         return float(raw)
     except ValueError:
-        raise ValueError(f"{name} must be a number, got {_shown(name, raw)}") from None
+        log.warning("%s must be a number, got %s; using %s", name, _shown(name, raw), default)
+        return default
 
 
 def _cache_ttl() -> int:

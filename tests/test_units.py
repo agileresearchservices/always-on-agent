@@ -471,23 +471,33 @@ def test_cache_ttl_parse_is_tolerant_but_loud(monkeypatch, tmp_path, caplog):
         assert "AOA_CACHE_TTL" in msg and raw in msg and str(want) in msg
 
 
-def test_numeric_env_errors_name_the_variable(monkeypatch, tmp_path):
+def test_bad_numeric_env_warns_and_uses_the_default(monkeypatch, tmp_path, caplog):
+    """A typo in .env must not stop the worker (launchd would crash-loop it): warn, name the variable, use the default."""
+    import logging
+
     from aoa.config import Settings, _int
 
     monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
-    for var in ("AOA_MAX_STEPS", "AOA_APPROVAL_NUDGE", "AOA_IDLE_SLEEP", "AOA_BATCH_WINDOW"):
+    caplog.set_level(logging.WARNING, logger="aoa.config")
+    base = Settings.from_env()
+    for var, attr in (("AOA_MAX_STEPS", "max_steps_per_turn"), ("AOA_APPROVAL_NUDGE", "approval_nudge_seconds"),
+                      ("AOA_IDLE_SLEEP", "idle_sleep_seconds"), ("AOA_BATCH_WINDOW", "batch_window_seconds")):
+        caplog.clear()
         monkeypatch.setenv(var, "twelve")
-        with pytest.raises(ValueError, match=var) as e:
-            Settings.from_env()
-        assert "twelve" in str(e.value)
-        monkeypatch.setenv(var, "")  # empty means unset
-        Settings.from_env()
+        assert getattr(Settings.from_env(), attr) == getattr(base, attr)
+        msg = " ".join(r.getMessage() for r in caplog.records)
+        assert var in msg and "twelve" in msg
+        caplog.clear()
+        monkeypatch.setenv(var, "")  # empty means unset: silent
+        assert getattr(Settings.from_env(), attr) == getattr(base, attr)
+        assert not caplog.records
         monkeypatch.delenv(var)
     # a secret-looking variable never has its value echoed
+    caplog.clear()
     monkeypatch.setenv("AOA_REVIEWER_TOKEN", "ghp_sekrit")
-    with pytest.raises(ValueError, match="AOA_REVIEWER_TOKEN") as e:
-        _int("AOA_REVIEWER_TOKEN", 1)
-    assert "ghp_sekrit" not in str(e.value)
+    assert _int("AOA_REVIEWER_TOKEN", 1) == 1
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "AOA_REVIEWER_TOKEN" in msg and "ghp_sekrit" not in msg
 
 
 def test_quiet_hours_and_positive_durations_fall_back_with_a_warning(monkeypatch, tmp_path, caplog):

@@ -26,7 +26,7 @@ python -m aoa.client_cli --session main
 
 `python -m aoa usage [--days N]` prints estimated spend per day and per source (pr-review, agent, helper, compact, cmd-review, warm, resolve) from the `usage` table (list prices in `aoa/pricing.py`, dated; update them when prices change; live services only, evals are not in it).
 
-All configuration is env vars read in `aoa/config.py` (`Settings.from_env`, all prefixed `AOA_`). Numeric values are strict: a non-numeric one stops startup with a ValueError naming the variable (empty = unset); `AOA_CACHE_TTL` and `AOA_GITHUB_POLL_SECONDS` are tolerant and warn. Every `AOA_*` name the code reads must appear in `.env.example` (`tests/test_config_env.py`). Tests redirect state with `AOA_DATA_DIR` (see the `settings` fixture in `tests/conftest.py`).
+All configuration is env vars read in `aoa/config.py` (`Settings.from_env`, all prefixed `AOA_`). A non-numeric value never stops startup (launchd would crash-loop the services): it logs a warning naming the variable (never the value of a *TOKEN/*KEY one) and uses the default; empty = unset. `AOA_CACHE_TTL` and `AOA_GITHUB_POLL_SECONDS` also warn when rounded or floored. Every `AOA_*` name the code reads must appear in `.env.example` (`tests/test_config_env.py`). Tests redirect state with `AOA_DATA_DIR` (see the `settings` fixture in `tests/conftest.py`).
 
 ## Architecture
 
