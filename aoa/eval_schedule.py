@@ -9,6 +9,8 @@ tools, safety rules and model are unchanged since the last run (unless that run 
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -19,6 +21,7 @@ from .config import Settings
 from .store import Store
 
 KEEP_RUNS = 30
+GREEN_WINDOW = 5  # soft cases are held to their best rate over this many recent green runs
 MAX_AGE = 7 * 86400  # run anyway when the last run is this old: the hosted model can change under a fixed name
 FINGERPRINT_FILES = ("prompt.py", "tools.py", "safety.py", "events.py", "notify.py")
 RunFn = Callable[[list[str]], Awaitable[dict[str, Any] | None]]
@@ -47,16 +50,32 @@ async def run_scheduled(store: Store, settings: Settings, session: str, run: Run
     runs = store.kv_get(session, "eval_runs", [])
     if not force and runs and runs[-1]["fingerprint"] == fp and now - runs[-1]["ts"] < MAX_AGE:
         return {"status": "skipped", "reason": "nothing that shapes the agent changed since the last run"}
-    report = await run(["--runs", str(settings.eval_schedule_runs)])
+    try:
+        report = await run(["--runs", str(settings.eval_schedule_runs)])
+    except Exception as e:  # a crash or timeout: the activity is never retried, so say so once instead of staying silent
+        msg = _scrub(f"{type(e).__name__}: {e}")
+        sig = msg[:60]
+        first = sig != store.kv_get(session, "eval_last_error", "")
+        if first:
+            store.outbox_push(session, "alert", {"text": f":warning: *Scheduled eval run failed* (nothing was compared): {msg[:300]}\n"
+                                                         "Nothing changes until the next run; check `data/logs/worker.log`."},
+                              client_key=f"evalerr:{int(now)}:{sig}"[:200])
+            store.kv_set(session, "eval_last_error", sig)
+        return {"status": "error", "error": msg, "posted": first}
     if report is None:
         return {"status": "skipped", "reason": "no ANTHROPIC_API_KEY for the eval run"}
     new = summarize(report, ts=now, fingerprint=fp)
-    baseline = store.kv_get(session, "eval_baseline")
-    regs = compare(baseline, new)
+    green = [r for r in runs if not r.get("regressions")][-GREEN_WINDOW:]
+    regs = compare(green or store.kv_get(session, "eval_baseline"), new)
     store.kv_set(session, "eval_runs", (runs + [{**new, "regressions": regs}])[-KEEP_RUNS:])
+    was_bad = bool(store.kv_get(session, "eval_last_posted", "") or store.kv_get(session, "eval_last_error", ""))
+    store.kv_set(session, "eval_last_error", "")
     if not regs:
         store.kv_set(session, "eval_baseline", new)  # only a green run moves the baseline
         store.kv_set(session, "eval_last_posted", "")
+        if was_bad:  # close the loop on an alert the person was shown
+            store.outbox_push(session, "update", {"text": ":white_check_mark: Scheduled evals are green again."},
+                              client_key=f"evalok:{int(now)}")
         return {"status": "green", "est_cost_usd": new["est_cost_usd"]}
     sig = signature(regs)
     posted = store.kv_get(session, "eval_last_posted", "")
@@ -64,6 +83,14 @@ async def run_scheduled(store: Store, settings: Settings, session: str, run: Run
         store.outbox_push(session, "alert", {"text": report_text(regs, new)}, client_key=f"evalreg:{int(now)}:{sig}"[:200])
         store.kv_set(session, "eval_last_posted", sig)
     return {"status": "regression", "regressions": regs, "posted": sig != posted, "est_cost_usd": new["est_cost_usd"]}
+
+
+def _scrub(text: str) -> str:
+    """Error text goes to Slack: drop anything shaped like an API key, and the configured one verbatim."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        text = text.replace(key, "[key]")
+    return re.sub(r"sk-ant-[A-Za-z0-9_\-]+", "[key]", text)
 
 
 def format_runs(runs: list[dict[str, Any]]) -> str:

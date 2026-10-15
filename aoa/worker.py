@@ -14,11 +14,11 @@ from .core import AgentCore
 from .llm import AnthropicLLM
 from .memory import MemoryStore
 from .pr_resolve import clean_stale_workdirs
-from .scheduling import TemporalScheduler, ensure_eval_schedule, ensure_github_schedule
+from .scheduling import TemporalScheduler, ensure_eval_schedule, ensure_flag_schedule, ensure_github_schedule
 from .search_attrs import ensure_registered
 from .store import Store
 from .workflows import (
-    EvalProposalWorkflow, EvalRunWorkflow, FixPrWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
+    EvalProposalWorkflow, EvalRunWorkflow, FixPrWorkflow, FlagScanWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
     SessionWorkflow,
 )
 
@@ -36,7 +36,7 @@ async def build_worker(settings: Settings, client: Client, core: AgentCore | Non
         client,
         task_queue=settings.task_queue,
         workflows=[SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow, EvalProposalWorkflow,
-                   EvalRunWorkflow, FixPrWorkflow],
+                   EvalRunWorkflow, FixPrWorkflow, FlagScanWorkflow],
         activities=acts.all(),
         max_concurrent_activities=20,
     )
@@ -52,6 +52,7 @@ async def main() -> None:
     if os.environ.get("GITHUB_TOKEN") and os.environ.get("AOA_GITHUB_USER"):
         await ensure_github_schedule(client, settings)
     await ensure_eval_schedule(client, settings)
+    await ensure_flag_schedule(client, settings)
     logging.info("worker up on queue %s (data dir %s)", settings.task_queue, settings.data_dir)
     await worker.run()
 

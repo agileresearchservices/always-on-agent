@@ -114,3 +114,63 @@ def test_signature_is_stable():
 def test_zero_runs_and_missing_cases_are_regressions():
     assert [r["case"] for r in compare(None, summ(a=(True, 0, 0)))] == ["a"]
     assert [r["case"] for r in compare(summ(a=(True, 3, 3), b=(False, 3, 3)), summ(a=(True, 3, 3)))] == ["b"]
+
+
+# --- #64: failure alert, recovery note, best-of-window soft guard -----------------------------------------------------
+
+def boom(exc):
+    async def run(args):
+        raise exc
+    return run
+
+
+def texts(store, kind):
+    return [m["payload"]["text"] for m in store.outbox_since("main", 0) if m["kind"] == kind]
+
+
+async def test_a_crashed_run_alerts_once_and_a_green_run_closes_it(env):
+    store, s = env
+    out = await es.run_scheduled(store, s, "main", boom(RuntimeError("eval run failed: 401")), now=100.0)
+    assert out["status"] == "error" and out["posted"] and len(alerts(store)) == 1
+    again = await es.run_scheduled(store, s, "main", boom(RuntimeError("eval run failed: 401")), now=200.0)
+    assert again["status"] == "error" and not again["posted"] and len(alerts(store)) == 1  # same failure, no new post
+    assert store.kv_get("main", "eval_runs", []) == []  # a failed run is not a result
+    ok = await es.run_scheduled(store, s, "main", stub(GREEN), now=300.0)
+    assert ok["status"] == "green" and len(texts(store, "update")) == 1 and "green again" in texts(store, "update")[0]
+
+
+async def test_a_timeout_with_no_message_still_alerts(env):
+    store, s = env
+    out = await es.run_scheduled(store, s, "main", boom(TimeoutError()), now=1.0)
+    assert out["status"] == "error" and "TimeoutError" in alerts(store)[0]["payload"]["text"]
+
+
+async def test_error_text_never_carries_a_key(env, monkeypatch):
+    store, s = env
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secretvalue123")
+    await es.run_scheduled(store, s, "main", boom(RuntimeError("bad key sk-ant-secretvalue123 and sk-ant-other_456")), now=1.0)
+    text = alerts(store)[0]["payload"]["text"]
+    assert "secretvalue" not in text and "other_456" not in text
+
+
+async def test_a_green_run_with_nothing_to_close_stays_silent(env):
+    store, s = env
+    await es.run_scheduled(store, s, "main", stub(GREEN), now=100.0)
+    await es.run_scheduled(store, s, "main", stub(GREEN), now=100.0 + es.MAX_AGE + 1)
+    assert texts(store, "update") == [] and alerts(store) == []
+
+
+def test_soft_case_is_held_to_the_best_of_the_window():
+    window = [summ(s=(False, 3, 3)), summ(s=(False, 2, 3)), summ(s=(False, 2, 3))]
+    assert compare(window[-1], summ(s=(False, 1, 3))) == []  # against only the last run: -0.33, the old blind spot
+    regs = compare(window, summ(s=(False, 1, 3)))
+    assert [r["case"] for r in regs] == ["s"] and "best" in regs[0]["detail"]
+
+
+async def test_slow_soft_slide_across_scheduled_runs_alerts(env):
+    store, s = env
+    t = 100.0
+    for p in (3, 2, 2, 1):  # each step is within the noise band of the previous run
+        t += es.MAX_AGE + 1
+        await es.run_scheduled(store, s, "main", stub(report(s=(False, p, 3))), now=t)
+    assert len(alerts(store)) == 1 and "`s`" in alerts(store)[0]["payload"]["text"]

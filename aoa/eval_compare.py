@@ -5,7 +5,8 @@ A *summary* is the small, stable part of a run report kept between runs:
      "cases": {name: {"hard": bool, "passed": int, "runs": int}}}
 
 A regression is either a hard case that did not pass every run (hard cases are safety rules and must stay green,
-whatever the baseline says) or a soft case whose pass rate fell by more than `SOFT_DROP` against the baseline.
+whatever the baseline says) or a soft case whose pass rate fell by more than `SOFT_DROP` against the *best* of the
+recent green runs (a window, so a case that loses one run per step cannot slide away unnoticed).
 """
 from __future__ import annotations
 
@@ -27,10 +28,14 @@ def _rate(c: dict[str, Any]) -> float:
     return c["passed"] / c["runs"] if c["runs"] else 0.0
 
 
-def compare(baseline: dict[str, Any] | None, new: dict[str, Any], soft_drop: float = SOFT_DROP) -> list[dict[str, Any]]:
-    """Regressions in `new`, sorted by case name. Each: {"case", "kind": "hard"|"soft", "detail"}."""
+def compare(baseline: dict[str, Any] | list[dict[str, Any]] | None, new: dict[str, Any],
+            soft_drop: float = SOFT_DROP) -> list[dict[str, Any]]:
+    """Regressions in `new`, sorted by case name. Each: {"case", "kind": "hard"|"soft", "detail"}.
+    `baseline` is one summary or a list of green ones (oldest first); a soft case is held to its best rate in the list,
+    and "missing from this run" is judged against the newest."""
+    window = [] if baseline is None else baseline if isinstance(baseline, list) else [baseline]
     out: list[dict[str, Any]] = []
-    base_cases = (baseline or {}).get("cases", {})
+    base_cases = window[-1].get("cases", {}) if window else {}
     for name, b in sorted(base_cases.items()):  # a case that vanished from the run is not a pass
         if name not in new["cases"]:
             out.append({"case": name, "kind": "hard" if b["hard"] else "soft", "detail": "case missing from this run"})
@@ -39,10 +44,12 @@ def compare(baseline: dict[str, Any] | None, new: dict[str, Any], soft_drop: flo
             if c["passed"] != c["runs"] or c["runs"] == 0:
                 out.append({"case": name, "kind": "hard", "detail": f"hard case passed {c['passed']}/{c['runs']} (must pass every run)"})
             continue
-        b = base_cases.get(name)
-        if b and b["runs"] and _rate(b) - _rate(c) > soft_drop + 1e-9:
+        seen = [w["cases"][name] for w in window if w["cases"].get(name, {}).get("runs")]
+        b = max(seen, key=_rate) if seen else None
+        if b and _rate(b) - _rate(c) > soft_drop + 1e-9:
+            best = " (best of the recent green runs)" if len(seen) > 1 else ""
             out.append({"case": name, "kind": "soft",
-                        "detail": f"soft case fell from {b['passed']}/{b['runs']} to {c['passed']}/{c['runs']}"})
+                        "detail": f"soft case fell from {b['passed']}/{b['runs']}{best} to {c['passed']}/{c['runs']}"})
     return out
 
 

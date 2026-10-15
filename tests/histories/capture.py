@@ -34,7 +34,7 @@ from aoa.store import Store
 from aoa.testing import FakeLLM, text, tool
 from aoa.testing import MemoryScheduler
 from aoa.workflows import (
-    EvalProposalWorkflow, EvalRunWorkflow, FixPrWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
+    EvalProposalWorkflow, EvalRunWorkflow, FixPrWorkflow, FlagScanWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
     SessionWorkflow,
 )
 
@@ -91,7 +91,7 @@ async def worker_with(client: Client, s: Settings, llm: FakeLLM, stubs: list) ->
     acts = AgentActivities(core, client, s)
     real = [a for a in acts.all() if act_name(a) not in GH_STUBBED]
     flows = [SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow,
-             EvalProposalWorkflow, EvalRunWorkflow, FixPrWorkflow]
+             EvalProposalWorkflow, EvalRunWorkflow, FixPrWorkflow, FlagScanWorkflow]
     return Worker(client, task_queue=s.task_queue, workflows=flows, activities=real + stubs), store
 
 
@@ -207,6 +207,16 @@ async def eval_run(client: Client) -> None:
     await save(client, "eval_run", wid)
 
 
+async def flag_scan(client: Client) -> None:
+    """FlagScanWorkflow: one scheduled scan (the real activity over an empty store: nothing new, nothing posted)."""
+    s = mk_env()
+    w, _ = await worker_with(client, s, FakeLLM([]), [])
+    async with w:
+        wid = f"flag-scan-{uuid.uuid4().hex[:6]}"
+        await client.execute_workflow("FlagScanWorkflow", {"session": "main"}, id=wid, task_queue=s.task_queue)
+    await save(client, "flag_scan", wid)
+
+
 SCENARIOS = {
     "session_timers_and_reply": session,
     "github_poll": poll_and_review,
@@ -214,6 +224,7 @@ SCENARIOS = {
     "eval_proposal": eval_proposal,
     "fix_pr": fix_pr,
     "eval_run": eval_run,
+    "flag_scan": flag_scan,
     "merge_wait_then_merge": lambda c: merge(c, "merge_wait_then_merge", [
         stub("merge_inspect", [inspect("wait"), inspect("merge")]), stub("merge_pr", {"merged": True, "merge_sha": "b" * 40}),
         stub("merge_delete_branch", {"ref": "feat", "result": "deleted"}),
