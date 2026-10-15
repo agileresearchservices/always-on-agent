@@ -98,3 +98,35 @@ async def ensure_github_schedule(client: Client, settings: Settings) -> None:
         await client.create_schedule(GITHUB_SCHEDULE_ID, schedule)
     except ScheduleAlreadyRunningError:
         await client.get_schedule_handle(GITHUB_SCHEDULE_ID).update(lambda _: ScheduleUpdate(schedule=schedule))
+
+
+EVAL_SCHEDULE_ID = "aoa-eval-run"
+
+
+async def ensure_eval_schedule(client: Client, settings: Settings) -> None:
+    """Create, update or delete the scheduled behaviour-eval run (#61). Real-model runs, so it exists only while
+    AOA_EVAL_SCHEDULE_HOURS > 0 and an API key is configured; setting it back to 0 removes the schedule."""
+    import os
+    from datetime import timedelta
+
+    from temporalio.client import ScheduleIntervalSpec
+
+    handle = client.get_schedule_handle(EVAL_SCHEDULE_ID)
+    if settings.eval_schedule_hours <= 0 or not os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            await handle.delete()
+        except RPCError as e:
+            if e.status != RPCStatusCode.NOT_FOUND:
+                raise
+        return
+    schedule = Schedule(
+        action=ScheduleActionStartWorkflow(
+            "EvalRunWorkflow", {"session": os.environ.get("AOA_SESSION", "main")},
+            id=f"{EVAL_SCHEDULE_ID}-run", task_queue=settings.task_queue, execution_timeout=timedelta(minutes=40),
+        ),
+        spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(hours=settings.eval_schedule_hours))]),
+    )
+    try:
+        await client.create_schedule(EVAL_SCHEDULE_ID, schedule)
+    except ScheduleAlreadyRunningError:
+        await handle.update(lambda _: ScheduleUpdate(schedule=schedule))

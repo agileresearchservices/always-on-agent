@@ -23,6 +23,8 @@ def main() -> None:
     pr.add_argument("--limit", type=int, default=1, help="how many open flags to propose for (default 1)")
     pr.add_argument("--session", default="main")
     sub.add_parser("proposals", help="list eval-case proposals and their status")
+    er = sub.add_parser("evalruns", help="scheduled eval runs and whether each regressed (#61)")
+    er.add_argument("--session", default="main")
     args = ap.parse_args()
     if args.cmd == "usage":
         print(usage_report.run(max(1, args.days)))
@@ -39,6 +41,10 @@ def main() -> None:
         todo = [f for f in store.flags_list("open") if store.proposal_find(f["conv_id"], f["reason"]) is None][: max(1, args.limit)]
         ids = asyncio.run(eval_proposal.start_proposals(s, args.session, todo))
         print(f"started {len(ids)} proposal workflow(s); cards arrive in Slack when ready" if ids else "nothing to propose")
+    elif args.cmd == "evalruns":
+        from . import eval_schedule
+
+        print(eval_schedule.format_runs(Store(Settings.from_env().db_path).kv_get(args.session, "eval_runs", [])))
     elif args.cmd == "proposals":
         for p in Store(Settings.from_env().db_path).proposals_list():
             print(f"{p['id']}  {p['status']:14} {p['conv_id']}  {p['reason']}")
