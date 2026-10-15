@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,7 +54,10 @@ class Settings:
         # extended thinking for PR reviews: the effort level ("low".."max"); anything else (default) = off. The
         # current models take adaptive thinking steered by effort, not a token budget.
         review_thinking = os.environ.get("AOA_REVIEW_THINKING", "").strip().lower()
-        review_thinking = review_thinking if review_thinking in ("low", "medium", "high", "xhigh", "max") else ""
+        if review_thinking and review_thinking not in ("low", "medium", "high", "xhigh", "max"):
+            logging.getLogger(__name__).warning(
+                "AOA_REVIEW_THINKING=%r is not an effort level (low|medium|high|xhigh|max); thinking stays off", review_thinking)
+            review_thinking = ""
         nudge = max(1, _int("AOA_APPROVAL_NUDGE", 4 * 3600))  # expiry must come after the nudge
         return cls(
             data_dir=Path(os.environ.get("AOA_DATA_DIR", "./data")).resolve(),

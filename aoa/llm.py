@@ -107,9 +107,10 @@ class AnthropicLLM:
             kwargs["tools"] = tools
         if tool_choice:
             kwargs["tool_choice"] = tool_choice
-        if thinking:
+        forced = bool(tool_choice) and tool_choice.get("type") in ("any", "tool")
+        if thinking and not forced:  # the API refuses thinking together with a forced tool choice
             kwargs["thinking"] = thinking
-        if effort:
+        if effort and "thinking" in kwargs:
             kwargs["output_config"] = {"effort": effort}
         resp = await self.client.messages.create(**kwargs)
         content: list[dict[str, Any]] = []

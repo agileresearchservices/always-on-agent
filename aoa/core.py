@@ -177,7 +177,9 @@ class AgentCore:
             model=model, system=system, messages=messages, tools=tools, max_tokens=self.s.max_tokens,
             **self._thinking_for(conv),
         )
-        content = resp.content or [{"type": "text", "text": "(no output)"}]
+        content = resp.content
+        if not any(b["type"] in ("text", "tool_use") for b in content):  # empty, or thinking only (cut off)
+            content = [*content, {"type": "text", "text": "(no output)"}]
         cache_miss = is_cache_miss(prev, resp.usage, self.s.cache_ttl_seconds)
         fp = request_fingerprint(system, tools, messages)
         prev_fp = self._fp.get(conv) or self._stored_fp(session, conv)

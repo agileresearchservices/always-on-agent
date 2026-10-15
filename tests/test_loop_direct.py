@@ -257,3 +257,10 @@ async def test_thinking_is_requested_only_for_pr_review_conversations_when_confi
     await handle_events(core, "main", [usr_event("hi")])
     assert llm.calls[0]["thinking"] == {"type": "adaptive"} and llm.calls[0]["effort"] == "high"
     assert llm.calls[1]["thinking"] is None and llm.calls[1]["effort"] is None
+
+
+async def test_a_thinking_only_response_is_stored_with_a_placeholder_so_the_turn_has_content(make_core):
+    core, llm = make_core([[THINK]])
+    await handle_events(core, "main", [usr_event("hi")])
+    last = core.store.load_messages("main")[-1]
+    assert [b["type"] for b in last["content"]] == ["thinking", "text"] and last["content"][1]["text"] == "(no output)"

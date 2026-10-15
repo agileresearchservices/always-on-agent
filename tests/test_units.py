@@ -308,6 +308,28 @@ def test_review_thinking_setting_accepts_only_known_effort_levels(monkeypatch, t
     assert Settings.from_env().review_thinking == ""
 
 
+async def test_forced_tool_choice_drops_thinking_and_effort():
+    from types import SimpleNamespace as NS
+    from aoa.llm import AnthropicLLM
+
+    seen = {}
+
+    class Msgs:
+        async def create(self, **kw):
+            seen.clear(); seen.update(kw)
+            return NS(content=[NS(type="text", text="ok")], stop_reason="end_turn",
+                      usage=NS(input_tokens=1, output_tokens=1, cache_read_input_tokens=0, cache_creation_input_tokens=0))
+
+    llm = AnthropicLLM(NS(messages=Msgs()), cache_ttl_seconds=300)
+    base = dict(model="m", system=[], tools=[{"name": "x", "input_schema": {"type": "object"}}], max_tokens=5000,
+                thinking={"type": "adaptive"}, effort="high",
+                messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    await llm.create(**base, tool_choice={"type": "tool", "name": "x"})
+    assert "thinking" not in seen and "output_config" not in seen
+    await llm.create(**base, tool_choice={"type": "auto"})
+    assert seen["thinking"] == {"type": "adaptive"} and seen["output_config"] == {"effort": "high"}
+
+
 # ---- store --------------------------------------------------------------------------------------
 def test_commit_step_is_atomic_and_idempotent(settings):
     st = Store(settings.db_path)
