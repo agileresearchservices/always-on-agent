@@ -170,7 +170,10 @@ async def fix_pr(client: Client) -> None:
         wid = f"fix-prop-{uuid.uuid4().hex[:6]}"
         h = await client.start_workflow("FixPrWorkflow", {"session": "main", "id": "prop-0123abcd"}, id=wid, task_queue=s.task_queue)
         await asyncio.sleep(2)  # fix_run and the "ready" report are done; the workflow waits for the click
-        await h.signal("open_pr")
+        token = (await h.describe()).run_id[:8]  # the click carries the attempt's token (a stale one is ignored)
+        await h.signal("open_pr", "stale000")
+        await asyncio.sleep(0.5)
+        await h.signal("open_pr", token)
         await asyncio.wait_for(h.result(), 30)
     await save(client, "fix_pr", wid)
 

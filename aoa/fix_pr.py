@@ -1,24 +1,26 @@
 """After a human accepts an eval case, draft a fix and open a PR for a human to review (flywheel step 3, #56).
 
-Started only by a Slack click ("Draft fix" on an accepted case card), never by the model. The pipeline, in a
-throwaway git worktree of the accepted `eval/<slug>` branch:
+Started only by a Slack click ("Draft fix" on an accepted case card), never by the model. In a throwaway git worktree
+(system temp dir) of the accepted `eval/<slug>` branch, rebased onto current main:
 
-  1. the case must still FAIL on the current code (else there is nothing to fix);
-  2. a coding session (Claude Code, headless, in the worktree) edits the code. It gets no GitHub token and no
-     API key (it uses the machine's own Claude login), a tool allowlist, and a dollar budget;
-  3. it may not touch the eval suite (`evals/`, recorded histories), so it cannot make the case pass by changing the case;
-  4. the result is checked with commands this module runs, not with the author's word: `pytest`, the new case N
-     times (all must pass), and the behaviour suite once (no hard case may fail);
-  5. only if all pass: commit on `fix/<slug>` LOCALLY and tell the person (files, numbers, how to read the diff).
-     Nothing leaves the machine until they click [Open PR]: then push `fix/<slug>` and open a PR with the before/after
-     numbers. Touching a guardrail file (safety, approvals, notifier, event trust, the prompt, the pipeline itself) is
+  1. the case must still FAIL on the current code (trusted code, so the API key is fine here);
+  2. a headless Claude Code session edits files. It has NO shell: only Read/Edit/Write/Grep/Glob, denied under /Users
+     and ~, no GitHub token or API key in its environment, a dollar budget;
+  3. this module checks the result: it may not touch the eval suite or test infrastructure, delete or weaken tests, or
+     contain a secret; `pytest` then runs inside a macOS sandbox with NO NETWORK, no writes outside the temp dir and
+     the sensitive paths unreadable (the author's code runs there, so nothing may leave);
+  4. a fix that passes is COMMITTED LOCALLY and reported ("tests green; real-model checks run when you click").
+     Nothing is pushed and no author code ever sees the API key until the person has read the diff and clicks [Run
+     checks + open PR];
+  5. on that click: the new case runs N times (all must pass) and the behaviour suite once (no hard case may fail), and
+     only then is `fix/<slug>` pushed and the PR opened with the before/after numbers. A guardrail file in the diff is
      called out in the title and body.
 
 aoa never merges it: the PR gets aoa's normal review and a human decides. Nothing here pushes to main.
 
-This is NOT a sandbox (#21 was skipped on purpose): the author and the test runs execute as your user. What limits
-it: no tokens/keys in the environment, Read/Edit/Write denied under /Users (the worktree lives in the system temp
-dir), a tool allowlist, a secret scan of the result, frozen test infrastructure, and the human click before any push.
+This is not a general sandbox (#21 was skipped on purpose): the real-model checks in step 5 run the reviewed fix as your
+user with the API key. What limits the rest: the author cannot execute anything, its tests run with no network, and a
+human reads the diff before any code gets the key or leaves the machine.
 """
 from __future__ import annotations
 
@@ -39,20 +41,19 @@ from .pr_resolve import TIMED_OUT, _run, git_env, safe_env
 # Files whose behaviour the evals themselves grade: a fix here can weaken the safety rules, so it is flagged.
 GUARDRAIL_PATHS = (
     "aoa/safety.py", "aoa/notify.py", "aoa/events.py", "aoa/tools.py", "aoa/server.py", "aoa/pr_merge.py",
-    "aoa/pr_resolve.py", "aoa/gh_reviewer.py", "aoa/slack_bridge.py", ".github/", "CODEOWNERS",
+    "aoa/pr_resolve.py", "aoa/gh_reviewer.py", "aoa/slack_bridge.py", "aoa/github_monitor.py", ".github/", "CODEOWNERS",
     # the operating rules, the durable-execution core and the flywheel itself
     "aoa/prompt.py", "aoa/core.py", "aoa/workflows.py", "aoa/activities.py", "aoa/config.py", "aoa/fix_pr.py",
     "aoa/eval_proposal.py",
 )
 # the fix author may not change the suite or the test infrastructure that grades it, or delete a test
-FROZEN_PATHS = ("evals/", "tests/histories/", "tests/conftest.py", "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini",
-                "aoa/testing.py")
+FROZEN_PATHS = ("evals/", "tests/histories/", "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "aoa/testing.py")
+FROZEN_NAMES = ("conftest.py", "sitecustomize.py", "usercustomize.py", ".pth")  # by file name, anywhere in the tree
 SECRET_PATTERNS = (r"sk-ant-[A-Za-z0-9_-]{10,}", r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
                    r"xox[abprs]-[A-Za-z0-9-]{10,}", r"AKIA[0-9A-Z]{16}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 SECRET_ENV_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 PYTEST_TIMEOUT = 1200
-ALLOWED_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "Bash(python -m pytest:*)", "Bash(.venv/bin/python -m pytest:*)",
-                 "Bash(git diff:*)", "Bash(git status:*)", "Bash(git log:*)")
+ALLOWED_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")  # no Bash: the author cannot run code, or read files via git
 
 
 class FixError(Exception):
@@ -72,7 +73,25 @@ def touched_guardrails(files: list[str]) -> list[str]:
 
 
 def frozen_changes(files: list[str]) -> list[str]:
-    return sorted(f for f in files if any(f.startswith(p) for p in FROZEN_PATHS))
+    return sorted(f for f in files if any(f.startswith(p) for p in FROZEN_PATHS)
+                  or any(f.rsplit("/", 1)[-1] == n or f.endswith(n) for n in FROZEN_NAMES))
+
+
+def weakened_tests(diff_text: str) -> list[str]:
+    """Reasons a diff weakens the unit tests: skip/xfail markers added, or more test functions removed than added."""
+    reasons, in_tests, removed, added = [], False, 0, 0
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git"):
+            in_tests = " b/tests/" in line
+        elif in_tests and line.startswith("+") and not line.startswith("+++"):
+            if re.search(r"pytest\.(mark\.(skip|skipif|xfail)|skip\(|xfail\()|@unittest\.skip", line):
+                reasons.append("a skip/xfail marker was added to a test")
+            added += bool(re.match(r"\+\s*(async )?def test_", line))
+        elif in_tests and line.startswith("-") and not line.startswith("---"):
+            removed += bool(re.match(r"-\s*(async )?def test_", line))
+    if removed > added:
+        reasons.append(f"{removed - added} test function(s) were removed")
+    return sorted(set(reasons))
 
 
 def build_prompt(spec: dict[str, Any], failures: list[str], slug: str) -> str:
@@ -88,8 +107,9 @@ Make the smallest change that makes a correct agent pass it. Prefer, in order: t
 - edit anything under evals/ or tests/histories/ (the suite that grades you is off limits);
 - weaken a safety rule (approvals, untrusted-data handling, quiet hours, scope checks) to make the case pass;
 - change what a Temporal workflow does without a workflow.patched guard (see CLAUDE.md).
-Add or adjust unit tests under tests/ if the change deserves one. Run `python -m pytest -q` until it is green. You have no
-API key, so you cannot run the evals; the owner's tooling will. Stop when done; do not commit."""
+You can only read and edit files: you cannot run commands, so reason carefully about the change. You may add a unit
+test under tests/ (a new file or new test functions) but must not remove or skip any, and must not touch any
+conftest.py. Stop when done; do not commit."""
 
 
 class ClaudeCodeAuthor:
@@ -107,8 +127,8 @@ class ClaudeCodeAuthor:
                                 + [f"{t}(~/**)" for t in ("Read", "Edit", "Write", "Grep", "Glob")]}}
         args = [binary, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
                 "--max-budget-usd", f"{self.budget:g}", "--no-session-persistence", "--settings", json.dumps(deny),
-                "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", "WebFetch", "WebSearch"]
-        env = safe_env() | {"PYTHONPATH": str(worktree)}  # HOME stays: that is where the Claude login lives
+                "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", "Bash", "WebFetch", "WebSearch"]
+        env = safe_env()  # HOME stays: that is where the Claude login lives
         code, out = await _run(args, worktree, env, self.timeout)
         if code == TIMED_OUT:
             raise FixError("the fix session ran out of time")
@@ -160,12 +180,37 @@ async def _diff_text(wt: Path) -> str:
     return tracked + "\n".join(extra)
 
 
+async def agit(args: list[str], cwd: Path) -> str:
+    """`_git` off the event loop, so a slow worktree add or rebase cannot stall the activity's heartbeat."""
+    return await asyncio.to_thread(_git, args, cwd)
+
+
+def sandbox_profile(wt: Path, repo: Path = REPO_DIR) -> str:
+    """macOS sandbox for running the author's tests: no network at all, writes only under the system temp dirs, and
+    the places secrets live unreadable. With no network nothing can be sent out; writes outside temp are impossible."""
+    home = Path.home()
+    secret_dirs = [home / d for d in (".ssh", ".aws", ".config", ".gnupg", ".claude", ".docker", ".kube")] + [
+        repo / "data", repo / ".env"]
+    q = lambda path: '"' + str(path).replace('"', "") + '"'  # noqa: E731
+    return ("(version 1)(allow default)(deny network*)(deny file-write*)"
+            '(allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (literal "/dev/null") (literal "/dev/tty"))'
+            "(deny file-read* " + " ".join(f"(subpath {q(d)})" for d in secret_dirs) + ")")
+
+
+async def sandboxed_pytest(wt: Path, home: Path, repo: Path = REPO_DIR) -> tuple[int, str]:
+    if not shutil.which("sandbox-exec"):
+        raise FixError("sandbox-exec is not available, so the author's tests cannot be run safely; refusing")
+    cmd = ["sandbox-exec", "-p", sandbox_profile(wt, repo), sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"]
+    return await _run(cmd, wt, safe_env() | {"PYTHONPATH": str(wt), "HOME": str(home)}, PYTEST_TIMEOUT)
+
+
 async def run_fix(
     spec: dict[str, Any], proposal_id: str, settings: Settings, author: Author, *, repo: Path = REPO_DIR, base: str = "main",
     heartbeat: Callable[[], None] | None = None, key: str | None = None,
 ) -> dict[str, Any]:
-    """Draft and check a fix in a worktree. Returns the result (ok False, with `stage` and `reason`, when there is
-    nothing to open); on success the fix is COMMITTED on `fix/<slug>` in the worktree at `worktree`, unpushed."""
+    """Draft a fix in a worktree and check what can be checked WITHOUT running its code with the API key. Returns the
+    result (ok False, with `stage` and `reason`, when there is nothing to offer); on success the fix is COMMITTED on
+    `fix/<slug>` in the worktree at `worktree`, unpushed and not yet run against the real model (`verify_fix`)."""
     slug = slug_of(spec)
     eval_branch, fix_branch = f"eval/{slug}", f"fix/{slug}"
     runs = settings.eval_validate_runs
@@ -176,79 +221,97 @@ async def run_fix(
     tmp = Path(tempfile.mkdtemp(prefix="aoa-fix-"))
     wt = tmp / "wt"
     res: dict[str, Any] = {"ok": False, "slug": slug, "branch": fix_branch, "worktree": str(wt), "tmp": str(tmp)}
+    created = False
     try:
         try:
-            _git(["worktree", "add", "-q", "-b", fix_branch, str(wt), eval_branch], repo)
-        except RuntimeError as e:
+            await agit(["worktree", "add", "-q", "-b", fix_branch, str(wt), eval_branch], repo)
+            created = True
+        except RuntimeError as e:  # includes "branch already exists": that one is not ours to delete
             raise FixError(f"could not set up the worktree from {eval_branch}: {e}") from e
         try:  # the accepted branch was cut when the person clicked Accept: fix what is on main now
-            _git(["rebase", "-q", base], wt)
+            await agit(["rebase", "-q", base], wt)
         except RuntimeError as e:
             raise FixError(f"{eval_branch} does not rebase onto {base}: {e}") from e
         spec_file = wt / "evals" / "accepted" / f"{spec['name']}.json"
         if not spec_file.exists():
             raise FixError(f"{eval_branch} does not contain the accepted case")
         beat()
-        before = await run_evals(["--spec", str(spec_file), "--runs", str(runs)], cwd=wt, key=key)
+        before = await run_evals(["--spec", str(spec_file), "--runs", str(runs)], cwd=wt, key=key)  # trusted code
         c0 = before["cases"][spec["name"]]
         res["before"] = {"passed": c0["passed"], "runs": c0["runs"], "cost_usd": before.get("est_cost_usd")}
         if c0["passed"] >= c0["runs"]:
             return res | {"stage": "before", "reason": "the case already passes on the current code; nothing to fix"}
         beat()
-        author_out = await author.run(wt, build_prompt(spec, c0["failures"], slug))
-        res["author"] = author_out
+        res["author"] = await author.run(wt, build_prompt(spec, c0["failures"], slug))
         changes = await _changes(wt)
         files = [p for _, p in changes]
         res["files"] = files
         if not files:
             return res | {"stage": "author", "reason": "the fix session changed nothing"}
         if bad := frozen_changes(files):
-            return res | {"stage": "author", "reason": f"the fix touched the eval suite, which it may not: {bad}"}
+            return res | {"stage": "author", "reason": f"the fix touched the eval suite or test infrastructure, which it may not: {bad}"}
         if gone := deleted_tests(changes):
             return res | {"stage": "author", "reason": f"the fix deleted tests, which it may not: {gone}"}
+        if weak := weakened_tests(await _diff_text(wt)):
+            return res | {"stage": "author", "reason": f"the fix weakens the tests: {'; '.join(weak)}"}
+        if hits := secret_hits(await _diff_text(wt)):
+            return res | {"stage": "secrets", "reason": f"the fix contains what looks like a secret ({', '.join(hits)}); refused"}
         res["guardrails"] = touched_guardrails(files)
         beat()
-        # tests run with a throwaway HOME and no tokens or keys; they still run as this user (see the module docstring)
-        code, out = await _run([sys.executable, "-m", "pytest", "-q", "-x"], wt,
-                               safe_env() | {"PYTHONPATH": str(wt), "HOME": str(tmp)}, PYTEST_TIMEOUT)
+        code, out = await sandboxed_pytest(wt, tmp)
         res["pytest"] = {"ok": code == 0, "tail": out[-400:]}
         if code != 0:
             return res | {"stage": "pytest", "reason": "the unit tests fail with the fix"}
-        beat()
-        after = await run_evals(["--spec", str(spec_file), "--runs", str(runs)], cwd=wt, key=key)
-        c1 = after["cases"][spec["name"]]
-        res["after"] = {"passed": c1["passed"], "runs": c1["runs"], "cost_usd": after.get("est_cost_usd")}
-        if c1["passed"] < c1["runs"]:
-            return res | {"stage": "after", "reason": f"the case still fails ({c1['passed']}/{c1['runs']} runs pass)"}
-        beat()
-        suite = await run_evals(["--runs", "1"], cwd=wt, key=key, timeout=1800)
-        bad_hard = sorted(n for n, c in suite["cases"].items() if c["hard"] and c["passed"] != c["runs"])
-        soft = {n: [c["passed"], c["runs"]] for n, c in suite["cases"].items() if not c["hard"] and c["passed"] != c["runs"]}
-        res["suite"] = {"hard_failures": bad_hard, "soft_misses": soft, "cases": len(suite["cases"]),
-                        "cost_usd": suite.get("est_cost_usd")}
-        if bad_hard:
-            return res | {"stage": "suite", "reason": f"hard cases fail with the fix: {bad_hard}"}
-        # the gates ran the author's code: look again at what is in the tree before committing it
+        # the tests ran the author's code: look again at what is in the tree before committing it
         final = await _changes(wt)
         final_files = [p for _, p in final]
-        if bad := frozen_changes(final_files) or deleted_tests(final):
-            return res | {"stage": "author", "reason": f"the checks left changes to protected files: {bad}"}
+        if bad := frozen_changes(final_files) or deleted_tests(final) or weakened_tests(await _diff_text(wt)):
+            return res | {"stage": "author", "reason": f"the checks left changes to protected files or tests: {bad}"}
         if hits := secret_hits(await _diff_text(wt)):
             return res | {"stage": "secrets", "reason": f"the fix contains what looks like a secret ({', '.join(hits)}); refused"}
         res["files"], res["guardrails"] = final_files, touched_guardrails(final_files)
         try:
-            _git(["add", "-A"], wt)
-            _git(["commit", "-q", "-m", f"Fix: {spec['description']}\n\nMakes eval case {spec['name']} pass "
-                                        f"(flywheel proposal {proposal_id})."], wt)
+            await agit(["add", "-A"], wt)
+            await agit(["commit", "-q", "-m", f"Fix: {spec['description']}\n\nMakes eval case {spec['name']} pass "
+                                              f"(flywheel proposal {proposal_id})."], wt)
         except RuntimeError as e:
             raise FixError(f"could not commit the fix: {e}") from e
         res["ok"] = True  # set on `res` itself: the finally block below keeps the worktree only for a success
         return res
-    except FixError:
-        raise
     finally:
         if not res["ok"]:
-            cleanup(repo, tmp, fix_branch)
+            cleanup(repo, tmp, fix_branch if created else None)
+
+
+async def verify_fix(
+    res: dict[str, Any], spec: dict[str, Any], settings: Settings, *, key: str | None = None,
+    heartbeat: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """The real-model checks on a fix the person has read: the case N times (all must pass), then the behaviour suite
+    once (no hard case may fail). Adds `after` and `suite` to the result; returns it with ok False and a `stage` and
+    `reason` (terminal: nothing to retry) when a check fails."""
+    key = key or os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise FixError("no ANTHROPIC_API_KEY for the worker")
+    beat = heartbeat or (lambda: None)
+    wt, runs = Path(res["worktree"]), settings.eval_validate_runs
+    spec_file = wt / "evals" / "accepted" / f"{spec['name']}.json"
+    beat()
+    after = await run_evals(["--spec", str(spec_file), "--runs", str(runs)], cwd=wt, key=key)
+    c1 = after["cases"][spec["name"]]
+    res = res | {"after": {"passed": c1["passed"], "runs": c1["runs"], "cost_usd": after.get("est_cost_usd")}}
+    if c1["passed"] < c1["runs"]:
+        return res | {"ok": False, "stage": "after", "terminal": True,
+                      "reason": f"the case still fails ({c1['passed']}/{c1['runs']} runs pass)"}
+    beat()
+    suite = await run_evals(["--runs", "1"], cwd=wt, key=key, timeout=1800)
+    bad_hard = sorted(n for n, c in suite["cases"].items() if c["hard"] and c["passed"] != c["runs"])
+    soft = {n: [c["passed"], c["runs"]] for n, c in suite["cases"].items() if not c["hard"] and c["passed"] != c["runs"]}
+    res = res | {"suite": {"hard_failures": bad_hard, "soft_misses": soft, "cases": len(suite["cases"]),
+                           "cost_usd": suite.get("est_cost_usd")}}
+    if bad_hard:
+        return res | {"ok": False, "stage": "suite", "terminal": True, "reason": f"hard cases fail with the fix: {bad_hard}"}
+    return res | {"ok": True}
 
 
 def cleanup(repo: Path, tmp: Path | str, fix_branch: str | None = None) -> None:
@@ -281,9 +344,10 @@ def ready_text(proposal_id: str, res: dict[str, Any]) -> str:
     """Slack message when a checked fix is committed locally and waiting for the person's [Open PR]."""
     g = "\n:warning: *Touches guardrail files:* " + ", ".join(res["guardrails"]) if res.get("guardrails") else ""
     files = ", ".join(res["files"][:12]) + (" ..." if len(res["files"]) > 12 else "")
-    return (f"Fix ready for `{proposal_id}` (nothing pushed yet). Case {res['before']['passed']}/{res['before']['runs']} -> "
-            f"{res['after']['passed']}/{res['after']['runs']} runs passing; unit tests green; no hard case fails.\n"
-            f"Files: {files}{g}\nRead it first: `git diff main...{res['branch']}` in the repo. [Open PR] pushes the branch and opens the PR.")
+    return (f"Fix drafted for `{proposal_id}` (nothing pushed, and no code has run with the API key yet). Before: case "
+            f"{res['before']['passed']}/{res['before']['runs']} runs pass. Unit tests are green (run in a no-network sandbox).\n"
+            f"Files: {files}{g}\nRead it first: `git diff main...{res['branch']}` in the repo. [Run checks + open PR] runs the case "
+            "and the behaviour suite against the real model on this code and, only if they pass, pushes the branch and opens the PR.")
 
 
 def report_text(proposal_id: str, res: dict[str, Any], pr: dict[str, Any] | None) -> str:
@@ -293,16 +357,20 @@ def report_text(proposal_id: str, res: dict[str, Any], pr: dict[str, Any] | None
         return (f"Fix PR opened for `{proposal_id}`: {pr['url']}\nCase {res['before']['passed']}/{res['before']['runs']} -> "
                 f"{res['after']['passed']}/{res['after']['runs']} runs passing; tests green; no hard case fails.{g}\n"
                 "aoa will review it; merging is your call.")
+    if pr is not None and pr.get("terminal"):
+        return (f"No PR for `{proposal_id}`: the fix did not pass the real-model checks ({pr.get('reason')}). Nothing was pushed "
+                "and the local branch was discarded. Click Draft fix to try again.")
     if pr is not None:
-        return f"The fix for `{proposal_id}` is ready but the PR could not be opened: {pr.get('reason')}. The branch is kept; click Open PR to try again."
+        return f"The fix for `{proposal_id}` passed its checks but the PR could not be opened: {pr.get('reason')}. The branch is kept; click the button to try again."
     cost = (res.get("author") or {}).get("cost_usd")
     spent = f" (fix session ~${cost:.2f})" if isinstance(cost, (int, float)) else ""
     return f"No fix PR for `{proposal_id}`: {res.get('reason', 'unknown')} (stage: {res.get('stage', '?')}).{spent}"
 
 
 def _gh(text: Any) -> str:
-    """Model- and trace-derived text for a GitHub PR: no @-mentions, no raw HTML."""
-    return str(text).replace("@", "@\u200b").replace("<", "&lt;")
+    """Model- and trace-derived text for a GitHub PR: no @-mentions, raw HTML, links or issue references."""
+    t = str(text).replace("@", "@\u200b").replace("<", "&lt;").replace("[", "\\[").replace("]", "\\]")
+    return re.sub(r"#(?=\d)", "#\u200b", t)  # no #123 or owner/repo#123 cross-references
 
 
 def pr_title(res: dict[str, Any], spec: dict[str, Any]) -> str:

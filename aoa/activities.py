@@ -408,17 +408,26 @@ class AgentActivities:
 
     @activity.defn(name="fix_open_pr")
     async def fix_open_pr(self, a: dict[str, Any]) -> dict[str, Any]:
-        from .fix_pr import FixError, cleanup, open_pr
+        from .fix_pr import FixError, cleanup, open_pr, verify_fix
 
         p = self.core.store.proposal_get(a["id"])
         res = a["result"]
+        repo = Path(__file__).resolve().parent.parent
         if not (Path(res["worktree"]) / ".git").exists():
-            return {"ok": False, "reason": "the worktree is gone (the system cleaned its temp dir); draft the fix again"}
+            return {"ok": False, "terminal": True, "reason": "the worktree is gone (the system cleaned its temp dir)"}
+        try:  # the person has read this diff: now it may run against the real model with the API key
+            res = await with_heartbeat(verify_fix(res, p["spec"], self.s), activity.heartbeat)
+        except Exception as e:  # noqa: BLE001 - an eval failure is a result; keep the fix so the click can be retried
+            activity.logger.exception("fix verification crashed")
+            return {"ok": False, "reason": f"the real-model checks could not run: {type(e).__name__}: {str(e)[:150]}"}
+        if not res["ok"]:
+            cleanup(repo, res["tmp"], res["branch"])
+            return {"ok": False, "terminal": True, "reason": res["reason"]}
         try:
             url = await open_pr(res, p["spec"], p["id"], p["spec"].get("origin", {}))
         except (FixError, gh.GithubError, httpx.HTTPError) as e:
             return {"ok": False, "reason": str(e)[:300]}  # worktree and branch are kept so the person can retry
-        cleanup(Path(__file__).resolve().parent.parent, res["tmp"])  # pushed: the worktree goes, the branch stays
+        cleanup(repo, res["tmp"])  # pushed: the worktree goes, the branch stays
         self.core.store.proposal_update(p["id"], "fix_opened", info={**p["info"], "pr": url})
         return {"ok": True, "url": url}
 
@@ -439,8 +448,9 @@ class AgentActivities:
             a.get("note") or report_text(a["id"], a["result"], a.get("pr")))
         self.core.store.outbox_push(
             a["session"], "eval_fix",
-            {"text": text, "proposal_id": a["id"], "ready": kind == "ready" or (a.get("pr") is not None and not a["pr"].get("ok")),
-             "retry": kind == "final" and not a["result"].get("ok") and a.get("pr") is None},
+            {"text": text, "proposal_id": a["id"], "token": a.get("token"),
+             "ready": kind == "ready" or (a.get("pr") is not None and not a["pr"].get("ok") and not a["pr"].get("terminal")),
+             "retry": kind == "final" and ((a.get("pr") is None and not a["result"].get("ok")) or bool((a.get("pr") or {}).get("terminal")))},
             client_key=f"evalfix:{a['id']}:{a['run_id']}:{a.get('seq', 0)}")
 
     def all(self) -> list:

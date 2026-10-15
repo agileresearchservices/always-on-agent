@@ -120,24 +120,26 @@ def parse_fix_action(payload: dict[str, Any], cfg: BridgeConfig) -> str | None:
     return None
 
 
-def parse_fix_open_action(payload: dict[str, Any], cfg: BridgeConfig) -> str | None:
+def parse_fix_open_action(payload: dict[str, Any], cfg: BridgeConfig) -> tuple[str, str] | None:
+    """[Run checks + open PR] click -> (proposal id, attempt token); the button value is "<proposal id>:<token>"."""
     if payload.get("type") != "block_actions" or (payload.get("user") or {}).get("id") != cfg.user:
         return None
     if (payload.get("channel") or {}).get("id") != cfg.channel:
         return None
     for act in payload.get("actions", []):
-        if act.get("action_id") == "aoa_fix_open" and act.get("value"):
-            return act["value"]
+        if act.get("action_id") == "aoa_fix_open" and ":" in (act.get("value") or ""):
+            pid, token = act["value"].split(":", 1)
+            return pid, token
     return None
 
 
-def open_pr_button(pid: str) -> dict[str, Any]:
+def open_pr_button(pid: str, token: str) -> dict[str, Any]:
     return {"type": "actions", "block_id": f"aoa_fixopen_{pid}", "elements": [
-        {"type": "button", "action_id": "aoa_fix_open", "style": "primary", "value": pid,
-         "text": {"type": "plain_text", "text": "Open PR"},
-         "confirm": {"title": {"type": "plain_text", "text": "Push and open the PR?"},
-                     "text": {"type": "mrkdwn", "text": "Pushes the fix branch to GitHub and opens a PR. aoa will review it; merging stays your call."},
-                     "confirm": {"type": "plain_text", "text": "Open PR"}, "deny": {"type": "plain_text", "text": "Cancel"}}},
+        {"type": "button", "action_id": "aoa_fix_open", "style": "primary", "value": f"{pid}:{token}",
+         "text": {"type": "plain_text", "text": "Run checks + open PR"},
+         "confirm": {"title": {"type": "plain_text", "text": "Have you read the diff?"},
+                     "text": {"type": "mrkdwn", "text": "Runs the fix against the real model with the API key (costs a little), then, only if it passes, pushes the branch and opens a PR. aoa will review it; merging stays your call."},
+                     "confirm": {"type": "plain_text", "text": "Run and open"}, "deny": {"type": "plain_text", "text": "Cancel"}}},
     ]}
 
 
@@ -198,7 +200,7 @@ def render_outbox_item(item: dict[str, Any]) -> tuple[str, list[dict[str, Any]] 
     kind, p = item["kind"], item["payload"]
     text = PREFIX.get(kind, f"_{kind}_ ") + to_mrkdwn(str(p.get("text", "")))
     if kind == "eval_fix" and p.get("proposal_id") and (p.get("ready") or p.get("retry")):
-        btn = open_pr_button(p["proposal_id"]) if p.get("ready") else fix_button(p["proposal_id"])
+        btn = open_pr_button(p["proposal_id"], p.get("token") or "") if p.get("ready") else fix_button(p["proposal_id"])
         return text, [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}, btn]
     if kind == "eval_proposal" and p.get("proposal_id"):
         return text, proposal_blocks(text, p["proposal_id"])
@@ -256,7 +258,7 @@ class Bridge:
         opened = parse_fix_open_action(payload, self.cfg)
         if opened is not None:
             msg = payload.get("message") or {}
-            await self._open_fix(opened, msg.get("ts"), msg.get("text", ""))
+            await self._open_fix(opened[0], opened[1], msg.get("ts"), msg.get("text", ""))
             return
         fix = parse_fix_action(payload, self.cfg)
         if fix is not None:
@@ -381,13 +383,13 @@ class Bridge:
             except Exception:  # noqa: BLE001 - cosmetic only
                 log.warning("could not update eval-case card", exc_info=True)
 
-    async def _open_fix(self, pid: str, ts: str | None, text: str) -> None:
+    async def _open_fix(self, pid: str, token: str, ts: str | None, text: str) -> None:
         key = ("open", pid)
         if key in self._deciding:
             return
         self._deciding.add(key)
         try:
-            r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}/fix/open")
+            r = await self.http.post(f"/sessions/{self.cfg.session}/proposals/{pid}/fix/open", json={"token": token})
         except httpx.HTTPError:
             self._deciding.discard(key)
             await self.web.chat_postMessage(channel=self.cfg.channel, text=f"_{pid}: could not reach the aoa server; click again._")
@@ -404,7 +406,7 @@ class Bridge:
         if ts:
             try:
                 await self.web.chat_update(channel=self.cfg.channel, ts=ts, text=text, blocks=proposal_blocks(
-                    text, None, ":hourglass_flowing_sand: Pushing and opening the PR; the result will be posted here"))
+                    text, None, ":hourglass_flowing_sand: Running the real-model checks, then opening the PR; the result will be posted here"))
             except Exception:  # noqa: BLE001 - cosmetic only
                 log.warning("could not update fix card", exc_info=True)
 

@@ -228,13 +228,21 @@ async def draft_fix(sid: str, pid: str) -> dict[str, Any]:
     return {"status": "started"}
 
 
+class OpenFixRequest(BaseModel):
+    token: str = Field(max_length=16)  # names the attempt whose diff the person read; a stale button does nothing
+
+
 @app.post("/sessions/{sid}/proposals/{pid}/fix/open", status_code=202, dependencies=[Depends(require_token)])
-async def open_fix_pr(sid: str, pid: str) -> dict[str, Any]:
-    """The person read the local fix and clicked [Open PR]: tell the waiting FixPrWorkflow to push and open it."""
-    if not re.fullmatch(r"prop-[0-9a-f]{8}", pid) or store.proposal_get(pid) is None:
+async def open_fix_pr(sid: str, pid: str, o: OpenFixRequest) -> dict[str, Any]:
+    """The person read the local fix and clicked [Run checks + open PR]: tell the waiting FixPrWorkflow (the signal
+    is ignored unless the token is that run's and the workflow is waiting)."""
+    p = store.proposal_get(pid) if re.fullmatch(r"prop-[0-9a-f]{8}", pid) else None
+    if p is None:
         raise HTTPException(404, "no such proposal")
+    if p["status"] != "accepted":
+        raise HTTPException(409, f"the case is {p['status']}")
     try:
-        await app.state.client.get_workflow_handle(f"fix-{pid}").signal("open_pr")
+        await app.state.client.get_workflow_handle(f"fix-{pid}").signal("open_pr", o.token)
     except RPCError as e:
         raise HTTPException(409, "no fix is waiting to be opened for this case") from e
     return {"status": "signalled"}

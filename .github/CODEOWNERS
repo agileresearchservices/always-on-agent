@@ -1,12 +1,21 @@
-# Files the evals grade: a change here can weaken a safety rule, so the owner reviews it by name.
-# (The flywheel's fix PRs also say so in their title and body: aoa/fix_pr.py GUARDRAIL_PATHS.)
-/aoa/safety.py        @agileresearchservices
-/aoa/notify.py        @agileresearchservices
-/aoa/events.py        @agileresearchservices
-/aoa/tools.py         @agileresearchservices
-/aoa/server.py        @agileresearchservices
-/aoa/pr_merge.py      @agileresearchservices
-/aoa/pr_resolve.py    @agileresearchservices
-/aoa/gh_reviewer.py   @agileresearchservices
-/aoa/slack_bridge.py  @agileresearchservices
-/.github/             @agileresearchservices
+# Files the evals grade, plus the prompt, the durable core and the flywheel itself: a change here can weaken a safety
+# rule or a gate, so the owner reviews it by name. Kept in step with aoa/fix_pr.py GUARDRAIL_PATHS by a test.
+# (This only blocks a merge if branch protection requires code owner review.)
+/aoa/safety.py             @agileresearchservices
+/aoa/notify.py             @agileresearchservices
+/aoa/events.py             @agileresearchservices
+/aoa/tools.py              @agileresearchservices
+/aoa/server.py             @agileresearchservices
+/aoa/pr_merge.py           @agileresearchservices
+/aoa/pr_resolve.py         @agileresearchservices
+/aoa/gh_reviewer.py        @agileresearchservices
+/aoa/slack_bridge.py       @agileresearchservices
+/aoa/github_monitor.py     @agileresearchservices
+/.github/                  @agileresearchservices
+/aoa/prompt.py             @agileresearchservices
+/aoa/core.py               @agileresearchservices
+/aoa/workflows.py          @agileresearchservices
+/aoa/activities.py         @agileresearchservices
+/aoa/config.py             @agileresearchservices
+/aoa/fix_pr.py             @agileresearchservices
+/aoa/eval_proposal.py      @agileresearchservices
