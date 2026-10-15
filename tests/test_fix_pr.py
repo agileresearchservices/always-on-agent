@@ -782,3 +782,46 @@ def test_a_failed_start_gives_the_daily_slot_back(make_core, settings, monkeypat
     core.store.proposal_update(pid, "accepted", spec=SPEC, info={})
     assert c.post(f"/sessions/main/proposals/{pid}/fix").status_code == 500
     assert c.post(f"/sessions/main/proposals/{pid}/fix").status_code == 500  # still 500, not 409: the slot came back
+
+
+# ---- follow-ups from aoa's APPROVE of #59 ---------------------------------------------------------------------
+
+def test_nested_git_and_tool_config_files_are_frozen_too():
+    assert frozen_changes(["sub/.gitignore", "a/b/.gitattributes", "x/.claude/settings.json", "pkg/.mcp.json", "aoa/store.py"]) == [
+        "a/b/.gitattributes", "pkg/.mcp.json", "sub/.gitignore", "x/.claude/settings.json"]
+
+
+def test_noise_is_only_compiled_files_and_the_pytest_cache_itself():
+    assert fix_pr._noise("aoa/__pycache__/x.cpython-314.pyc") and fix_pr._noise(".pytest_cache/README.md")
+    assert not fix_pr._noise("aoa/__pycache__/evil.py") and not fix_pr._noise(".pytest_cache/sub/dir/conftest.py")
+    assert not fix_pr._noise("tests/__pycache__/conftest.py")
+
+
+async def test_a_diff_too_big_to_scan_is_refused(tmp_path, settings, pipeline, monkeypatch):
+    repo = make_repo(tmp_path)
+    monkeypatch.setattr(fix_pr, "DIFF_SCAN_CAP", 50)
+    pipeline.reports = [report(0)]
+    with pytest.raises(FixError, match="too big to check"):
+        await go(repo, settings, Author(lambda wt: (wt / "aoa" / "store.py").write_text("X = '" + "y" * 500 + "'\n")))
+
+
+async def test_a_rejected_push_says_the_remote_branch_exists(tmp_path, monkeypatch):
+    res = committed_worktree(tmp_path)
+    repo = tmp_path / "repo"
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    subprocess.run(["git", "remote", "add", "origin", "https://github.com/agileresearchservices/always-on-agent.git"], cwd=repo, check=True)
+    real = fix_pr._run
+
+    async def rejected(args, cwd, env, timeout, shell=False):
+        if "push" in args:
+            return 1, "! [rejected] abc -> fix/x (non-fast-forward)"
+        return await real(args, cwd, env, timeout, shell)
+
+    monkeypatch.setattr(fix_pr, "_run", rejected)
+    with pytest.raises(FixError, match="already exists on GitHub"):
+        await fix_pr.open_pr(res | {"suite": {}, "after": {}, "pytest": {}, "files": []}, SPEC, "p", SPEC["origin"], repo=repo, gh=None, token="tok-secret-1234")
+
+
+def test_a_title_cannot_fake_the_guardrail_flag():
+    title = fix_pr.pr_title({"guardrails": []}, dict(SPEC, description="[guardrail] looks flagged"))
+    assert not title.startswith("[guardrail]") and "[" not in title

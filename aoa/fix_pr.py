@@ -49,11 +49,13 @@ GUARDRAIL_PATHS = (
 # the fix author may not change the suite or the test infrastructure that grades it, or delete a test
 FROZEN_PATHS = ("evals/", "tests/histories/", "pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini", "aoa/testing.py",
                 ".claude/", ".mcp.json", "CLAUDE.md", ".gitattributes", ".gitmodules", ".gitignore", ".git/")
+FROZEN_NESTED = (".gitignore", ".gitattributes", ".gitmodules", ".claude/", ".mcp.json", ".git/")  # at any depth
 FROZEN_NAMES = ("conftest.py", "sitecustomize.py", "usercustomize.py")  # by file name, anywhere in the tree (and any *.pth)
 SECRET_PATTERNS = (r"sk-ant-[A-Za-z0-9_-]{10,}", r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
                    r"xox[abprs]-[A-Za-z0-9-]{10,}", r"AKIA[0-9A-Z]{16}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 SECRET_ENV_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 PYTEST_TIMEOUT = 1200
+DIFF_SCAN_CAP = 3_000_000
 TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")  # no Bash: the author cannot run code, or read files via git
 
 
@@ -105,6 +107,7 @@ def touched_guardrails(files: list[str]) -> list[str]:
 
 def frozen_changes(files: list[str]) -> list[str]:
     return sorted(f for f in files if any(f.startswith(p) for p in FROZEN_PATHS)
+                  or any(f == p.rstrip("/") or ("/" + p) in ("/" + f) for p in FROZEN_NESTED)
                   or f.rsplit("/", 1)[-1] in FROZEN_NAMES or f.endswith(".pth"))
 
 
@@ -174,7 +177,8 @@ class ClaudeCodeAuthor:
 
 
 def _noise(path: str) -> bool:
-    return "__pycache__/" in path or path.endswith(".pyc") or path.startswith(".pytest_cache")
+    """Interpreter byproducts only; any other file in those directories is still a change."""
+    return path.endswith(".pyc") or (path.startswith(".pytest_cache/") and path.count("/") == 1)
 
 
 async def _changes(wt: Path) -> list[tuple[str, str]]:
@@ -208,7 +212,9 @@ async def _diff_text(wt: Path) -> str:
     """Everything the commit would contain, as one unified diff with new files shown as added lines (capped)."""
     await agit(["add", "-N", "."], wt)  # intent-to-add: untracked files appear in `git diff`
     diff = await agit(["diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv"], wt)
-    return diff[:3_000_000]
+    if len(diff) > DIFF_SCAN_CAP:  # a cut-off scan would let a secret or a removed test hide past the cap
+        raise FixError(f"the fix is larger than {DIFF_SCAN_CAP:,} characters of diff, too big to check; refusing")
+    return diff
 
 
 async def agit(args: list[str], cwd: Path, raw: bool = False) -> str:
@@ -430,7 +436,7 @@ def _gh(text: Any) -> str:
 
 def _gh_title(text: Any) -> str:
     """A PR title is plain text: no mentions or markup, one line."""
-    return " ".join(str(text).replace("@", "@\u200b").replace("<", "&lt;").replace("`", "'").split())
+    return " ".join(str(text).replace("@", "@\u200b").replace("<", "&lt;").replace("`", "'").replace("[", "(").replace("]", ")").split())
 
 
 def pr_title(res: dict[str, Any], spec: dict[str, Any]) -> str:
@@ -479,7 +485,11 @@ async def open_pr(
                             f"{res['sha']}:refs/heads/{res['branch']}"],  # the exact commit, not whatever the branch is now
                            wt, git_env(token, home=Path(res["tmp"])), 300)
     if code != 0:
-        raise FixError(f"push failed: {(out[-300:].replace(token, '***') if token else out[-300:])}")
+        text = out[-300:].replace(token, "***") if token else out[-300:]
+        if "non-fast-forward" in text or "rejected" in text:
+            raise FixError(f"push rejected: {res['branch']} already exists on GitHub with different commits (a closed or older "
+                           "attempt). Delete that remote branch or close its PR, then click again")
+        raise FixError(f"push failed: {text}")
     r = await gh("POST", f"/repos/{slug}/pulls", json={
         "title": pr_title(res, spec), "head": res["branch"], "base": base, "body": pr_body(res, spec, proposal_id, origin)})
     if r.status_code >= 300:
