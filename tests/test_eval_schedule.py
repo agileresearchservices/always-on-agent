@@ -109,3 +109,8 @@ async def test_no_api_key_is_a_skip_not_a_crash(env):
 
 def test_signature_is_stable():
     assert signature(compare(None, summ(a=(True, 0, 3), b=(True, 1, 3)))) == "hard:a,hard:b"
+
+
+def test_zero_runs_and_missing_cases_are_regressions():
+    assert [r["case"] for r in compare(None, summ(a=(True, 0, 0)))] == ["a"]
+    assert [r["case"] for r in compare(summ(a=(True, 3, 3), b=(False, 3, 3)), summ(a=(True, 3, 3)))] == ["b"]

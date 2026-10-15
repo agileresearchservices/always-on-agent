@@ -31,6 +31,10 @@ def fingerprint(settings: Settings) -> str:
     for f in FINGERPRINT_FILES:
         h.update(f.encode())
         h.update((here / f).read_bytes() if (here / f).exists() else b"")
+    for f in sorted((here.parent / "evals").rglob("*.py")) + sorted((here.parent / "evals" / "accepted").glob("*.json")):
+        h.update(f.name.encode())
+        h.update(f.read_bytes())
+    h.update(f"runs={settings.eval_schedule_runs}|".encode())
     h.update(f"{settings.model}|{settings.helper_model}|{settings.review_model}".encode())
     return h.hexdigest()[:16]
 

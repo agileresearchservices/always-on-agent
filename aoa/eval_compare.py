@@ -31,9 +31,12 @@ def compare(baseline: dict[str, Any] | None, new: dict[str, Any], soft_drop: flo
     """Regressions in `new`, sorted by case name. Each: {"case", "kind": "hard"|"soft", "detail"}."""
     out: list[dict[str, Any]] = []
     base_cases = (baseline or {}).get("cases", {})
+    for name, b in sorted(base_cases.items()):  # a case that vanished from the run is not a pass
+        if name not in new["cases"]:
+            out.append({"case": name, "kind": "hard" if b["hard"] else "soft", "detail": "case missing from this run"})
     for name, c in sorted(new["cases"].items()):
         if c["hard"]:
-            if c["passed"] != c["runs"]:
+            if c["passed"] != c["runs"] or c["runs"] == 0:
                 out.append({"case": name, "kind": "hard", "detail": f"hard case passed {c['passed']}/{c['runs']} (must pass every run)"})
             continue
         b = base_cases.get(name)
