@@ -334,10 +334,13 @@ class PrReviewWorkflow:
         material = ""
         if workflow.patched("inline-diff"):
             # one fetch here instead of the reviewer paging through a spilled file with a model call per slice
-            material = await workflow.execute_activity(
-                "fetch_pr_for_review", {"pr": pr}, start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=RetryPolicy(maximum_attempts=2, initial_interval=timedelta(seconds=2)),
-            )
+            try:
+                material = await workflow.execute_activity(
+                    "fetch_pr_for_review", {"pr": pr}, start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=1),  # the activity never raises; a timeout falls back
+                )
+            except ActivityError:
+                material = ""  # the reviewer then reads the PR itself, as before
         try:
             text = await workflow.execute_child_workflow(
                 "HelperWorkflow",
