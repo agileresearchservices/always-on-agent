@@ -6,6 +6,7 @@ boundaries and sit in SQLite unchanged.
 from __future__ import annotations
 
 import copy
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -33,9 +34,11 @@ class LLM(Protocol):
         tool_choice: dict[str, Any] | None = None,
         thinking: dict[str, Any] | None = None,
         effort: str | None = None,
+        output_format: dict[str, Any] | None = None,
     ) -> LLMResponse: ...
 
 
+log = logging.getLogger(__name__)
 THINKING_TYPES = ("thinking", "redacted_thinking")
 
 
@@ -100,6 +103,7 @@ class AnthropicLLM:
         tool_choice: dict[str, Any] | None = None,
         thinking: dict[str, Any] | None = None,
         effort: str | None = None,
+        output_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
         system, messages, tools = place_cache_breakpoints(system, messages, tools, self.ttl)
         kwargs: dict[str, Any] = dict(model=model, max_tokens=max_tokens, system=system, messages=messages)
@@ -110,9 +114,27 @@ class AnthropicLLM:
         forced = bool(tool_choice) and tool_choice.get("type") in ("any", "tool")
         if thinking and not forced:  # the API refuses thinking together with a forced tool choice
             kwargs["thinking"] = thinking
+        out_cfg: dict[str, Any] = {}
         if effort and "thinking" in kwargs:
-            kwargs["output_config"] = {"effort": effort}
-        resp = await self.client.messages.create(**kwargs)
+            out_cfg["effort"] = effort
+        if output_format:  # structured outputs: the reply is JSON matching this schema
+            out_cfg["format"] = {"type": "json_schema", "schema": output_format}
+        if out_cfg:
+            kwargs["output_config"] = out_cfg
+        try:
+            resp = await self.client.messages.create(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            if not (output_format and getattr(e, "status_code", None) == 400):
+                raise
+            # a schema the API will not compile must not stop reviews or the fail-closed command reviewer:
+            # carry on without it (callers still validate what they get)
+            log.warning("structured output rejected (%s); retrying without it", str(e)[:200])
+            out_cfg.pop("format", None)
+            if out_cfg:
+                kwargs["output_config"] = out_cfg
+            else:
+                kwargs.pop("output_config", None)
+            resp = await self.client.messages.create(**kwargs)
         content: list[dict[str, Any]] = []
         for b in resp.content:
             if b.type == "text":

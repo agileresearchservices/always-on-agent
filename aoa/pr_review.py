@@ -14,6 +14,25 @@ from typing import Any
 VERDICTS = ("approve", "request_changes")
 SEVERITIES = ("high", "medium", "low")
 MAX_FINDINGS = 15
+# The reviewer's reply, as a structured-output schema (so the API constrains it; parse_verdict still validates).
+VERDICT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": list(VERDICTS)},
+        "summary": {"type": "string"},
+        "findings": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "severity": {"type": "string", "enum": list(SEVERITIES)},
+                "file": {"type": "string"},
+                "line": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "comment": {"type": "string"},
+            },
+            "required": ["severity", "file", "line", "comment"], "additionalProperties": False,
+        }},
+    },
+    "required": ["verdict", "summary", "findings"], "additionalProperties": False,
+}
 
 
 def build_task(pr: dict[str, Any]) -> str:

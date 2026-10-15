@@ -21,6 +21,7 @@ from .events import render_event_text
 from .llm import LLM
 from .memory import MemoryStore
 from .notify import Notifier
+from .pr_review import VERDICT_SCHEMA
 from .prompt import build_sections, helper_sections, system_blocks, volatile_context_block
 from .sandbox import LocalSandbox, Sandbox
 from .store import Store
@@ -165,6 +166,11 @@ class AgentCore:
             return {"thinking": {"type": "adaptive"}, "effort": self.s.review_thinking}
         return {}
 
+    @staticmethod
+    def _output_for(conv: str) -> dict[str, Any]:
+        """PR-review conversations must end with the verdict JSON: have the API enforce the schema."""
+        return {"output_format": VERDICT_SCHEMA} if conv.startswith("prreview/") else {}
+
     # ---- the model step ----------------------------------------------------------------
     async def llm_step(self, session: str, conv: str, step_key: str, role: str, depth: int) -> dict[str, Any]:
         done = self.store.step_get(conv, f"llm:{step_key}")
@@ -175,7 +181,7 @@ class AgentCore:
         prev = self.store.last_usage(conv)
         resp = await self.llm.create(
             model=model, system=system, messages=messages, tools=tools, max_tokens=self.s.max_tokens,
-            **self._thinking_for(conv),
+            **self._thinking_for(conv), **self._output_for(conv),
         )
         content = resp.content
         if not any(b["type"] in ("text", "tool_use") for b in content):  # empty, or thinking only (cut off)
