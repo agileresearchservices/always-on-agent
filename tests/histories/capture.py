@@ -40,7 +40,7 @@ from aoa.workflows import (
 HERE = Path(__file__).parent
 PR = {"repo": "agileresearchservices/demo", "number": 7, "sha": "a" * 40, "title": "Add thing", "author": "agileresearchservices"}
 VERDICT = json.dumps({"verdict": "approve", "summary": "Looks fine.", "findings": []})
-GH_STUBBED = {"poll_github", "publish_pr_review", "merge_inspect", "merge_pr", "merge_update_branch",
+GH_STUBBED = {"poll_github", "fetch_pr_for_review", "publish_pr_review", "merge_inspect", "merge_pr", "merge_update_branch",
               "merge_delete_branch", "merge_issue_states", "resolve_conflicts", "merge_report"}
 
 
@@ -132,6 +132,19 @@ async def poll_and_review(client: Client) -> None:
     await save(client, "pr_review", child)
 
 
+async def review_inline_diff(client: Client) -> None:
+    """PrReviewWorkflow with the inline-diff path: fetch_pr_for_review, then the reviewer helper, then publish."""
+    s = mk_env()
+    stubs = [stub("fetch_pr_for_review", "<untrusted>PR #7 ... --- diff --- ...</untrusted>"),
+             stub("publish_pr_review", {"posted": True, "verdict": "approve"})]
+    w, _ = await worker_with(client, s, FakeLLM([text(VERDICT)]), stubs)
+    async with w:
+        wid = f"pr-review-main-inline-{uuid.uuid4().hex[:6]}"
+        await client.execute_workflow("PrReviewWorkflow", {"session": "main", "cfg": workflow_cfg(s), "pr": PR},
+                                      id=wid, task_queue=s.task_queue)
+    await save(client, "pr_review_inline_diff", wid)
+
+
 def inspect(action: str, **kw: Any) -> dict[str, Any]:
     base = {"action": action, "reason": action, "title": "Add thing", "head_ref": "feat", "base_ref": "main", "same_repo": True,
             "default_base": True, "protected_refs": ["main"], "merge_sha": None, "issues": [{"number": 3, "state": "OPEN"}]}
@@ -154,6 +167,7 @@ async def merge(client: Client, name: str, stubs: list) -> None:
 SCENARIOS = {
     "session_timers_and_reply": session,
     "github_poll": poll_and_review,
+    "pr_review_inline_diff": review_inline_diff,
     "merge_wait_then_merge": lambda c: merge(c, "merge_wait_then_merge", [
         stub("merge_inspect", [inspect("wait"), inspect("merge")]), stub("merge_pr", {"merged": True, "merge_sha": "b" * 40}),
         stub("merge_delete_branch", {"ref": "feat", "result": "deleted"}),

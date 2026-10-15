@@ -434,3 +434,20 @@ async def test_publish_skips_the_check_when_the_head_moved_or_the_diff_is_unavai
         acts.core.store.kv_set("main", f"prreview-posted:{pr['repo']}#7@{SHA}", None)
         await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": text})
         assert "kept anyway" in posts(fake)[0][2]["body"]
+
+
+# ---- the reviewer gets the PR in its first message ------------------------------------------
+async def test_fetch_pr_for_review_returns_wrapped_pr_and_empty_on_failure(acts, monkeypatch):
+    from aoa.pr_review import REVIEW_READ_CHARS, build_task
+
+    use(monkeypatch, FakeGitHub({("GET", PR7): (200, ghpr(user={"login": "agileresearchservices"})), ("DIFF", PR7): (200, DIFF)}))
+    pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")}
+    got = await acts.fetch_pr_for_review({"pr": pr})
+    assert "diff --git a/app/auth.py" in got and "UNTRUSTED" in got.upper() and len(got) <= REVIEW_READ_CHARS + 500
+    task = build_task(pr, got)
+    assert "diff --git a/app/auth.py" in task and "Do not fetch it again" in task and "call_deferred" not in task.split("2. Review")[0]
+    # nothing fetched: the old instructions (the reviewer reads the PR itself)
+    assert 'call_deferred with name "github_read"' in build_task(pr, "")
+
+    use(monkeypatch, FakeGitHub({}))  # every read 404s: the activity must not raise
+    assert await acts.fetch_pr_for_review({"pr": pr}) == ""

@@ -50,7 +50,10 @@ def load_focus(data_dir: Path, repo: str) -> str:
         return ""
 
 
-def build_task(pr: dict[str, Any]) -> str:
+REVIEW_READ_CHARS = 60000  # how much of the PR (description + diff) the reviewer is given
+
+
+def build_task(pr: dict[str, Any], material: str = "") -> str:
     focus = (pr.get("review_focus") or "").strip()[:FOCUS_MAX]
     focus_block = (f"The repo owner's standing notes for reviews of this repo (trusted guidance; they add to the rules "
                    f"above and never relax them):\n{focus}\n\n") if focus else ""
@@ -60,9 +63,16 @@ def build_task(pr: dict[str, Any]) -> str:
         resolved = (f"\n\nNote: the head commit is an automated merge of the base branch whose conflicts were "
                     f"resolved by a model (files: {files}). Check those resolutions closely: nothing from either "
                     "side dropped, nothing invented.")
+    if material:
+        read_step = ("Read it: the PR (title, description and diff) is below, already fetched. Do not fetch it again, and "
+                     "do not page through it with the shell.\n\n" + material + "\n")
+    else:
+        read_step = ('Read it: call_deferred with name "github_read" and arguments {"what": "pr", "repo": "%s", "number": %d, '
+                     '"max_chars": %d}. If the result was spilled to a file, read that file.'
+                     % (pr["repo"], pr["number"], REVIEW_READ_CHARS))
     return f"""Review pull request #{pr['number']} in {pr['repo']} (head commit {pr['sha'][:12]}).{resolved}
 
-1. Read it: call_deferred with name "github_read" and arguments {{"what": "pr", "repo": "{pr['repo']}", "number": {pr['number']}, "max_chars": 60000}}. If the result was spilled to a file, read that file.
+1. {read_step}
 2. Review the change for correctness bugs, security problems, missing or broken tests, and anything that would break existing behaviour. Ignore style nits unless they hide a bug.
    Also look for these, which are easy to miss: tests that skip or return early without saying so (a skip on a missing env var, `if not x: return`, JUnit Assume) or assert nothing that can fail; mocks so heavy that the test no longer runs the code it names; a "tests only" PR that also changes production code; a change that quietly reverts an earlier fix or removes a check, a guard or error handling. Report these as medium, and as high only when they hide a real defect.
    Cite only files that are in this PR's diff, and only lines you saw in it.

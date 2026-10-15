@@ -294,25 +294,31 @@ async def h_external_send(ctx: ToolContext, a: dict[str, Any]) -> str:
     return f"sent to {a['channel']} (prototype stub: recorded, no real delivery)"
 
 
-async def h_github_read(ctx: ToolContext, a: dict[str, Any]) -> str:
+async def read_github(what: str, repo: str, number: int, max_chars: int) -> str:
+    """A PR (title, description, diff) or an issue as untrusted, wrapped text. Raises ToolError. Shared by the
+    `github_read` tool and the review workflow's fetch (which puts the PR in the reviewer's first message)."""
     from . import github_monitor as gh
 
     try:
-        repo = gh.check_repo_in_scope(a["repo"])
-        n = int(a["number"])
-        if a["what"] == "pr":
+        repo = gh.check_repo_in_scope(repo)
+        n = int(number)
+        if what == "pr":
             pr = (await gh.gh_call("GET", f"/repos/{repo}/pulls/{n}")).json()
             diff = (await gh.gh_call("GET", f"/repos/{repo}/pulls/{n}", accept="application/vnd.github.diff")).text
             text = (f"PR #{n} {pr['title']} (by {pr['user']['login']}, {pr['state']})\n\n{pr.get('body') or ''}"
                     f"\n\n--- diff ---\n{diff}")
-        elif a["what"] == "issue":
+        elif what == "issue":
             it = (await gh.gh_call("GET", f"/repos/{repo}/issues/{n}")).json()
             text = f"Issue #{n} {it['title']} (by {it['user']['login']}, {it['state']})\n\n{it.get('body') or ''}"
         else:
             raise ToolError("what must be 'pr' or 'issue'")
     except (gh.GithubError, httpx.HTTPError) as e:
         raise ToolError(str(e)) from e
-    return wrap_untrusted(f"github:{repo}#{n}", text[: int(a.get("max_chars", 12000))])
+    return wrap_untrusted(f"github:{repo}#{n}", text[:max_chars])
+
+
+async def h_github_read(ctx: ToolContext, a: dict[str, Any]) -> str:
+    return await read_github(a["what"], a["repo"], a["number"], int(a.get("max_chars", 12000)))
 
 
 async def h_github_write(ctx: ToolContext, a: dict[str, Any]) -> str:
