@@ -7,11 +7,13 @@ Then:             pytest -m temporal
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import uuid
 
 import pytest
 from temporalio.client import Client
+from temporalio.service import RPCError
 
 from aoa.config import Settings
 from aoa.core import AgentCore
@@ -139,6 +141,9 @@ async def test_poll_starts_one_review_per_commit_and_publishes(client, env, monk
         deadline = asyncio.get_event_loop().time() + 30
         while asyncio.get_event_loop().time() < deadline and not any(o["kind"] == "pr_review" for o in store.outbox_since(sid)):
             await asyncio.sleep(0.2)
+        # a review still in flight when the worker goes away would stay "running" in the shared dev server forever
+        with contextlib.suppress(RPCError):  # already finished is the usual case
+            await client.get_workflow_handle(f"pr-review-{sid}-agileresearchservices-demo-7-{pr['sha'][:12]}").terminate("test done")
     cards = [o for o in store.outbox_since(sid) if o["kind"] == "pr_review"]
     assert len(cards) == 1 and cards[0]["payload"]["verdict"] == "request_changes"
     assert len(llm.calls) == 1  # second poll found the same commit: no second review
