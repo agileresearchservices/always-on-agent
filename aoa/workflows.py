@@ -445,3 +445,24 @@ class MergePrWorkflow:
             await workflow.sleep(every * (attempt + 1))
             issues = await self._act("merge_issue_states", issues)
         return {"issues": issues, "note": note}
+
+
+@workflow.defn
+class EvalProposalWorkflow:
+    """Started by `aoa propose` for one flagged outcome (never by the model): draft an eval case, check that it
+    fails on the current agent, and put a card in Slack. The decision is a click handled by the server, so this
+    workflow ends once the card is up. A new workflow, so it needs no patch guard."""
+
+    @workflow.run
+    async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
+        out = await workflow.execute_activity(
+            "eval_draft", {"session": inp["session"], "conv_id": inp["conv_id"], "reason": inp["reason"]},
+            start_to_close_timeout=timedelta(minutes=30), heartbeat_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        if out["status"] == "proposed":
+            await workflow.execute_activity(
+                "eval_post_card", {"session": inp["session"], "id": out["id"]},
+                start_to_close_timeout=timedelta(seconds=30), retry_policy=STATE_RETRY,
+            )
+        return out

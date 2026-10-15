@@ -24,6 +24,8 @@ def kind_of(conv_id: str) -> str:
         return "cmd-review"
     if conv_id.endswith("#warm"):
         return "warm"
+    if conv_id.endswith("#eval-draft"):
+        return "eval-draft"
     if conv_id.startswith("resolve/"):
         return "resolve"
     if conv_id.startswith("prreview/"):

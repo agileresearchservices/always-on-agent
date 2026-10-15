@@ -109,6 +109,9 @@ class Settings:
     approval_nudge_seconds: int
     review_thinking: str
     approval_expire_seconds: int
+    # eval flywheel
+    eval_validate_runs: int
+    eval_proposals_per_day: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -149,6 +152,8 @@ class Settings:
             review_thinking=review_thinking,
             approval_nudge_seconds=nudge,
             approval_expire_seconds=max(nudge + 1, _int("AOA_APPROVAL_EXPIRE", 24 * 3600)),
+            eval_validate_runs=max(1, min(_int("AOA_EVAL_VALIDATE_RUNS", 2), 5)),
+            eval_proposals_per_day=max(0, _int("AOA_EVAL_PROPOSALS_PER_DAY", 3)),
         )
 
     # Derived paths -------------------------------------------------------

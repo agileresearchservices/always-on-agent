@@ -311,3 +311,32 @@ async def test_pr_workflows_are_findable_by_search_attributes(client, env):
         assert found == [handle.id]
     finally:
         await handle.terminate("test done")
+
+
+async def test_eval_proposal_workflow_drafts_validates_and_posts_a_card(client, env, monkeypatch):
+    """Flag -> EvalProposalWorkflow -> draft (scripted model) -> validate (stubbed eval run) -> Slack card in the outbox."""
+    import json
+
+    from aoa import eval_proposal
+
+    async def fake_validate(spec, runs, **kw):
+        return {"passed": 0, "runs": runs, "failures": ["no card"], "cost_usd": 0.02, "verdict": "reproduced"}
+
+    monkeypatch.setattr(eval_proposal, "validate_on_agent", fake_validate)
+    sid = f"t-{uuid.uuid4().hex[:6]}"
+    draft = {"notes": "n", "case": {
+        "name": "flywheel_e2e_case", "description": "An e2e drafted case about approvals.", "hard": False, "clock": "afternoon",
+        "turns": [[{"from": "person", "text": "email bob"}]],
+        "graders": [{"type": "no_error", "args_json": "{}"}, {"type": "approval_card_for", "args_json": "{\"tool\": \"external_send\"}"}]}}
+    store = Store(env.db_path)
+    store.flag_add("main", "approval_denied:apr-e2e", "the person denied external_send")
+    core = AgentCore(env, store, MemoryStore(env.memory_dir), FakeLLM([text(json.dumps(draft))]), TemporalScheduler(client, env))
+    async with await build_worker(env, client, core):
+        out = await client.execute_workflow(
+            "EvalProposalWorkflow", {"session": sid, "conv_id": "main", "reason": "approval_denied:apr-e2e"},
+            id=f"eval-proposal-{sid}", task_queue=env.task_queue)
+    assert out["status"] == "proposed"
+    cards = [o for o in store.outbox_since(sid) if o["kind"] == "eval_proposal"]
+    assert len(cards) == 1 and cards[0]["payload"]["proposal_id"] == out["id"]
+    assert "flywheel_e2e_case" in cards[0]["payload"]["text"]
+    assert store.flags_list("proposed")[0]["reason"] == "approval_denied:apr-e2e"

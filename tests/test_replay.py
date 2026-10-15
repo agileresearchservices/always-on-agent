@@ -16,18 +16,20 @@ from temporalio.client import WorkflowHistory
 from temporalio.worker import Replayer
 
 from aoa.workflows import (
-    GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow, SessionWorkflow,
+    EvalProposalWorkflow, GithubPollWorkflow, HelperWorkflow, MergePrWorkflow, PrReviewWorkflow, RoutineWorkflow,
+    SessionWorkflow,
 )
 
 HISTORIES = sorted((Path(__file__).parent / "histories").glob("*.json"))
-FLOWS = [SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow]
+FLOWS = [SessionWorkflow, HelperWorkflow, RoutineWorkflow, GithubPollWorkflow, PrReviewWorkflow, MergePrWorkflow,
+         EvalProposalWorkflow]
 
 
 def test_histories_are_present():
     names = {p.stem for p in HISTORIES}
     assert {"session_timers_and_reply", "legacy_session_pre_timers", "pr_review", "github_poll",
             "legacy_poll_pre_search_attrs", "merge_wait_then_merge", "merge_update_branch",
-            "merge_conflict_resolved", "pr_review_inline_diff"} <= names
+            "merge_conflict_resolved", "pr_review_inline_diff", "eval_proposal"} <= names
 
 
 @pytest.mark.parametrize("path", HISTORIES, ids=lambda p: p.stem)
