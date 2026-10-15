@@ -48,18 +48,23 @@ def request_fingerprint(system: list[dict[str, Any]], tools: list[dict[str, Any]
     return h([tools, system]), [h(m) for m in messages]
 
 
-def describe_prefix_change(prev: tuple[str, list[str]] | None, cur: tuple[str, list[str]]) -> str:
-    """Why a cache miss happened, from our side: what differs from the previous request in this conversation."""
+def prefix_change(prev: tuple[str, list[str]] | None, cur: tuple[str, list[str]]) -> tuple[str, str]:
+    """(cause code, text): why a cache miss happened, from our side, i.e. what differs from the previous request in
+    this conversation. The code is stored with the step so `flag.scan` can tell a deploy from a real prefix bug."""
     if prev is None:
-        return "no previous request recorded for this conversation"
+        return "no_previous", "no previous request recorded for this conversation"
     if prev[0] != cur[0]:
-        return "tools/system changed since the previous request"
+        return "tools_system", "tools/system changed since the previous request"
     for i, (a, b) in enumerate(zip(prev[1], cur[1])):
         if a != b:
-            return f"message {i} of {len(prev[1])} changed since the previous request"
+            return "message_changed", f"message {i} of {len(prev[1])} changed since the previous request"
     if len(cur[1]) < len(prev[1]):
-        return "history shrank (compaction?)"
-    return "our request prefix is identical to the previous one, so the miss is not caused by our request"
+        return "history_shrank", "history shrank (compaction?)"
+    return "identical", "our request prefix is identical to the previous one, so the miss is not caused by our request"
+
+
+def describe_prefix_change(prev: tuple[str, list[str]] | None, cur: tuple[str, list[str]]) -> str:
+    return prefix_change(prev, cur)[1]
 
 
 def is_cache_miss(prev: dict[str, Any] | None, usage: dict[str, int], ttl: float) -> bool:
@@ -189,11 +194,13 @@ class AgentCore:
         cache_miss = is_cache_miss(prev, resp.usage, self.s.cache_ttl_seconds)
         fp = request_fingerprint(system, tools, messages)
         prev_fp = self._fp.get(conv) or self._stored_fp(session, conv)
+        miss_cause = ""
         if cache_miss:
+            miss_cause, miss_why = prefix_change(prev_fp, fp)
             log.warning("cache miss in %s within TTL (read %s of ~%s cached tokens): treat as a bug (prefix changed?)",
                     conv, resp.usage.get("cache_read_input_tokens", 0),
                     prev["cache_read"] + prev["cache_write"])
-            log.warning("cache miss cause in %s: %s", conv, describe_prefix_change(prev_fp, fp))
+            log.warning("cache miss cause in %s: %s", conv, miss_why)
         self._fp[conv] = fp
         self.store.kv_set(session, f"fp:{conv}", list(fp))  # survives worker restarts, so a miss can be explained
         result = {
@@ -204,6 +211,8 @@ class AgentCore:
             "text": "".join(b["text"] for b in content if b["type"] == "text").strip(),
             "cache_miss": cache_miss,
         }
+        if miss_cause:  # kept with the step (logs rotate); a key added only on a miss, so replays and old steps are unaffected
+            result["cache_miss_cause"] = miss_cause
         stored, fresh = self.store.commit_step(conv, f"llm:{step_key}", result, role="assistant", content=content)
         if fresh:
             self.store.usage_add(conv, model, resp.usage)

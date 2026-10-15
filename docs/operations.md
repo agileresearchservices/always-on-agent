@@ -33,7 +33,7 @@ Do not start hand-run copies next to the services: they would fight over ports 7
    (the long-lived session) is. Anything else is in-flight work: a PR review, a merge, a fix draft.
 2. Restart the affected service. A worker restart is safe for durable workflows (they resume), but it interrupts any
    activity mid-flight, and a tool activity that dies is reported to the model as "effects unknown".
-3. After a worker restart that changed the tool list, expect one prompt-cache miss warning. More than one is a bug.
+3. After a worker restart that changed the tool list, expect one prompt-cache miss warning; it is stored with the cause `tools_system` and is not flagged. A miss with any other cause is flagged.
 4. Restart the **worker** after changing code in `aoa/` that the worker runs; the **server** for `server.py`; the
    **bridge** for `slack_bridge.py`. Changing `.env` needs a restart of every service that reads the variable.
 

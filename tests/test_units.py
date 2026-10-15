@@ -571,3 +571,34 @@ async def test_ensure_github_schedule_updates_an_existing_schedule(monkeypatch, 
     assert isinstance(update, ScheduleUpdate)
     assert update.schedule.spec.intervals[0].every == timedelta(seconds=30)  # floored
     assert update.schedule.action.args[0]["user"] == "someone"
+
+
+def test_prefix_change_returns_a_code_the_flag_scan_can_use():
+    from aoa.core import prefix_change, request_fingerprint
+    from aoa.flag import EXPECTED_MISS_CAUSES
+    m = lambda t: {"role": "user", "content": [{"type": "text", "text": t}]}  # noqa: E731
+    sys_a, sys_b = [{"type": "text", "text": "a"}], [{"type": "text", "text": "b"}]
+    prev = request_fingerprint(sys_a, [], [m("x"), m("y")])
+    codes = {
+        "no_previous": prefix_change(None, prev)[0],
+        "tools_system": prefix_change(prev, request_fingerprint(sys_b, [], [m("x"), m("y")]))[0],
+        "message_changed": prefix_change(prev, request_fingerprint(sys_a, [], [m("x"), m("z")]))[0],
+        "history_shrank": prefix_change(prev, request_fingerprint(sys_a, [], [m("x")]))[0],
+        "identical": prefix_change(prev, request_fingerprint(sys_a, [], [m("x"), m("y"), m("w")]))[0],
+    }
+    assert all(k == v for k, v in codes.items())
+    assert EXPECTED_MISS_CAUSES == {"tools_system", "history_shrank"}  # a changed message or an identical prefix is a lead
+
+
+async def test_a_miss_records_its_cause_with_the_step(make_core, monkeypatch):
+    from aoa import core as core_mod
+    from aoa.direct import handle_events
+    from aoa.events import user_event
+    from aoa.testing import text
+    core, _ = make_core([text("one"), text("two")])
+    monkeypatch.setattr(core_mod, "is_cache_miss", lambda prev, usage, ttl: prev is not None)
+    await handle_events(core, "s", [user_event("hi").to_dict()])
+    await handle_events(core, "s", [user_event("again").to_dict()])
+    results = [r for k, r in core.store.steps_for("s") if k.startswith("llm:")]
+    assert "cache_miss_cause" not in results[0]  # no miss on the first call
+    assert results[1]["cache_miss"] and results[1]["cache_miss_cause"] == "identical"  # same tools/system, history only grew
