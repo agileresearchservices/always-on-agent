@@ -22,7 +22,7 @@ from .gh_reviewer import forget as forget_reviewer_token, reviewer_token
 from .github_monitor import notice_key, notice_text, poll_once, reviews_to_start, token_provider
 from .pr_merge import OFFER_FOR_KEY, OFFER_KEY, RESOLVED_KEY, RETRYABLE, check_summary, decide, report_text
 from .pr_resolve import AUTO_MERGE_ON, ResolveError, Resolver, resolve_root, with_heartbeat
-from .pr_review import github_body, parse_verdict, slack_text
+from .pr_review import check_citations, diff_index, github_body, load_focus, parse_verdict, slack_text
 
 
 class AgentActivities:
@@ -105,6 +105,8 @@ class AgentActivities:
             files = self.core.store.kv_get(a["session"], f"{RESOLVED_KEY}{pr['repo']}#{pr['number']}@{pr['sha']}")
             if files is not None:
                 pr["resolved_files"] = files
+            if focus := load_focus(self.s.data_dir, pr["repo"]):
+                pr["review_focus"] = focus
         return {"announced": len(prs), "review": review, "search_attrs": search_attrs.registered()}
 
     @activity.defn(name="publish_pr_review")
@@ -113,6 +115,8 @@ class AgentActivities:
         REQUEST_CHANGES when a reviewer identity is configured, else a comment review), and put a card in Slack. Idempotent: the card has a client key, and a repeat post is skipped."""
         pr, session = a["pr"], a["session"]
         v = parse_verdict(a.get("review_text") or "")
+        if v is not None:
+            v = await self._check_citations(pr, v)
         posted, note, posted_as = False, a.get("note", ""), "a comment review"
         done_key = f"prreview-posted:{pr['repo']}#{pr['number']}@{pr['sha']}"
         url = f"/repos/{pr['repo']}/pulls/{pr['number']}/reviews"
@@ -155,6 +159,19 @@ class AgentActivities:
             session, "pr_review", payload, client_key=f"prreview:{pr['repo']}#{pr['number']}@{pr['sha']}",
         )
         return {"verdict": v["verdict"] if v else None, "posted": posted}
+
+    async def _check_citations(self, pr: dict[str, Any], v: dict[str, Any]) -> dict[str, Any]:
+        """Remove locations the PR's diff cannot support (the findings stay). Skipped (the review is used as it
+        is) when the diff is unavailable, too large for GitHub, or the head moved since the review: this check
+        must never stop a review from being published."""
+        path = f"/repos/{pr['repo']}/pulls/{pr['number']}"
+        try:
+            if (await gh.gh_call("GET", path)).json()["head"]["sha"] != pr["sha"]:
+                return v
+            diff = (await gh.gh_call("GET", path, accept="application/vnd.github.diff")).text
+            return check_citations(v, diff_index(diff)) if diff.strip() else v
+        except Exception:  # noqa: BLE001 - an unexpected reply shape or network error must not fail the publish
+            return v
 
     def _merge_offer(self, session: str, pr: dict[str, Any], card: str) -> str:
         """An opaque id the [Merge] button carries. It names this PR at this reviewed commit, so a click can

@@ -2,6 +2,8 @@
 server's merge endpoint. No model, no Temporal server (see test_temporal_e2e.py for the workflow)."""
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -111,13 +113,15 @@ class FakeGitHub:
     async def __call__(self, method, path, json=None, accept="", token=None):
         self.calls.append((method, path, json))
         self.tokens.append(token)
+        kind = "DIFF" if method == "GET" and "diff" in accept else method  # a diff is routed as ("DIFF", path)
         for (m, prefix), resp in self.routes.items():
-            if m == method and path.startswith(prefix):
+            if m == kind and path.startswith(prefix):
                 resp = resp(json) if callable(resp) else resp
                 if isinstance(resp, Exception):
                     raise resp
                 code, body = resp
-                r = httpx.Response(code, json=body, request=httpx.Request(method, "https://api.github.com" + path))
+                req = httpx.Request(method, "https://api.github.com" + path)
+                r = httpx.Response(code, text=body, request=req) if isinstance(body, str) else httpx.Response(code, json=body, request=req)
                 if code >= 400:
                     raise httpx.HTTPStatusError("err", request=r.request, response=r)
                 return r
@@ -131,6 +135,14 @@ def acts(make_core, monkeypatch):
     monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
     core, _ = make_core([])
     return AgentActivities(core, None, core.s)
+
+
+PR7 = "/repos/agileresearchservices/demo/pulls/7"
+REVIEW_READS = {("GET", PR7): (200, ghpr()), ("DIFF", PR7): (200, "")}  # what publish_pr_review reads before posting
+
+
+def posts(fake):
+    return [c for c in fake.calls if c[0] == "POST"]
 
 
 def use(monkeypatch, fake):
@@ -236,7 +248,7 @@ async def test_issue_states_stay_in_scope(acts, monkeypatch):
 
 
 async def test_publish_approve_creates_one_stable_merge_offer(acts, monkeypatch):
-    use(monkeypatch, FakeGitHub({("POST", "/repos/agileresearchservices/demo/pulls/7/reviews"): (200, {})}))
+    use(monkeypatch, FakeGitHub(REVIEW_READS | {("POST", "/repos/agileresearchservices/demo/pulls/7/reviews"): (200, {})}))
     pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")} | {"author": "agileresearchservices"}
     ok = '{"verdict": "approve", "summary": "Fine.", "findings": []}'
     await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": ok})
@@ -331,11 +343,12 @@ def test_check_names_are_escaped_exactly_once():
 
 async def test_reviewer_identity_posts_a_real_approval(acts, monkeypatch):
     monkeypatch.setenv("AOA_REVIEWER_TOKEN", "ghs_reviewer")
-    fake = use(monkeypatch, FakeGitHub({("POST", "/repos/agileresearchservices/demo/pulls/7/reviews"): (200, {})}))
+    fake = use(monkeypatch, FakeGitHub(REVIEW_READS | {("POST", "/repos/agileresearchservices/demo/pulls/7/reviews"): (200, {})}))
     pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")} | {"author": "agileresearchservices"}
     await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": '{"verdict": "approve", "summary": "Fine.", "findings": []}'})
-    assert fake.calls[0][2]["event"] == "APPROVE" and fake.tokens == ["ghs_reviewer"]
-    assert "recommendation" not in fake.calls[0][2]["body"] and fake.calls[0][2]["commit_id"] == SHA
+    sent = posts(fake)
+    assert sent[0][2]["event"] == "APPROVE" and fake.tokens[-1] == "ghs_reviewer"
+    assert "recommendation" not in sent[0][2]["body"] and sent[0][2]["commit_id"] == SHA
     card = acts.core.store.outbox_since("main")[-1]["payload"]
     assert "Posted on GitHub as an approval" in card["text"] and card["merge_offer"]
 
@@ -346,12 +359,12 @@ async def test_reviewer_identity_failure_falls_back_to_a_comment_review(acts, mo
     def post(body):
         return (422, {"message": "nope"}) if body["event"] != "COMMENT" else (200, {})
 
-    fake = use(monkeypatch, FakeGitHub({("POST", "/repos/agileresearchservices/demo/pulls/7/reviews"): post}))
+    fake = use(monkeypatch, FakeGitHub(REVIEW_READS | {("POST", "/repos/agileresearchservices/demo/pulls/7/reviews"): post}))
     pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")} | {"author": "agileresearchservices"}
     bad = '{"verdict": "request_changes", "summary": "Bug.", "findings": []}'
     await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": bad})
-    assert [c[2]["event"] for c in fake.calls] == ["REQUEST_CHANGES", "COMMENT"]
-    assert fake.tokens == ["ghs_reviewer", None]  # the fallback uses GITHUB_TOKEN
+    assert [c[2]["event"] for c in posts(fake)] == ["REQUEST_CHANGES", "COMMENT"]
+    assert [t for c, t in zip(fake.calls, fake.tokens) if c[0] == "POST"] == ["ghs_reviewer", None]  # the fallback uses GITHUB_TOKEN
     text = acts.core.store.outbox_since("main")[-1]["payload"]["text"]
     assert "as a comment review" in text and "could not post (422)" in text
 
@@ -378,3 +391,46 @@ def test_merge_starts_even_if_the_stored_offer_lacks_a_field(api):
     store.kv_set("main", "merge-offer:mrg-0123456789ab", {k: v for k, v in OFFER.items() if k != "sha"})
     assert client.post("/sessions/main/merges/mrg-0123456789ab", json={}).status_code == 202
     assert "search_attributes" not in fake.started[0]
+
+
+# ---- citation check in publish_pr_review ----------------------------------------------------
+DIFF = """diff --git a/app/auth.py b/app/auth.py
+--- a/app/auth.py
++++ b/app/auth.py
+@@ -10,3 +10,3 @@
+ a
+-b
++c
+ d
+"""
+
+
+async def test_publish_removes_locations_the_diff_cannot_support(acts, monkeypatch):
+    fake = use(monkeypatch, FakeGitHub(REVIEW_READS | {("DIFF", PR7): (200, DIFF),
+                                                       ("POST", PR7 + "/reviews"): (200, {})}))
+    pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")} | {"author": "agileresearchservices"}
+    text = json.dumps({"verdict": "approve", "summary": "Fine.", "findings": [
+        {"severity": "low", "file": "app/auth.py", "line": 11, "comment": "kept"},
+        {"severity": "low", "file": "app/auth.py", "line": 99, "comment": "line never shown"},
+        {"severity": "medium", "file": "other.py", "line": 1, "comment": "file not in the PR"}]})
+    await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": text})
+    body = posts(fake)[0][2]["body"]
+    assert "kept" in body and "line never shown" in body and "file not in the PR" in body  # findings stay
+    assert "`app/auth.py:99`" not in body and "`other.py:1`" not in body and "2 finding(s) cited a file or line" in body
+    assert posts(fake)[0][2]["event"] == "COMMENT"
+    card = acts.core.store.outbox_since("main")[-1]["payload"]
+    assert card["verdict"] == "approve" and "location was removed" in card["text"]  # never changes the verdict
+
+
+async def test_publish_skips_the_check_when_the_head_moved_or_the_diff_is_unavailable(acts, monkeypatch):
+    pr = {k: OFFER[k] for k in ("repo", "number", "sha", "title", "url")} | {"author": "agileresearchservices"}
+    text = json.dumps({"verdict": "request_changes", "summary": "Bug.", "findings": [
+        {"severity": "medium", "file": "other.py", "line": 1, "comment": "kept anyway"}]})
+    moved = {"head": {"sha": "f" * 16}}
+    for reads in ({("GET", PR7): (200, ghpr() | moved), ("DIFF", PR7): (200, DIFF)},
+                  {("GET", PR7): (200, ghpr()), ("DIFF", PR7): (406, {"message": "diff too large"})},
+                  {("GET", PR7): (404, {"message": "gone"})}):
+        fake = use(monkeypatch, FakeGitHub(reads | {("POST", PR7 + "/reviews"): (200, {})}))
+        acts.core.store.kv_set("main", f"prreview-posted:{pr['repo']}#7@{SHA}", None)
+        await acts.publish_pr_review({"session": "main", "pr": pr, "review_text": text})
+        assert "kept anyway" in posts(fake)[0][2]["body"]
