@@ -6,12 +6,72 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+log = logging.getLogger(__name__)
+
+
+def _shown(name: str, value: str) -> str:
+    """The value as it may appear in a message: never for a secret (*TOKEN, *KEY variable)."""
+    return "<hidden>" if name.endswith(("TOKEN", "KEY")) else repr(value)
+
+
+def _raw(name: str) -> str | None:
+    """The variable's text, or None when unset or empty (an empty `AOA_X=` line means unset)."""
+    v = os.environ.get(name, "").strip()
+    return v or None
+
+
 def _int(name: str, default: int) -> int:
-    return int(os.environ.get(name, default))
+    raw = _raw(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {_shown(name, raw)}") from None
 
 
 def _float(name: str, default: float) -> float:
-    return float(os.environ.get(name, default))
+    raw = _raw(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {_shown(name, raw)}") from None
+
+
+def _cache_ttl() -> int:
+    """AOA_CACHE_TTL: the API offers 5m or 1h only. Tolerant on purpose (a bad value must not stop the worker),
+    but never silent: anything other than 300 or 3600 logs the TTL it was turned into."""
+    raw = _raw("AOA_CACHE_TTL")
+    if raw is None:
+        return 300
+    try:
+        v = int(raw)
+    except ValueError:
+        log.warning("AOA_CACHE_TTL=%r is not an integer; using 300", raw)
+        return 300
+    if v in (300, 3600):
+        return v
+    chosen = 3600 if v > 300 else 300
+    log.warning("AOA_CACHE_TTL=%d is not 300 or 3600 (the API offers 5m or 1h); using %d", v, chosen)
+    return chosen
+
+
+def _hour(name: str, default: int) -> int:
+    v = _int(name, default)
+    if not 0 <= v <= 23:
+        log.warning("%s=%d is not an hour (0-23); using %d", name, v, default)
+        return default
+    return v
+
+
+def _positive(name: str, default: int) -> int:
+    v = _int(name, default)
+    if v <= 0:
+        log.warning("%s=%d must be positive; using %d", name, v, default)
+        return default
+    return v
 
 
 @dataclass(frozen=True)
@@ -56,7 +116,7 @@ class Settings:
         # current models take adaptive thinking steered by effort, not a token budget.
         review_thinking = os.environ.get("AOA_REVIEW_THINKING", "").strip().lower()
         if review_thinking and review_thinking not in ("low", "medium", "high", "xhigh", "max"):
-            logging.getLogger(__name__).warning(
+            log.warning(
                 "AOA_REVIEW_THINKING=%r is not an effort level (low|medium|high|xhigh|max); thinking stays off", review_thinking)
             review_thinking = ""
         nudge = max(1, _int("AOA_APPROVAL_NUDGE", 4 * 3600))  # expiry must come after the nudge
@@ -76,14 +136,14 @@ class Settings:
             tool_result_max_chars=_int("AOA_TOOL_RESULT_MAX_CHARS", 8000),
             context_hard_limit_tokens=_int("AOA_CONTEXT_HARD_LIMIT", 120_000),
             context_warm_compact_tokens=_int("AOA_CONTEXT_WARM_COMPACT", 50_000),
-            cache_ttl_seconds=3600 if _int("AOA_CACHE_TTL", 300) > 300 else 300,  # the API offers 5m or 1h
-            idle_sleep_seconds=_int("AOA_IDLE_SLEEP", 600),
+            cache_ttl_seconds=_cache_ttl(),
+            idle_sleep_seconds=_positive("AOA_IDLE_SLEEP", 600),
             batch_window_seconds=_float("AOA_BATCH_WINDOW", 2.0),
             min_update_interval_seconds=_int("AOA_MIN_UPDATE_INTERVAL", 1800),
             review_settle_seconds=max(0, _int("AOA_REVIEW_SETTLE_SECONDS", 300)),
-            quiet_start_hour=_int("AOA_QUIET_START", 22),
-            quiet_end_hour=_int("AOA_QUIET_END", 7),
-            shell_timeout_seconds=_int("AOA_SHELL_TIMEOUT", 60),
+            quiet_start_hour=_hour("AOA_QUIET_START", 22),
+            quiet_end_hour=_hour("AOA_QUIET_END", 7),
+            shell_timeout_seconds=_positive("AOA_SHELL_TIMEOUT", 60),
             review_thinking=review_thinking,
             approval_nudge_seconds=nudge,
             approval_expire_seconds=max(nudge + 1, _int("AOA_APPROVAL_EXPIRE", 24 * 3600)),
