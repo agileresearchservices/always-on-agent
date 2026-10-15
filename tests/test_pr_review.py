@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 
 from aoa.github_monitor import reviews_to_start
-from aoa.pr_review import build_task, github_body, no_mentions, parse_verdict, slack_text
+from aoa.pr_review import (build_task, check_citations, diff_index, github_body, load_focus, no_mentions,
+                           parse_verdict, slack_text)
 
 PR = {"repo": "agileresearchservices/demo", "number": 7, "title": "Tidy", "author": "agileresearchservices",
       "url": "https://github.com/agileresearchservices/demo/pull/7", "sha": "abcdef1234567890", "why": "new"}
@@ -84,3 +85,78 @@ def test_links_and_slack_syntax_from_the_model_are_defanged():
     assert "](http" not in body and "docs (http://evil.example)" in body
     assert "<http://x|label>" not in card and "&lt;http://x|label&gt;" in card and "](http://evil" not in card
     assert "channel" in card and "<!channel>" not in card and "`< !" not in card
+
+
+DIFF = """diff --git a/app/auth.py b/app/auth.py
+index 1..2 100644
+--- a/app/auth.py
++++ b/app/auth.py
+@@ -10,3 +10,4 @@ def f():
+ a
+-b
++c
++d
+ e
+@@ -40 +41 @@
+-x
++y
+diff --git a/old.py b/old.py
+deleted file mode 100644
+--- a/old.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-gone
+-too
+diff --git a/dir/new file.txt b/dir/new file.txt
+new file mode 100644
+--- /dev/null
++++ b/dir/new file.txt
+@@ -0,0 +1,2 @@
++one
+++++ b/not-a-header
+"""
+
+
+def test_diff_index_lists_the_new_side_ranges():
+    idx = diff_index(DIFF)
+    assert idx["app/auth.py"] == [(10, 13), (41, 41)]
+    assert idx["old.py"] == []  # deleted: nothing on the new side
+    assert idx["dir/new file.txt"] == [(1, 2)] and "not-a-header" not in idx
+
+
+def _v(*findings, verdict="request_changes"):
+    return {"verdict": verdict, "summary": "s", "findings": [
+        {"severity": sev, "file": f, "line": line, "comment": c} for sev, f, line, c in findings]}
+
+
+def test_check_citations_drops_foreign_files_and_blanks_unseen_lines():
+    v = check_citations(_v(("high", "app/auth.py", 12, "ok"), ("medium", "app/auth.py", 30, "unseen line"),
+                           ("high", "elsewhere.py", 3, "foreign file"), ("low", "", None, "general"),
+                           ("low", "./app/auth.py", 41, "dot-slash")), diff_index(DIFF))
+    assert [f["comment"] for f in v["findings"]] == ["ok", "unseen line", "general", "dot-slash"]
+    assert [f["line"] for f in v["findings"]] == [12, None, None, 41] and v["dropped"] == 1 and v["unplaced"] == 1
+    assert v["findings"][3]["file"] == "app/auth.py"
+
+
+def test_a_dropped_finding_never_turns_into_an_approval():
+    only_foreign = check_citations(_v(("high", "elsewhere.py", 1, "x")), diff_index(DIFF))
+    assert only_foreign["findings"] == [] and only_foreign["verdict"] == "request_changes"
+    assert "dropped" in github_body(only_foreign) and "dropped" not in github_body(_v())
+
+
+def test_focus_is_read_from_the_local_profile_only(tmp_path):
+    d = tmp_path / "review-focus"
+    d.mkdir()
+    (d / "agileresearchservices__demo.md").write_text("Watch for cross-tenant leaks.\n" + "x" * 5000)
+    got = load_focus(tmp_path, "agileresearchservices/demo")
+    assert got.startswith("Watch for cross-tenant leaks.") and len(got) == 3000
+    assert load_focus(tmp_path, "agileresearchservices/other") == ""
+    assert load_focus(tmp_path, "../../etc/passwd") == ""
+    task = build_task(PR | {"review_focus": got})
+    assert "standing notes" in task and "cross-tenant leaks" in task
+    assert "standing notes" not in build_task(PR)
+
+
+def test_task_carries_the_checklist():
+    t = build_task(PR)
+    assert "skip or return early" in t and "tests only" in t and "quietly reverts" in t

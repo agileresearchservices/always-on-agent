@@ -142,6 +142,7 @@ async def test_poll_starts_one_review_per_commit_and_publishes(client, env, monk
     cards = [o for o in store.outbox_since(sid) if o["kind"] == "pr_review"]
     assert len(cards) == 1 and cards[0]["payload"]["verdict"] == "request_changes"
     assert len(llm.calls) == 1  # second poll found the same commit: no second review
+    posts = [c for c in posts if c[0] == "POST"]  # the citation check also reads the PR
     assert posts == [("POST", "/repos/agileresearchservices/demo/pulls/7/reviews",
                       {"body": posts[0][2]["body"], "event": "COMMENT", "commit_id": pr["sha"]})]
     assert "off by one" in posts[0][2]["body"]
