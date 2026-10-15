@@ -149,11 +149,25 @@ conftest.py. Stop when done; do not commit."""
 
 
 class ClaudeCodeAuthor:
-    """Headless Claude Code in the worktree. No GitHub token and no API key reach it; it runs under the machine's own
-    Claude login. Tools are allowlisted and spend is capped."""
+    """Headless Claude Code in the worktree. No GitHub token reaches it. Its credential is explicit, because a stripped
+    environment has no login: `extra_env` carries CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or, only when the
+    owner opted in, ANTHROPIC_API_KEY. Tools are allowlisted and spend is capped."""
 
-    def __init__(self, binary: str, budget_usd: float, timeout: int = 2400, deny_extra: tuple[Path, ...] = ()):
+    def __init__(self, binary: str, budget_usd: float, timeout: int = 2400, deny_extra: tuple[Path, ...] = (),
+                 extra_env: dict[str, str] | None = None):
         self.binary, self.budget, self.timeout, self.deny_extra = binary, budget_usd, timeout, deny_extra
+        self.extra_env = extra_env or {}
+
+    @classmethod
+    def from_environment(cls, binary: str, budget_usd: float, env: dict[str, str] | None = None) -> "ClaudeCodeAuthor":
+        """Credential from the worker's environment: AOA_CLAUDE_OAUTH_TOKEN, else (opt-in) the API key."""
+        env = os.environ if env is None else env
+        extra: dict[str, str] = {}
+        if env.get("AOA_CLAUDE_OAUTH_TOKEN"):
+            extra["CLAUDE_CODE_OAUTH_TOKEN"] = env["AOA_CLAUDE_OAUTH_TOKEN"]
+        elif env.get("AOA_FIX_USE_API_KEY") == "1" and env.get("ANTHROPIC_API_KEY"):
+            extra["ANTHROPIC_API_KEY"] = env["ANTHROPIC_API_KEY"]  # bills the API key instead of a subscription
+        return cls(binary, budget_usd, extra_env=extra)
 
     async def run(self, worktree: Path, prompt: str) -> dict[str, Any]:
         binary = shutil.which(self.binary, path=os.environ.get("PATH", "") + ":" + str(Path.home() / ".local/bin")) or self.binary
@@ -163,15 +177,21 @@ class ClaudeCodeAuthor:
         args = [binary, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
                 "--max-budget-usd", f"{self.budget:g}", "--no-session-persistence", "--settings", json.dumps(deny),
                 "--allowedTools", *allowed_tools(worktree), "--disallowedTools", "Bash", "WebFetch", "WebSearch"]
-        env = safe_env()  # HOME stays: that is where the Claude login lives
+        env = safe_env() | self.extra_env  # HOME stays; the credential is whatever extra_env carries
         code, out = await _run(args, worktree, env, self.timeout)
         if code == TIMED_OUT:
             raise FixError("the fix session ran out of time")
-        if code != 0:
-            raise FixError(f"the fix session failed: {out[-300:]}")
         try:
             last = json.loads(out.strip().splitlines()[-1])
         except (ValueError, IndexError):
+            last = None
+        if code != 0 or (last or {}).get("is_error"):  # the CLI reports "not logged in" as exit 0 with is_error true
+            text = str((last or {}).get("result") or out[-300:])
+            if "not logged in" in text.lower() or "/login" in text:
+                text += (" (the service has no Claude login: run `claude setup-token` and set AOA_CLAUDE_OAUTH_TOKEN, "
+                         "or set AOA_FIX_USE_API_KEY=1 to bill the API key)")
+            raise FixError(f"the fix session failed: {text[:400]}")
+        if last is None:
             return {"summary": out[-500:], "cost_usd": None}
         return {"summary": str(last.get("result", ""))[:1500], "cost_usd": last.get("total_cost_usd")}
 

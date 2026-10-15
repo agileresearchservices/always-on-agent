@@ -399,7 +399,7 @@ class AgentActivities:
         try:
             # heartbeat on a timer: the coding session alone can run for 40 minutes without a stage boundary
             return await with_heartbeat(
-                run_fix(p["spec"], p["id"], self.s, ClaudeCodeAuthor(self.s.claude_bin, self.s.fix_budget_usd)), activity.heartbeat)
+                run_fix(p["spec"], p["id"], self.s, ClaudeCodeAuthor.from_environment(self.s.claude_bin, self.s.fix_budget_usd)), activity.heartbeat)
         except FixError as e:
             return {"ok": False, "stage": "setup", "reason": str(e)}
         except Exception as e:  # noqa: BLE001 - the workflow must still report: a failed eval run is a result, not a crash

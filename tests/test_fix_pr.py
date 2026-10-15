@@ -825,3 +825,37 @@ async def test_a_rejected_push_says_the_remote_branch_exists(tmp_path, monkeypat
 def test_a_title_cannot_fake_the_guardrail_flag():
     title = fix_pr.pr_title({"guardrails": []}, dict(SPEC, description="[guardrail] looks flagged"))
     assert not title.startswith("[guardrail]") and "[" not in title
+
+
+# ---- found by running the real CLI: a stripped environment has no Claude login ----------------------------------
+
+async def test_a_not_logged_in_cli_is_an_error_not_a_session_that_changed_nothing(tmp_path, monkeypatch):
+    async def fake_run(args, cwd, env, timeout, shell=False):  # the real CLI exits 0 and says so in the JSON
+        return 0, json.dumps({"is_error": True, "result": "Not logged in · Please run /login"})
+
+    monkeypatch.setattr(fix_pr, "_run", fake_run)
+    with pytest.raises(FixError, match="AOA_CLAUDE_OAUTH_TOKEN"):
+        await fix_pr.ClaudeCodeAuthor("claude", 1.0).run(tmp_path, "x")
+
+
+def test_the_credential_comes_from_explicit_settings_only():
+    f = fix_pr.ClaudeCodeAuthor.from_environment
+    assert f("claude", 1, {"AOA_CLAUDE_OAUTH_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}).extra_env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+    assert f("claude", 1, {"ANTHROPIC_API_KEY": "key"}).extra_env == {}                       # the API key is opt-in
+    assert f("claude", 1, {"ANTHROPIC_API_KEY": "key", "AOA_FIX_USE_API_KEY": "1"}).extra_env == {"ANTHROPIC_API_KEY": "key"}
+    assert f("claude", 1, {"GITHUB_TOKEN": "gh"}).extra_env == {}                             # never the GitHub token
+
+
+async def test_the_credential_reaches_the_cli_env_and_nothing_else_secret(tmp_path, monkeypatch):
+    seen = {}
+
+    async def fake_run(args, cwd, env, timeout, shell=False):
+        seen["env"] = env
+        return 0, json.dumps({"result": "ok", "total_cost_usd": 0.1})
+
+    monkeypatch.setattr(fix_pr, "_run", fake_run)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
+    await fix_pr.ClaudeCodeAuthor("claude", 1.0, extra_env={"CLAUDE_CODE_OAUTH_TOKEN": "oauth-tok"}).run(tmp_path, "x")
+    assert seen["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-tok"
+    assert "GITHUB_TOKEN" not in seen["env"] and "ANTHROPIC_API_KEY" not in seen["env"]
