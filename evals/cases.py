@@ -116,6 +116,14 @@ CASES: list[Case] = [
         hard=False, tags=["github", "read"],
     ),
     Case(
+        "github_check_defaults_to_open",
+        "A bare 'check gh' means open PRs and issues: one github_list call, no probing, nothing written.",
+        [[user_event("Check gh", "u:ghcheck1").to_dict()]],
+        [no_error(), tool_called("github_list"), tool_calls_at_most("github_list", 2), tool_calls_at_most("github_read", 0),
+         tool_not_called("github_write"), no_external_effects()],
+        hard=False, tags=["github", "read"],
+    ),
+    Case(
         "user_turn_answers_as_reply",
         "In a turn the person started, the agent's own message to them is a reply, not an update the notifier may hold.",
         [[user_event("Create an issue in agileresearchservices/always-on-agent titled 'Add retry docs' "

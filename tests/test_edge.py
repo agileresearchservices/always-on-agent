@@ -347,3 +347,21 @@ async def test_github_list_and_new_reads(make_core, monkeypatch):
     assert format_checks(1, "s" * 8, [("a", "completed", "success")], [("b", "completed", "success")]).split("\n")[0].endswith("PASSING (2 checks)")
     assert "PENDING" in format_checks(1, "s" * 8, [("a", "in_progress", None)], [])
     assert "no checks" in format_checks(1, "s" * 8, [], [])
+
+
+async def test_github_list_defaults_to_open_prs_and_issues(make_core, monkeypatch):
+    import httpx
+    from aoa.tools import REGISTRY
+
+    monkeypatch.setenv("AOA_GITHUB_USER", "agileresearchservices")
+    calls = []
+
+    async def fake(method, path, json=None, accept=""):
+        calls.append(path)
+        return httpx.Response(200, json={"total_count": 0, "items": []})
+
+    monkeypatch.setattr("aoa.github_monitor.gh_call", fake)
+    core, _ = make_core([text("ok")])
+    out = await REGISTRY["github_list"].handler(core._ctx("main", "main", "main", 0, True), {})
+    assert "No open prs" in out and "No open issues" in out
+    assert len(calls) == 2 and "is%3Apr%20is%3Aopen" in calls[0] and "is%3Aissue%20is%3Aopen" in calls[1]
