@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `aoa` is a prototype of an "always-on" agent (Python ≥3.11, Anthropic SDK, Temporal, FastAPI, SQLite). `README.md` has a table mapping each architecture idea to the file that implements it, plus an "Honest limits" section. Read both before changing behavior. Default models: `claude-sonnet-5-5` (main/helper), `claude-haiku-5-5` (command reviewer). There is no linter or formatter configured.
 
+Long-form documentation (architecture, per-subsystem reference, build guide, runbook, design decisions) is in `docs/`; start at `docs/architecture.md`. When you change a tool, table or `AOA_*` variable, update the matching page under `docs/reference/` (`tests/test_docs_in_sync.py` checks this).
+
 ## Commands
 
 ```bash
