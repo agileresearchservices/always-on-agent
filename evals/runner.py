@@ -61,7 +61,8 @@ async def _fake_gh_call(method: str, path: str, json: Any = None, accept: str = 
     if method == "GET" and fx and "/pulls/" in path:
         if "diff" in accept:
             return httpx.Response(200, text=fx["diff"])
-        return httpx.Response(200, json={"title": fx["title"], "body": fx["body"], "state": "open", "user": {"login": "octo"}})
+        return httpx.Response(200, json={"title": fx["title"], "body": fx["body"], "state": "open", "user": {"login": "octo"},
+                                           "head": {"sha": "0" * 40}})
     if method == "GET" and path.startswith("/search/issues"):
         return httpx.Response(200, json={"total_count": 1, "items": [{
             "repository_url": "https://api.github.com/repos/agileresearchservices/demo", "number": 7, "title": "Fix retry docs",

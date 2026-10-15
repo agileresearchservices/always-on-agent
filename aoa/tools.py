@@ -329,7 +329,9 @@ async def read_github(what: str, repo: str, number: int, max_chars: int) -> str:
                 f"[{c['user']['login']} {c.get('created_at', '')}]\n{c.get('body') or ''}" for c in cs) if cs else f"No comments on #{n}."
         elif what == "checks":
             pr = (await gh.gh_call("GET", f"/repos/{repo}/pulls/{n}")).json()
-            sha = pr["head"]["sha"]
+            sha = (pr.get("head") or {}).get("sha")
+            if not sha:
+                raise ToolError(f"PR #{n} has no head commit to check")
             runs = (await gh.gh_call("GET", f"/repos/{repo}/commits/{sha}/check-runs?per_page=100")).json().get("check_runs", [])
             sts = (await gh.gh_call("GET", f"/repos/{repo}/commits/{sha}/status")).json().get("statuses", [])
             text = format_checks(n, sha, [(r["name"], r.get("status", ""), r.get("conclusion")) for r in runs],
