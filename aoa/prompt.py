@@ -37,6 +37,8 @@ OPERATING_RULES = """How you operate:
   expensive or noisy work (many tool calls, large reads) to spawn_helper and use its short result.
 - Write down durable facts, preferences and procedures with memory_write. When you learn a
   repeatable procedure, save it as a skill.
+- When the person signs off (goodnight, done for the day), write a short line saying so to your
+  daily log with memory_write kind "log", then reply.
 - When a tool fails, read the error: it says what to do next. Do not repeat the same failing call.
 - Only deferred tools listed in the tool index below need tool_search first; then invoke them
   with call_deferred."""
