@@ -11,7 +11,7 @@ import hashlib
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -125,9 +125,10 @@ def _quiet_for(pr: dict[str, Any], settle: int, now: float) -> bool:
     if settle <= 0:
         return True
     try:
-        updated = datetime.fromisoformat(str(pr.get("updated", "")).replace("Z", "+00:00")).timestamp()
+        when = datetime.fromisoformat(str(pr.get("updated", "")).replace("Z", "+00:00"))
     except ValueError:
         return True
+    updated = (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).timestamp()  # GitHub sends Z; naive = UTC
     return now - updated >= settle
 
 
