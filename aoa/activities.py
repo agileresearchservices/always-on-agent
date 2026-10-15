@@ -397,8 +397,9 @@ class AgentActivities:
         if self.s.fix_budget_usd <= 0:
             return {"ok": False, "stage": "setup", "reason": "fix PRs are off (AOA_FIX_BUDGET_USD=0)"}
         try:
-            return await run_fix(p["spec"], p["id"], self.s, ClaudeCodeAuthor(self.s.claude_bin, self.s.fix_budget_usd),
-                                 heartbeat=activity.heartbeat)
+            # heartbeat on a timer: the coding session alone can run for 40 minutes without a stage boundary
+            return await with_heartbeat(
+                run_fix(p["spec"], p["id"], self.s, ClaudeCodeAuthor(self.s.claude_bin, self.s.fix_budget_usd)), activity.heartbeat)
         except FixError as e:
             return {"ok": False, "stage": "setup", "reason": str(e)}
 

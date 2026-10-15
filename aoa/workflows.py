@@ -477,7 +477,7 @@ class FixPrWorkflow:
     async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
         pid, session = inp["id"], inp["session"]
         res = await workflow.execute_activity(
-            "fix_run", {"id": pid}, start_to_close_timeout=timedelta(minutes=90), heartbeat_timeout=timedelta(minutes=30),
+            "fix_run", {"id": pid}, start_to_close_timeout=timedelta(minutes=90), heartbeat_timeout=timedelta(minutes=5),
             retry_policy=RetryPolicy(maximum_attempts=1),  # a retry would pay for the session twice
         )
         pr = None
