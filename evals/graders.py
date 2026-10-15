@@ -157,7 +157,7 @@ def finds_defects(groups: dict[str, tuple[str, ...]], at_least: int) -> Grader:
     named at least `at_least` of them. Records how many it found in run.metrics for the results."""
     def g(r: Run) -> tuple[bool, str]:
         if not r.verdict:
-            r.metrics["defects"] = [0, len(groups)]
+            r.metrics["defects"], r.metrics["found"] = [0, len(groups)], []
             return False, "no verdict"
         texts = _finding_texts(r)
         found = [name for name, grp in groups.items() if _group_hit(texts, grp)]
@@ -174,7 +174,7 @@ def no_high_findings() -> Grader:
         if not r.verdict:
             return False, "no verdict"
         high = [str(f.get("comment", ""))[:80] for f in r.verdict.get("findings", []) if f.get("severity") == "high"]
-        return not high, f"high finding on a clean PR: {high}"
+        return not high, f"high finding on a clean PR: {high}" if high else "no high finding"
     return g
 
 

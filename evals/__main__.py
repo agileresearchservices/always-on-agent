@@ -1,6 +1,7 @@
 """python -m evals [--runs N] [--case NAME ...] [--concurrency K] [--batch]   (needs ANTHROPIC_API_KEY; costs real tokens)
 
-Cases tagged "slow" (the hard review set, `--tag review-hard`) are left out of a default run.
+Cases tagged "slow" (the hard review set) run only when named with --case or selected with --tag review-hard (or slow);
+--tag review alone gives the quick seed review cases.
 
 --batch sends every round of model calls through the Message Batches API: half the price, but each round takes
 minutes instead of seconds. For big sample sizes, not for a quick check."""
@@ -15,6 +16,13 @@ from .cases import CASES
 from .runner import format_table, run_suite, save
 
 
+def select_cases(cases, names=None, tags=None):
+    """--case and --tag narrow each other; "slow" cases run only when named or asked for by tag."""
+    return [c for c in cases
+            if (not names or c.name in names) and (not tags or any(t in c.tags for t in tags))
+            and (names or "slow" not in c.tags or {"slow", "review-hard"} & set(tags or []))]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="python -m evals")
     ap.add_argument("--runs", type=int, default=3, help="runs per case (default 3)")
@@ -22,16 +30,14 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--batch", action="store_true", help="use the Message Batches API (50%% price, slower)")
     ap.add_argument("--batch-poll", type=float, default=15.0, help="seconds between batch status checks")
-    ap.add_argument("--tag", action="append", help="only cases with this tag (repeatable); \"slow\" cases run only when named or tagged")
+    ap.add_argument("--tag", action="append", help="only cases with this tag (repeatable); the slow hard review set needs --tag review-hard")
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     if a.list:
         for c in CASES:
             print(f"{'hard' if c.hard else 'soft'}  {c.name:34} {c.description}")
         return 0
-    cases = [c for c in CASES
-             if (not a.case or c.name in a.case) and (not a.tag or any(t in c.tags for t in a.tag))
-             and (a.case or a.tag or "slow" not in c.tags)]  # "slow" cases run only when named or tagged
+    cases = select_cases(CASES, a.case, a.tag)
     if not cases:
         print("no such case; try --list", file=sys.stderr)
         return 2

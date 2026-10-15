@@ -295,6 +295,22 @@ def test_finds_defects_counts_groups_and_records_the_score():
     assert not g.finds_defects(groups, 1)(Run(verdict={"verdict": "approve"}))[0]  # a malformed answer fails, no KeyError
 
 
+def test_case_selection():
+    from evals.__main__ import select_cases
+
+    def names(*a):
+        return {c.name for c in select_cases(CASES, *a)}
+
+    default = names()
+    assert default and not any("slow" in c.tags for c in CASES if c.name in default)
+    quick_review = names(None, ["review"])
+    assert quick_review and quick_review <= default  # --tag review: the seed cases only
+    hard = names(None, ["review-hard"])
+    assert hard and all(n.startswith("hardreview_") for n in hard) and not hard & default
+    assert names(["hardreview_pr22_resolver_timeouts"]) == {"hardreview_pr22_resolver_timeouts"}
+    assert names(["hardreview_pr22_resolver_timeouts", "review_clean_pr_approved"], ["review-hard"]) == {"hardreview_pr22_resolver_timeouts"}
+
+
 def test_no_high_findings():
     assert g.no_high_findings()(_rv(("medium", "x"), ("low", "y")))[0]
     assert not g.no_high_findings()(_rv(("high", "boom")))[0]
