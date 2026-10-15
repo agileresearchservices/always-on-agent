@@ -31,7 +31,12 @@ class LLM(Protocol):
         tools: list[dict[str, Any]],
         max_tokens: int,
         tool_choice: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        effort: str | None = None,
     ) -> LLMResponse: ...
+
+
+THINKING_TYPES = ("thinking", "redacted_thinking")
 
 
 def ttl_label(seconds: int) -> str | None:
@@ -59,8 +64,11 @@ def place_cache_breakpoints(
     for m in messages:
         for b in m["content"]:
             b.pop("cache_control", None)
-    if messages and messages[-1]["content"]:
-        messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+    if messages:  # a thinking block cannot carry a breakpoint: mark the last block that can
+        for b in reversed(messages[-1]["content"]):
+            if b["type"] not in THINKING_TYPES:
+                b["cache_control"] = {"type": "ephemeral"}
+                break
     if ttl:  # every breakpoint gets the same lifetime (longer ones must not follow shorter ones)
         for b in [*tools, *system, *(b for m in messages for b in m["content"])]:
             if "cache_control" in b:
@@ -90,6 +98,8 @@ class AnthropicLLM:
         tools: list[dict[str, Any]],
         max_tokens: int,
         tool_choice: dict[str, Any] | None = None,
+        thinking: dict[str, Any] | None = None,
+        effort: str | None = None,
     ) -> LLMResponse:
         system, messages, tools = place_cache_breakpoints(system, messages, tools, self.ttl)
         kwargs: dict[str, Any] = dict(model=model, max_tokens=max_tokens, system=system, messages=messages)
@@ -97,6 +107,10 @@ class AnthropicLLM:
             kwargs["tools"] = tools
         if tool_choice:
             kwargs["tool_choice"] = tool_choice
+        if thinking:
+            kwargs["thinking"] = thinking
+        if effort:
+            kwargs["output_config"] = {"effort": effort}
         resp = await self.client.messages.create(**kwargs)
         content: list[dict[str, Any]] = []
         for b in resp.content:
@@ -104,6 +118,10 @@ class AnthropicLLM:
                 content.append({"type": "text", "text": b.text})
             elif b.type == "tool_use":
                 content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+            elif b.type == "thinking":  # kept verbatim: the API rejects a changed or reordered thinking block
+                content.append({"type": "thinking", "thinking": b.thinking, "signature": b.signature})
+            elif b.type == "redacted_thinking":
+                content.append({"type": "redacted_thinking", "data": b.data})
         u = resp.usage
         usage = {
             "input_tokens": getattr(u, "input_tokens", 0) or 0,

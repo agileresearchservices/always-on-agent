@@ -217,3 +217,43 @@ async def test_cut_off_final_answer_is_reported_as_max_tokens(make_core):
     res = await run_agent_loop(DirectOps(core, "s"), conv="h1", role="helper", depth=1, turn_key="h",
                                max_steps=3, max_helper_depth=1, trigger_user=False)
     assert res.stop == "max_tokens" and res.text.startswith('{"verdict"')
+
+
+THINK = {"type": "thinking", "thinking": "The person said hi; reply briefly.", "signature": "sig-abc123=="}
+REDACTED = {"type": "redacted_thinking", "data": "EncryptedBlob=="}
+
+
+async def test_thinking_blocks_round_trip_unchanged_and_never_count_as_text(make_core):
+    core, llm = make_core([[THINK, REDACTED, tool("send_user", text="hello")], [THINK | {"signature": "sig-2"}, *text("done")]])
+    await handle_events(core, "main", [usr_event("hi")])
+    second = llm.calls[1]["messages"]
+    assistant = [m for m in second if m["role"] == "assistant"][0]["content"]
+    assert assistant[:2] == [THINK, REDACTED]  # verbatim and in order, ahead of the tool_use
+    assert assistant[2]["type"] == "tool_use"
+    stored = core.store.load_messages("main")
+    assert [b["type"] for b in stored[-1]["content"]] == ["thinking", "text"]
+    assert core.store.outbox_since("main")[0]["payload"]["text"] == "hello"
+    # the step result keeps its text clean: thinking is not output
+    assert core.store.step_get("main", "llm:" + _last_step_key(core))["text"] == "done"
+
+
+def _last_step_key(core) -> str:
+    with core.store._conn() as c:
+        rows = c.execute("SELECT step_key FROM steps WHERE step_key LIKE 'llm:%' ORDER BY rowid").fetchall()
+    return rows[-1]["step_key"][4:]
+
+
+async def test_thinking_is_requested_only_for_pr_review_conversations_when_configured(make_core):
+    from dataclasses import replace
+
+    core, llm = make_core([text("a"), text("b"), text("c")])
+    assert core._thinking_for("prreview/o/r#1@abc/helper/x") == {}  # off by default
+    core.s = replace(core.s, review_thinking="high")
+    want = {"thinking": {"type": "adaptive"}, "effort": "high"}
+    assert core._thinking_for("prreview/o/r#1@abc/helper/x") == want
+    assert core._thinking_for("main") == {} and core._thinking_for("main/helper/y") == {}
+    await core.prepare_helper("prreview/o/r#1@abc/helper/x", "review it")
+    await core.llm_step("main", "prreview/o/r#1@abc/helper/x", "k", "helper", 1)
+    await handle_events(core, "main", [usr_event("hi")])
+    assert llm.calls[0]["thinking"] == {"type": "adaptive"} and llm.calls[0]["effort"] == "high"
+    assert llm.calls[1]["thinking"] is None and llm.calls[1]["effort"] is None
