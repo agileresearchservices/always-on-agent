@@ -38,9 +38,22 @@ def main() -> None:
         s = Settings.from_env()
         store = Store(s.db_path)
         flag.scan(store, s)
-        todo = [f for f in store.flags_list("open") if store.proposal_find(f["conv_id"], f["reason"]) is None][: max(1, args.limit)]
-        ids = asyncio.run(eval_proposal.start_proposals(s, args.session, todo))
-        print(f"started {len(ids)} proposal workflow(s); cards arrive in Slack when ready" if ids else "nothing to propose")
+        import time
+
+        todo = [f for f in store.flags_list("open") if store.proposal_find(f["conv_id"], f["reason"]) is None]
+        used, cap, frees = eval_proposal.cap_state(store, s, time.time())
+        if not todo:
+            print("nothing to propose: no open flag without a proposal")
+        elif cap <= 0:
+            print("proposals are off (AOA_EVAL_PROPOSALS_PER_DAY=0)")
+        elif used >= cap:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(frees)) if frees else "later"
+            print(f"daily cap reached: {used} of {cap} in the last 24h (a rolling window); the next slot frees at {when}. "
+                  f"{len(todo)} flag(s) are waiting")
+        else:
+            ids = asyncio.run(eval_proposal.start_proposals(s, args.session, todo, limit=max(1, args.limit)))
+            print(f"started {len(ids)} proposal workflow(s); cards arrive in Slack when ready" if ids
+                  else "nothing started: every candidate flag already has a running proposal")
     elif args.cmd == "evalruns":
         from . import eval_schedule
 

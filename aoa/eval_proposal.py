@@ -184,23 +184,44 @@ def workflow_id(flag: dict[str, Any]) -> str:
     return "eval-proposal-" + hashlib.sha256(f"{flag['conv_id']}|{flag['reason']}".encode()).hexdigest()[:12]
 
 
-async def start_proposals(settings: Settings, session: str, flags: list[dict[str, Any]]) -> list[str]:
-    """Start one EvalProposalWorkflow per flag (a flag already proposed or running is skipped). Returns the ids."""
+CAP_WINDOW = 86400  # the daily cap is a rolling window, not a calendar day
+
+
+def cap_state(store: Store, settings: Settings, now: float) -> tuple[int, int, float | None]:
+    """(proposals in the last 24h, the cap, when the next slot frees). The time is None while a slot is free,
+    and also when the cap is 0 (proposals off: nothing frees)."""
+    times = store.proposal_times_since(now - CAP_WINDOW)
+    cap = settings.eval_proposals_per_day
+    full = cap <= 0 or len(times) >= cap
+    return len(times), cap, (times[len(times) - cap] + CAP_WINDOW if full and cap > 0 else None)
+
+
+async def start_proposals(settings: Settings, session: str, flags: list[dict[str, Any]], limit: int | None = None,
+                          client: Any = None) -> list[str]:
+    """Start an EvalProposalWorkflow for flags until `limit` have started (None = all). A flag whose workflow is
+    running is skipped and does not count. Returns the ids.
+
+    The `eval_proposals` table, not Temporal, says whether a flag was proposed (callers pass only flags without a
+    row), so a finished workflow's id may be reused: a run that ended `capped` writes no row and must not block the
+    flag for good. A repeat start for a flag that has a row is free: `run_proposal` returns `duplicate` first."""
     from temporalio.client import Client
     from temporalio.common import WorkflowIDReusePolicy
     from temporalio.exceptions import WorkflowAlreadyStartedError
 
-    client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
-    started = []
+    if client is None:
+        client = await Client.connect(settings.temporal_address, namespace=settings.temporal_namespace)
+    started: list[str] = []
     for f in flags:
+        if limit is not None and len(started) >= limit:
+            break
         try:
             await client.start_workflow(
                 "EvalProposalWorkflow", {"session": session, "conv_id": f["conv_id"], "reason": f["reason"]},
                 id=workflow_id(f), task_queue=settings.task_queue,
-                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY)
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE)
             started.append(workflow_id(f))
         except WorkflowAlreadyStartedError:
-            continue
+            continue  # still running: not started now, and it does not use up the limit
     return started
 
 
@@ -309,7 +330,8 @@ async def run_proposal(store: Store, settings: Settings, llm: LLM, flag: dict[st
     elif existing:
         return {"id": existing["id"], "status": "duplicate"}
     else:
-        if settings.eval_proposals_per_day <= 0 or store.proposals_since(time.time() - 86400) >= settings.eval_proposals_per_day:
+        used, cap, _ = cap_state(store, settings, time.time())
+        if cap <= 0 or used >= cap:
             return {"id": None, "status": "capped"}
         pid = store.proposal_create(flag["conv_id"], flag["reason"])
         if pid is None:

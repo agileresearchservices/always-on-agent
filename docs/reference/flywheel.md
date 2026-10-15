@@ -53,14 +53,16 @@ starts proposals.** Flags see only mechanical failures: a confidently wrong answ
    `eval/<slug>` in a temporary worktree: never main, never pushed. Accepted specs load into the suite through
    `evals/cases.py`.
 
-Caps and cost: `AOA_EVAL_PROPOSALS_PER_DAY` (default 3; 0 = off; a capped workflow ends with `status: capped`) and
+Caps and cost: `AOA_EVAL_PROPOSALS_PER_DAY` (default 3; 0 = off). The cap is a **rolling 24 hours**, not a calendar day:
+a slot frees when the oldest proposal is 24 hours old. `aoa propose` checks it first (`eval_proposal.cap_state`) and says
+when the next slot frees; the activity checks again as a backstop and ends `status: capped` (no row written). And
 `AOA_EVAL_VALIDATE_RUNS` (default 2). The draft is metered as `<session>#eval-draft` in `aoa usage`; validation runs'
 estimated cost is on the card (evals are not in the usage table).
 
-Gotcha: a workflow that completed (including `capped`) keeps its id, so `aoa propose` cannot start the same flag again;
-the id-reuse policy allows a restart only after a *failed* run. A capped flag has no proposal row, so with the default
-`--limit 1` it can sit first in the list, be refused, and make the command print "nothing to propose" while other flags
-are open. Use a larger `--limit` to reach the rest.
+The `eval_proposals` table, not Temporal, is the record of what was proposed. `aoa propose` offers every open flag without a
+row and counts only workflows it actually starts toward `--limit`. Workflow ids are reusable once a run has finished
+(`ALLOW_DUPLICATE`), so a run that ended `capped` does not block its flag; a workflow still running is refused and skipped.
+A repeat start for a flag that has a row is free (`run_proposal` returns `duplicate` first). (#70)
 
 ## Step 3: fix PRs (`fix_pr.py`, #56)
 
