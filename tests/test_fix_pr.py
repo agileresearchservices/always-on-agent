@@ -667,7 +667,7 @@ async def test_a_retry_after_a_failed_push_does_not_pay_for_the_checks_again(tmp
     first = await env.run(acts.fix_open_pr, {"id": pid, "result": base | {"ok": True}})
     assert first["ok"] is False and first["verified"]["verified"] is True and calls["verify"] == 1
     second = await env.run(acts.fix_open_pr, {"id": pid, "result": first["verified"]})
-    assert second == {"ok": True, "url": "https://x/pull/1"} and calls["verify"] == 1  # not re-run
+    assert second["ok"] and second["url"] == "https://x/pull/1" and second["verified"]["verified"] and calls["verify"] == 1  # not re-run
     missing = await env.run(acts.fix_open_pr, {"id": "prop-00000000", "result": base | {"ok": True}})
     assert missing["terminal"] and "no longer exists" in missing["reason"]
 
