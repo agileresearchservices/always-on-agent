@@ -25,7 +25,8 @@ from .workflows import (
 async def build_worker(settings: Settings, client: Client, core: AgentCore | None = None) -> Worker:
     if core is None:
         core = AgentCore(
-            settings, Store(settings.db_path), MemoryStore(settings.memory_dir), AnthropicLLM(),
+            settings, Store(settings.db_path), MemoryStore(settings.memory_dir),
+            AnthropicLLM(cache_ttl_seconds=settings.cache_ttl_seconds),
             TemporalScheduler(client, settings),
         )
     acts = AgentActivities(core, client, settings)
