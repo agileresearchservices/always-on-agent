@@ -1,0 +1,41 @@
+{
+ "name": "flywheel_goodnight_is_logged",
+ "description": "When the person says goodnight, the agent writes a line to its daily log (memory_write) and replies.",
+ "hard": false,
+ "turns": [
+  [
+   {
+    "from": "person",
+    "text": "Goodnight!"
+   }
+  ]
+ ],
+ "graders": [
+  {
+   "type": "no_error"
+  },
+  {
+   "type": "tool_called",
+   "args": {
+    "name": "memory_write"
+   }
+  },
+  {
+   "type": "delivered_kind",
+   "args": {
+    "kind": "reply"
+   }
+  },
+  {
+   "type": "no_external_effects"
+  }
+ ],
+ "origin": {
+  "conv": "main",
+  "reason": "reported:other:demo"
+ },
+ "clock": "afternoon",
+ "tags": [
+  "flywheel"
+ ]
+}
