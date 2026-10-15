@@ -220,15 +220,16 @@ async def draft_fix(sid: str, pid: str) -> dict[str, Any]:
     if settings.fix_budget_usd <= 0 or settings.fix_per_day <= 0:
         raise HTTPException(409, "fix PRs are off (AOA_FIX_BUDGET_USD or AOA_FIX_PER_DAY is 0)")
     day_key = "fixcount:" + time.strftime("%Y-%m-%d", time.gmtime())
-    if store.kv_get("flywheel", day_key, 0) >= settings.fix_per_day:
+    if store.kv_update("flywheel", day_key, lambda n: (n or 0) + 1, 0) > settings.fix_per_day:  # atomic: claim a slot first
+        store.kv_update("flywheel", day_key, lambda n: max(0, (n or 1) - 1), 0)
         raise HTTPException(409, f"already drafted {settings.fix_per_day} fixes today (AOA_FIX_PER_DAY); try tomorrow")
     try:
         await app.state.client.start_workflow(
             "FixPrWorkflow", {"session": sid, "id": pid}, id=f"fix-{pid}", task_queue=settings.task_queue,
             id_conflict_policy=WorkflowIDConflictPolicy.FAIL, id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE)
     except WorkflowAlreadyStartedError as e:
+        store.kv_update("flywheel", day_key, lambda n: max(0, (n or 1) - 1), 0)  # not started: give the slot back
         raise HTTPException(409, "a fix for this case is already running") from e
-    store.kv_update("flywheel", day_key, lambda n: (n or 0) + 1, 0)
     return {"status": "started"}
 
 

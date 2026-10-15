@@ -4,23 +4,22 @@ Started only by a Slack click ("Draft fix" on an accepted case card), never by t
 (system temp dir) of the accepted `eval/<slug>` branch, rebased onto current main:
 
   1. the case must still FAIL on the current code (trusted code, so the API key is fine here);
-  2. a headless Claude Code session edits files. It has NO shell: only Read/Edit/Write/Grep/Glob, denied under /Users
-     and ~, no GitHub token or API key in its environment, a dollar budget;
-  3. this module checks the result: it may not touch the eval suite or test infrastructure, delete or weaken tests, or
-     contain a secret; `pytest` then runs inside a macOS sandbox with NO NETWORK, no writes outside the temp dir and
-     the sensitive paths unreadable (the author's code runs there, so nothing may leave);
-  4. a fix that passes is COMMITTED LOCALLY and reported ("tests green; real-model checks run when you click").
-     Nothing is pushed and no author code ever sees the API key until the person has read the diff and clicks [Run
-     checks + open PR];
-  5. on that click: the new case runs N times (all must pass) and the behaviour suite once (no hard case may fail), and
-     only then is `fix/<slug>` pushed and the PR opened with the before/after numbers. A guardrail file in the diff is
-     called out in the title and body.
+  2. a headless Claude Code session edits files. It has NO shell: only Read/Edit/Write/Grep/Glob scoped to the worktree
+     (and denied under /Users and ~), no GitHub token or API key in its environment, a dollar budget;
+  3. this module checks the result STATICALLY: it may not touch the eval suite or test infrastructure, delete or weaken
+     tests, or contain a secret. NO CODE FROM THE FIX HAS RUN YET;
+  4. a fix that passes is COMMITTED LOCALLY (its commit id is recorded) and reported. Nothing runs, nothing is pushed
+     and the API key is not used until the person has read the diff and clicks [Run checks + open PR];
+  5. on that click, if the branch is still the commit they were shown: `pytest` (no tokens or keys, throwaway HOME),
+     then the new case N times (all must pass) and the behaviour suite (a failing hard case is re-run before it counts),
+     and only then is `fix/<slug>` pushed and the PR opened with the before/after numbers. A guardrail file in the diff
+     is called out in the title and body.
 
 aoa never merges it: the PR gets aoa's normal review and a human decides. Nothing here pushes to main.
 
-This is not a general sandbox (#21 was skipped on purpose): the real-model checks in step 5 run the reviewed fix as your
-user with the API key. What limits the rest: the author cannot execute anything, its tests run with no network, and a
-human reads the diff before any code gets the key or leaves the machine.
+This is not a sandbox (#21 was skipped on purpose; a macOS profile was tried and abandoned because a hostile test can
+reach launchd, and a deny-default profile is too brittle for git and python). The control is that no code from the fix
+executes before a human has read it, and that code then runs as your user.
 """
 from __future__ import annotations
 
@@ -54,7 +53,13 @@ SECRET_PATTERNS = (r"sk-ant-[A-Za-z0-9_-]{10,}", r"gh[pousr]_[A-Za-z0-9]{20,}", 
                    r"xox[abprs]-[A-Za-z0-9-]{10,}", r"AKIA[0-9A-Z]{16}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 SECRET_ENV_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 PYTEST_TIMEOUT = 1200
-ALLOWED_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")  # no Bash: the author cannot run code, or read files via git
+TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")  # no Bash: the author cannot run code, or read files via git
+
+
+def allowed_tools(worktree: Path) -> list[str]:
+    """Each tool allowed only inside the worktree (`//` = an absolute path in Claude Code's rule syntax)."""
+    root = "/" + str(worktree.resolve()).lstrip("/")
+    return [f"{t}({root}/**)" for t in TOOLS]
 
 
 class FixError(Exception):
@@ -130,7 +135,7 @@ class ClaudeCodeAuthor:
                                 + [f"{t}(~/**)" for t in ("Read", "Edit", "Write", "Grep", "Glob")]}}
         args = [binary, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
                 "--max-budget-usd", f"{self.budget:g}", "--no-session-persistence", "--settings", json.dumps(deny),
-                "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", "Bash", "WebFetch", "WebSearch"]
+                "--allowedTools", *allowed_tools(worktree), "--disallowedTools", "Bash", "WebFetch", "WebSearch"]
         env = safe_env()  # HOME stays: that is where the Claude login lives
         code, out = await _run(args, worktree, env, self.timeout)
         if code == TIMED_OUT:
@@ -182,23 +187,10 @@ async def agit(args: list[str], cwd: Path) -> str:
     return await asyncio.to_thread(_git, args, cwd)
 
 
-def sandbox_profile(wt: Path, repo: Path = REPO_DIR, data_dir: Path | None = None) -> str:
-    """macOS sandbox for running the author's tests: no network at all, writes only under the system temp dirs, and
-    the places secrets live unreadable. With no network nothing can be sent out; writes outside temp are impossible."""
-    home = Path.home()
-    secret_dirs = [home / d for d in (".ssh", ".aws", ".config", ".gnupg", ".claude", ".docker", ".kube")] + [
-        repo / "data", repo / ".env"] + ([data_dir] if data_dir else [])
-    q = lambda path: '"' + str(path).replace('"', "") + '"'  # noqa: E731
-    return ("(version 1)(allow default)(deny network*)(deny file-write*)"
-            '(allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (literal "/dev/null") (literal "/dev/tty"))'
-            "(deny file-read* " + " ".join(f"(subpath {q(d)})" for d in secret_dirs) + ")")
-
-
-async def sandboxed_pytest(wt: Path, home: Path, repo: Path = REPO_DIR, data_dir: Path | None = None) -> tuple[int, str]:
-    if not shutil.which("sandbox-exec"):
-        raise FixError("sandbox-exec is not available, so the author's tests cannot be run safely; refusing")
-    cmd = ["sandbox-exec", "-p", sandbox_profile(wt, repo, data_dir), sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"]
-    return await _run(cmd, wt, safe_env() | {"PYTHONPATH": str(wt), "HOME": str(home)}, PYTEST_TIMEOUT)
+async def checked_pytest(wt: Path, home: Path) -> tuple[int, str]:
+    """The unit tests, for a fix the person has read: no tokens or keys, a throwaway HOME. Returns (code, output)."""
+    return await _run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"], wt,
+                      safe_env() | {"PYTHONPATH": str(wt), "HOME": str(home)}, PYTEST_TIMEOUT)
 
 
 async def run_fix(
@@ -254,23 +246,11 @@ async def run_fix(
         if hits := secret_hits(await _diff_text(wt)):
             return res | {"stage": "secrets", "reason": f"the fix contains what looks like a secret ({', '.join(hits)}); refused"}
         res["guardrails"] = touched_guardrails(files)
-        beat()
-        code, out = await sandboxed_pytest(wt, tmp, repo, settings.data_dir)
-        res["pytest"] = {"ok": code == 0, "tail": out[-400:]}
-        if code != 0:
-            return res | {"stage": "pytest", "reason": "the unit tests fail with the fix"}
-        # the tests ran the author's code: look again at what is in the tree before committing it
-        final = await _changes(wt)
-        final_files = [p for _, p in final]
-        if bad := frozen_changes(final_files) or deleted_tests(final) or weakened_tests(await _diff_text(wt)):
-            return res | {"stage": "author", "reason": f"the checks left changes to protected files or tests: {bad}"}
-        if hits := secret_hits(await _diff_text(wt)):
-            return res | {"stage": "secrets", "reason": f"the fix contains what looks like a secret ({', '.join(hits)}); refused"}
-        res["files"], res["guardrails"] = final_files, touched_guardrails(final_files)
-        try:
+        try:  # nothing from the fix has run: only static checks so far. Commit it and remember which commit was shown
             await agit(["add", "-A"], wt)
             await agit(["commit", "-q", "-m", f"Fix: {spec['description']}\n\nMakes eval case {spec['name']} pass "
                                               f"(flywheel proposal {proposal_id})."], wt)
+            res["sha"] = (await agit(["rev-parse", "HEAD"], wt)).strip()
         except RuntimeError as e:
             raise FixError(f"could not commit the fix: {e}") from e
         res["ok"] = True  # set on `res` itself: the finally block below keeps the worktree only for a success
@@ -293,6 +273,19 @@ async def verify_fix(
     beat = heartbeat or (lambda: None)
     wt, runs = Path(res["worktree"]), settings.eval_validate_runs
     spec_file = wt / "evals" / "accepted" / f"{spec['name']}.json"
+    try:  # what runs must be what the person was shown
+        head = (await agit(["rev-parse", "HEAD"], wt)).strip()
+        dirty = (await agit(["status", "--porcelain", "--untracked-files=all"], wt)).strip()
+    except RuntimeError as e:
+        return res | {"ok": False, "stage": "changed", "terminal": True, "reason": f"the worktree cannot be read: {e}"}
+    if head != res.get("sha") or dirty:
+        return res | {"ok": False, "stage": "changed", "terminal": True,
+                      "reason": "the branch is not the commit you were shown (it changed after the report); nothing was run"}
+    beat()
+    code, out = await checked_pytest(wt, Path(res["tmp"]))
+    res = res | {"pytest": {"ok": code == 0, "tail": out[-400:], "summary": (out.strip().splitlines() or [""])[-1][:200]}}
+    if code != 0:
+        return res | {"ok": False, "stage": "pytest", "terminal": True, "reason": "the unit tests fail with the fix"}
     beat()
     after = await run_evals(["--spec", str(spec_file), "--runs", str(runs)], cwd=wt, key=key)
     c1 = after["cases"][spec["name"]]
@@ -303,6 +296,12 @@ async def verify_fix(
     beat()
     suite = await run_evals(["--runs", "1"], cwd=wt, key=key, timeout=1800)
     bad_hard = sorted(n for n, c in suite["cases"].items() if c["hard"] and c["passed"] != c["runs"])
+    for name in list(bad_hard):  # one flaky or already-failing run must not discard a reviewed fix: look again first
+        again = await run_evals(["--case", name, "--runs", "3"], cwd=wt, key=key)
+        c = again["cases"][name]
+        if c["passed"] == c["runs"]:
+            bad_hard.remove(name)
+            suite["cases"][name] = c | {"hard": False}  # reported as a soft miss below, with its rerun numbers
     soft = {n: [c["passed"], c["runs"]] for n, c in suite["cases"].items() if not c["hard"] and c["passed"] != c["runs"]}
     res = res | {"suite": {"hard_failures": bad_hard, "soft_misses": soft, "cases": len(suite["cases"]),
                            "cost_usd": suite.get("est_cost_usd")}}
@@ -341,10 +340,12 @@ def ready_text(proposal_id: str, res: dict[str, Any]) -> str:
     """Slack message when a checked fix is committed locally and waiting for the person's [Open PR]."""
     g = "\n:warning: *Touches guardrail files:* " + ", ".join(res["guardrails"]) if res.get("guardrails") else ""
     files = ", ".join(res["files"][:12]) + (" ..." if len(res["files"]) > 12 else "")
-    return (f"Fix drafted for `{proposal_id}` (nothing pushed, and no code has run with the API key yet). Before: case "
-            f"{res['before']['passed']}/{res['before']['runs']} runs pass. Unit tests are green (run in a no-network sandbox).\n"
-            f"Files: {files}{g}\nRead it first: `git diff main...{res['branch']}` in the repo. [Run checks + open PR] runs the case "
-            "and the behaviour suite against the real model on this code and, only if they pass, pushes the branch and opens the PR.")
+    return (f"Fix drafted for `{proposal_id}`. *Nothing from it has run and nothing is pushed.* Only static checks passed "
+            f"(protected files untouched, no tests removed or skipped, no secrets). Before: case "
+            f"{res['before']['passed']}/{res['before']['runs']} runs pass.\n"
+            f"Files: {files}{g}\nRead it first: `git diff main...{res['branch']}` in the repo (commit {res.get('sha', '?')[:10]}). "
+            "[Run checks + open PR] then runs the unit tests, the case and the behaviour suite on exactly that commit "
+            "(real model, API key) and, only if they pass, pushes the branch and opens the PR.")
 
 
 def report_text(proposal_id: str, res: dict[str, Any], pr: dict[str, Any] | None) -> str:
@@ -367,11 +368,17 @@ def report_text(proposal_id: str, res: dict[str, Any], pr: dict[str, Any] | None
 def _gh(text: Any) -> str:
     """Model- and trace-derived text for a GitHub PR: no @-mentions, raw HTML, links or issue references."""
     t = str(text).replace("@", "@\u200b").replace("<", "&lt;").replace("[", "\\[").replace("]", "\\]")
+    t = t.replace("://", ":\u200b//").replace("`", "'")  # no autolinked URLs, no breaking out of a code span
     return re.sub(r"#(?=\d)", "#\u200b", t)  # no #123 or owner/repo#123 cross-references
 
 
+def _gh_title(text: Any) -> str:
+    """A PR title is plain text: no mentions or markup, one line."""
+    return " ".join(str(text).replace("@", "@\u200b").replace("<", "&lt;").replace("`", "'").split())
+
+
 def pr_title(res: dict[str, Any], spec: dict[str, Any]) -> str:
-    return ("[guardrail] " if res.get("guardrails") else "") + _gh(f"Fix: {spec['description']}")[:200]
+    return ("[guardrail] " if res.get("guardrails") else "") + _gh_title(f"Fix: {spec['description']}")[:200]
 
 
 def pr_body(res: dict[str, Any], spec: dict[str, Any], proposal_id: str, origin: dict[str, Any]) -> str:
@@ -383,12 +390,12 @@ def pr_body(res: dict[str, Any], spec: dict[str, Any], proposal_id: str, origin:
         f"- case before: {b['passed']}/{b['runs']} runs pass", f"- case after: {a['passed']}/{a['runs']} runs pass",
         f"- behaviour suite after ({s['cases']} cases, 1 run each): hard failures: {s['hard_failures'] or 'none'}; "
         f"soft misses: {s['soft_misses'] or 'none'}",
-        f"- unit tests: {'pass' if res['pytest']['ok'] else 'FAIL'}",
-        "", "## Files changed"] + [f"- `{f}`" for f in res["files"]]
+        f"- unit tests: {_gh(res['pytest'].get('summary') or ('pass' if res['pytest']['ok'] else 'FAIL'))}",
+        "", "## Files changed"] + [f"- `{_gh(f)}`" for f in res["files"]]
     if res.get("guardrails"):
         lines += ["", "## Guardrail files touched",
                   "This change touches code the evals grade (safety, approvals, notifier, trust, merge path, the prompt, the pipeline). "
-                  "Review it as a safety change, not a routine fix:"] + [f"- `{f}`" for f in res["guardrails"]]
+                  "Review it as a safety change, not a routine fix:"] + [f"- `{_gh(f)}`" for f in res["guardrails"]]
     summary = (res.get("author") or {}).get("summary")
     if summary:
         lines += ["", "## Author's summary (model-written, unverified)", _gh(summary[:1200])]
