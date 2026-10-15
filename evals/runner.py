@@ -33,6 +33,16 @@ from .cases import Case
 from .graders import Run, ToolCall
 
 REVIEW_CONV = "prreview/eval"
+REVIEW_CONV2 = "prreview/eval-2"
+SECOND_PASS = False  # experiment (--second-pass): a second, independent reviewer pass over the same PR
+SECOND_PASS_FOCUS = (
+    "This is a second, independent review. Skip surface and style issues. Hunt specifically for: "
+    "(a) state changed or recorded before an action that can fail or be retried, or the reverse order; "
+    "(b) error, timeout, cancellation and retry paths, including what is left hanging or never resolved; "
+    "(c) a value read, validated or defaulted in one place but used in another file; "
+    "(d) limits, sizes and counts that grow with the input; "
+    "(e) a check that guards one caller or branch but not its siblings. "
+    "Report each as a finding with the file and line from the diff, as medium unless it is clearly worse.\n\n")
 
 SESSION = "main"
 _current: contextvars.ContextVar[tuple[Run, Case] | None] = contextvars.ContextVar("eval_run", default=None)
@@ -67,13 +77,17 @@ def install_fakes() -> Callable[[], None]:
     return undo
 
 
-def _collect(core: AgentCore, run: Run, conv: str = SESSION) -> None:
+def _collect(core: AgentCore, run: Run, conv: str = SESSION, extra_convs: tuple[str, ...] = ()) -> None:
     run.outbox = [{"kind": o["kind"], "payload": o["payload"]} for o in core.store.outbox_since(SESSION)]
     run.routines = core.store.routine_list(SESSION)
     run.scheduled = dict(core.scheduler.items)
     run.digest = core.store.kv_get(SESSION, "digest", [])
-    u = core.store.usage_totals(conv)
-    run.output_tokens, run.input_tokens, run.cache_read, run.cache_write = u["output"], u["input"], u["cache_read"], u["cache_write"]
+    for c in (conv, *extra_convs):
+        u = core.store.usage_totals(c)
+        run.output_tokens += u["output"]
+        run.input_tokens += u["input"]
+        run.cache_read += u["cache_read"]
+        run.cache_write += u["cache_write"]
     for m in core.store.load_messages(conv):
         if m["role"] != "assistant":
             continue
@@ -102,7 +116,7 @@ async def run_case_once(case: Case, llm: LLM, base: Settings) -> Run:
                     await handle_events(core, SESSION, events)
             except Exception as e:  # noqa: BLE001 - a crashed run is a failed run, with the reason kept
                 run.error = f"{type(e).__name__}: {e}"
-            _collect(core, run, conv)
+            _collect(core, run, conv, (REVIEW_CONV2,) if SECOND_PASS and case.mode == "review" else ())
     finally:
         _current.reset(token)
     return run
@@ -119,7 +133,23 @@ async def _review(core: AgentCore, case: Case) -> dict[str, Any] | None:
         DirectOps(core, SESSION), conv=REVIEW_CONV, role="helper", depth=1, turn_key="h",
         max_steps=core.s.max_helper_steps, max_helper_depth=core.s.max_helper_depth, trigger_user=False,
     )
-    return parse_verdict(res.text or "")
+    first = parse_verdict(res.text or "")
+    if not SECOND_PASS or first is None:
+        return first
+    task2 = build_task(REVIEW_PR).replace('Recommend "approve" only if', SECOND_PASS_FOCUS + 'Recommend "approve" only if')
+    assert SECOND_PASS_FOCUS in task2
+    await core.prepare_helper(REVIEW_CONV2, task2)
+    res2 = await run_agent_loop(
+        DirectOps(core, SESSION), conv=REVIEW_CONV2, role="helper", depth=1, turn_key="h2",
+        max_steps=core.s.max_helper_steps, max_helper_depth=core.s.max_helper_depth, trigger_user=False,
+    )
+    second = parse_verdict(res2.text or "")
+    if second is None:
+        return first
+    findings = (first["findings"] + second["findings"])[:30]
+    return {**first, "findings": findings,
+            "verdict": "request_changes" if "request_changes" in (first["verdict"], second["verdict"]) else "approve",
+            "second_pass": len(second["findings"])}
 
 
 def _severities(run: Run) -> dict[str, int]:

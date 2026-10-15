@@ -31,6 +31,7 @@ def main() -> int:
     ap.add_argument("--batch", action="store_true", help="use the Message Batches API (50%% price, slower)")
     ap.add_argument("--batch-poll", type=float, default=15.0, help="seconds between batch status checks")
     ap.add_argument("--tag", action="append", help="only cases with this tag (repeatable); the slow hard review set needs --tag review-hard")
+    ap.add_argument("--second-pass", action="store_true", help="experiment: review each PR twice, the second pass hunting ordering/error-path/cross-file bugs")
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     if a.list:
@@ -45,6 +46,9 @@ def main() -> int:
         print("ANTHROPIC_API_KEY is not set; this runs the real model (see .env.example)", file=sys.stderr)
         return 2
     from aoa.llm import AnthropicLLM
+    from . import runner
+
+    runner.SECOND_PASS = a.second_pass
 
     coord = None
     factory, concurrency = AnthropicLLM, a.concurrency
