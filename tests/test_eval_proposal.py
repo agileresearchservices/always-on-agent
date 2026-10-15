@@ -404,3 +404,118 @@ async def test_run_evals_kills_the_child_when_cancelled(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert started.get("killed")
+
+
+# --- #70: a capped flag must not block `aoa propose` -------------------------------------------------------------------
+
+class StubClient:
+    """Stands in for the Temporal client: records starts, refuses ids that are 'running'."""
+    def __init__(self, running=()):
+        self.running, self.calls = set(running), []
+
+    async def start_workflow(self, name, inp, *, id, task_queue, id_reuse_policy):
+        from temporalio.exceptions import WorkflowAlreadyStartedError
+        self.calls.append((id, id_reuse_policy))
+        if id in self.running:
+            raise WorkflowAlreadyStartedError(id, name)
+
+
+def _flags(n):
+    return [{"conv_id": f"c{i}", "reason": f"r{i}"} for i in range(n)]
+
+
+async def test_start_proposals_reuses_a_finished_workflows_id(settings):
+    from temporalio.common import WorkflowIDReusePolicy
+    client = StubClient()
+    ids = await ep.start_proposals(settings, "main", _flags(1), client=client)
+    assert ids == [ep.workflow_id(_flags(1)[0])]
+    # the table is the source of truth, so a finished (e.g. capped) workflow must not burn the id for good
+    assert client.calls[0][1] == WorkflowIDReusePolicy.ALLOW_DUPLICATE
+
+
+async def test_a_refused_start_does_not_use_up_the_limit(settings):
+    flags = _flags(3)
+    client = StubClient(running={ep.workflow_id(flags[0])})  # the first flag already has a running workflow
+    ids = await ep.start_proposals(settings, "main", flags, limit=1, client=client)
+    assert ids == [ep.workflow_id(flags[1])]  # skipped the stuck one, still started one
+    assert [c[0] for c in client.calls] == [ep.workflow_id(flags[0]), ep.workflow_id(flags[1])]  # and stopped at the limit
+
+
+async def test_limit_none_starts_every_flag(settings):
+    assert len(await ep.start_proposals(settings, "main", _flags(3), client=StubClient())) == 3
+
+
+def test_cap_is_a_rolling_window_and_says_when_a_slot_frees(settings, monkeypatch):
+    monkeypatch.setenv("AOA_EVAL_PROPOSALS_PER_DAY", "2")
+    from aoa.config import Settings
+    from aoa.store import Store
+    s = Settings.from_env()
+    st = Store(s.db_path)
+    now = 1_000_000_000.0
+    assert ep.cap_state(st, s, now) == (0, 2, None)
+    with st._conn() as c:
+        for i, ts in enumerate((now - 3600, now - 1800)):
+            c.execute("INSERT INTO eval_proposals (id, conv_id, reason, status, ts) VALUES (?,?,?,?,?)", (f"p{i}", f"c{i}", "r", "declined", ts))
+    used, cap, frees = ep.cap_state(st, s, now)
+    assert (used, cap) == (2, 2) and frees == now - 3600 + ep.CAP_WINDOW  # the oldest ages out first
+    assert ep.cap_state(st, s, now + ep.CAP_WINDOW - 3599)[0] == 1  # an hour later one has aged out: a slot is free
+
+
+async def test_a_capped_flag_can_be_proposed_after_the_cap_is_raised(make_core, settings, monkeypatch):
+    monkeypatch.setenv("AOA_EVAL_PROPOSALS_PER_DAY", "1")
+    from aoa.config import Settings
+    s = Settings.from_env()
+    core, _ = make_core([text(json.dumps({"notes": "meh", "case": None}))])
+    st = core.store
+    st.flag_add("c1", "r1", "e"), st.flag_add("c2", "r2", "e")
+    f1, f2 = st.flags_list()
+    assert (await ep.run_proposal(st, s, core.llm, f1, "main"))["status"] == "declined"
+    assert (await ep.run_proposal(st, s, core.llm, f2, "main"))["status"] == "capped"
+    assert st.proposal_find("c2", "r2") is None  # capped writes no row, which is why the id must stay reusable
+    monkeypatch.setenv("AOA_EVAL_PROPOSALS_PER_DAY", "5")
+    core.llm.script.append(text(json.dumps({"notes": "meh", "case": None})))
+    assert (await ep.run_proposal(st, Settings.from_env(), core.llm, f2, "main"))["status"] == "declined"
+
+
+def _run_propose(monkeypatch, tmp_path, argv):
+    from aoa import __main__ as cli
+    monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["aoa", *argv])
+    cli.main()
+
+
+def test_propose_command_reports_the_cap_instead_of_nothing_to_propose(monkeypatch, tmp_path, capsys):
+    from aoa.store import Store
+    monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AOA_EVAL_PROPOSALS_PER_DAY", "1")
+    from aoa.config import Settings
+    st = Store(Settings.from_env().db_path)
+    st.flag_add("c1", "r1", "e"), st.flag_add("c2", "r2", "e")
+    st.proposal_create("c1", "r1")  # uses the one slot
+    started = []
+
+    async def fake_start(*a, **kw):
+        started.append(1)
+        return []
+    monkeypatch.setattr(ep, "start_proposals", fake_start)
+    _run_propose(monkeypatch, tmp_path, ["propose"])
+    out = capsys.readouterr().out
+    assert "daily cap reached: 1 of 1" in out and "rolling" in out and "1 flag(s) are waiting" in out
+    assert started == []  # nothing was started, so no id was burned
+
+
+def test_propose_command_walks_past_a_refused_flag(monkeypatch, tmp_path, capsys):
+    from aoa.store import Store
+    monkeypatch.setenv("AOA_DATA_DIR", str(tmp_path))
+    from aoa.config import Settings
+    st = Store(Settings.from_env().db_path)
+    st.flag_add("c1", "r1", "e"), st.flag_add("c2", "r2", "e")
+    seen = {}
+
+    async def fake_start(settings, session, flags, limit=None, client=None):
+        seen["n"], seen["limit"] = len(flags), limit
+        return ["eval-proposal-x"]
+    monkeypatch.setattr(ep, "start_proposals", fake_start)
+    _run_propose(monkeypatch, tmp_path, ["propose"])
+    assert seen == {"n": 2, "limit": 1}  # every candidate is offered; the limit counts starts, not candidates
+    assert "started 1 proposal workflow" in capsys.readouterr().out

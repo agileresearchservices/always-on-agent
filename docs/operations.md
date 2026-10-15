@@ -96,12 +96,10 @@ conversation.
 **Merge button did nothing or disappeared.** `pr_merge.RETRYABLE` failures restore it; `needs_human`, `stale` and
 `tests_failed` do not. The notice posted in Slack says which.
 
-**`aoa propose` prints "nothing to propose" although flags are open.** It takes the first `--limit` flags (default 1) that
-have no proposal row and tries to start a workflow for each. A flag whose earlier workflow already *completed* (a `capped`
-run, for example) has no proposal row but still owns its workflow id, so the start is refused and counts as nothing started.
-With the default limit that one flag can sit at the head of the list and hide the rest. Run `python -m aoa propose --limit N`
-with N at least the number of open flags, or check `python -m aoa proposals` and `temporal workflow list`. (This is a known
-rough edge in the command, not something to fix by deleting history.)
+**`aoa propose` starts nothing.** It says why. "Daily cap reached" gives the count and when the next slot frees (the cap is a
+rolling 24 hours); raise `AOA_EVAL_PROPOSALS_PER_DAY` and restart the worker to go sooner. "Nothing to propose: no open flag
+without a proposal" means every open flag already has a row (`python -m aoa proposals`). "Every candidate flag already has a
+running proposal" means workflows are still running: check `temporal workflow list`.
 
 **Scheduled evals alert.** The alert names the case. Read `evals/results/*.json` (`findings`, `failures`), re-run
 `python -m evals --case NAME --runs 3`, and decide whether the agent or the case is wrong. A "no case passed" alert is a

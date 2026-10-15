@@ -357,6 +357,10 @@ class Store:
         with self._conn() as c:
             return c.execute("SELECT COUNT(*) AS n FROM eval_proposals WHERE ts>=?", (ts,)).fetchone()["n"]
 
+    def proposal_times_since(self, ts: float) -> list[float]:
+        with self._conn() as c:
+            return [r["ts"] for r in c.execute("SELECT ts FROM eval_proposals WHERE ts>=? ORDER BY ts", (ts,))]
+
     def flags_count(self, conv_id: str, reason_prefix: str, status: str) -> int:
         with self._conn() as c:
             return c.execute("SELECT COUNT(*) AS n FROM flagged WHERE conv_id=? AND status=? AND substr(reason, 1, ?)=?",
