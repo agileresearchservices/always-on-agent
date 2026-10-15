@@ -396,6 +396,13 @@ class AgentActivities:
 
         return await with_heartbeat(run_scheduled(self.core.store, self.s, a["session"], run, force=bool(a.get("force"))), activity.heartbeat)
 
+    @activity.defn(name="flag_scan")
+    async def flag_scan(self, a: dict[str, Any]) -> dict[str, Any]:
+        """Scan the stored traces for bad outcomes and post one digest if there are new ones (#64). No model calls."""
+        from .flag_schedule import run_flag_scan
+
+        return run_flag_scan(self.core.store, self.s, a["session"])
+
     @activity.defn(name="fix_run")
     async def fix_run(self, a: dict[str, Any]) -> dict[str, Any]:
         """Draft and check a fix for an accepted eval case in a worktree (flywheel step 3). Returns the result; a
@@ -474,5 +481,5 @@ class AgentActivities:
             self.deliver_routine_event, self.poll_github, self.fetch_pr_for_review, self.publish_pr_review,
             self.merge_inspect, self.merge_pr, self.merge_update_branch, self.merge_delete_branch,
             self.merge_issue_states, self.merge_report, self.resolve_conflicts, self.eval_draft, self.eval_post_card,
-            self.run_scheduled_evals, self.fix_run, self.fix_open_pr, self.fix_discard, self.fix_report,
+            self.run_scheduled_evals, self.flag_scan, self.fix_run, self.fix_open_pr, self.fix_discard, self.fix_report,
         ]

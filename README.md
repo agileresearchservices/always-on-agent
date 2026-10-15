@@ -18,8 +18,9 @@ python -m aoa.worker                      # terminal 2
 uvicorn aoa.server:app --port 8000        # terminal 3
 python -m aoa.client_cli --session main   # terminal 4
 python -m aoa usage                       # estimated API spend per day (from the usage table)
-python -m aoa flags --scan                # list flagged bad outcomes (denied approvals, cut-off or capped turns, repeated tool errors, cache misses, report_issue)
+python -m aoa flags --scan                # (also run daily by the aoa-flag-scan schedule, AOA_FLAG_SCAN_HOURS; it posts one Slack digest, never proposes) list flagged bad outcomes (denied approvals, cut-off or capped turns, repeated tool errors, cache misses, report_issue)
 python -m aoa trace <conv> [--json]       # a conversation's messages, the stable trace export
+python -m aoa evalruns                   # scheduled eval runs and whether each regressed (AOA_EVAL_SCHEDULE_HOURS; off by default)
 python -m aoa propose [--limit N]         # draft + validate eval cases for open flags (model calls and eval runs, capped per day); cards arrive in Slack
 python -m aoa proposals                   # list eval-case proposals and their status
 ```

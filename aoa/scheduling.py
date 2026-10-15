@@ -130,3 +130,35 @@ async def ensure_eval_schedule(client: Client, settings: Settings) -> None:
         await client.create_schedule(EVAL_SCHEDULE_ID, schedule)
     except ScheduleAlreadyRunningError:
         await handle.update(lambda _: ScheduleUpdate(schedule=schedule))
+
+
+FLAG_SCHEDULE_ID = "aoa-flag-scan"
+
+
+async def ensure_flag_schedule(client: Client, settings: Settings) -> None:
+    """Create, update or delete the scheduled flag scan (#64). It reads SQLite and posts a digest; no tokens are spent,
+    so it needs no key. AOA_FLAG_SCAN_HOURS=0 removes the schedule."""
+    import os
+    from datetime import timedelta
+
+    from temporalio.client import ScheduleIntervalSpec
+
+    handle = client.get_schedule_handle(FLAG_SCHEDULE_ID)
+    if settings.flag_scan_hours <= 0:
+        try:
+            await handle.delete()
+        except RPCError as e:
+            if e.status != RPCStatusCode.NOT_FOUND:
+                raise
+        return
+    schedule = Schedule(
+        action=ScheduleActionStartWorkflow(
+            "FlagScanWorkflow", {"session": os.environ.get("AOA_SESSION", "main")},
+            id=f"{FLAG_SCHEDULE_ID}-run", task_queue=settings.task_queue, execution_timeout=timedelta(minutes=15),
+        ),
+        spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(hours=settings.flag_scan_hours))]),
+    )
+    try:
+        await client.create_schedule(FLAG_SCHEDULE_ID, schedule)
+    except ScheduleAlreadyRunningError:
+        await handle.update(lambda _: ScheduleUpdate(schedule=schedule))

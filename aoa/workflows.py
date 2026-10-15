@@ -483,6 +483,18 @@ class EvalRunWorkflow:
 
 
 @workflow.defn
+class FlagScanWorkflow:
+    """Fired by the flag-scan schedule (`aoa-flag-scan`). The scan is idempotent and costs nothing, so it may retry."""
+
+    @workflow.run
+    async def run(self, inp: dict[str, Any]) -> dict[str, Any]:
+        return await workflow.execute_activity(
+            "flag_scan", {"session": inp["session"]},
+            start_to_close_timeout=timedelta(minutes=5), retry_policy=STATE_RETRY,
+        )
+
+
+@workflow.defn
 class FixPrWorkflow:
     """Started by the server when the person clicks [Draft fix] on an accepted eval case; never by the model. Drafts
     a fix in a worktree and commits it LOCALLY. Nothing is pushed, and no author code sees the API key, until the
