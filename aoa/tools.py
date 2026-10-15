@@ -131,7 +131,10 @@ async def h_call_deferred(ctx: ToolContext, a: dict[str, Any]) -> str:
 
 
 async def h_run_shell(ctx: ToolContext, a: dict[str, Any]) -> str:
-    verdict = await review_command(ctx.llm, ctx.settings.review_model, a["command"], a.get("why", ""))
+    verdict = await review_command(
+        ctx.llm, ctx.settings.review_model, a["command"], a.get("why", ""),
+        on_usage=lambda m, u: ctx.store.usage_add(f"{ctx.conv_id}#review", m, u),
+    )
     if not verdict.allow:
         raise ToolError(verdict.reason)
     try:
