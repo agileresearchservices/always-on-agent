@@ -164,3 +164,27 @@ def test_focus_is_read_from_the_local_profile_only(tmp_path):
 def test_task_carries_the_checklist():
     t = build_task(PR)
     assert "skip or return early" in t and "tests only" in t and "quietly reverts" in t
+
+
+def test_a_pr_pushed_to_recently_waits_and_quick_pushes_cost_one_review(tmp_path):
+    from datetime import datetime, timezone
+
+    from aoa.store import Store
+
+    def at(ts):  # the PR's updated_at, as GitHub prints it
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    store, me, t0 = Store(tmp_path / "s.sqlite3"), "agileresearchservices", 1_800_000_000
+    first = {**PR, "sha": "one", "updated": at(t0)}
+    # polled 60 s after the push, window 300 s: kept for a later poll, nothing reviewed
+    assert reviews_to_start(store, "main", [first], me, settle=300, now=t0 + 60) == []
+    # a second push before the next poll replaces the queued commit, still within the window
+    second = {**PR, "sha": "two", "updated": at(t0 + 200)}
+    assert reviews_to_start(store, "main", [second], me, settle=300, now=t0 + 260) == []
+    # quiet for the whole window: one review, of the last head
+    got = reviews_to_start(store, "main", [], me, settle=300, now=t0 + 600)
+    assert [(p["number"], p["sha"]) for p in got] == [(7, "two")]
+    assert reviews_to_start(store, "main", [], me, settle=300, now=t0 + 900) == []
+    # off (0), or an unreadable time, never holds a review back
+    assert len(reviews_to_start(store, "main", [{**PR, "updated": at(t0 + 900)}], me, settle=0, now=t0 + 900)) == 1
+    assert len(reviews_to_start(store, "main", [{**PR, "number": 8, "updated": "garbage"}], me, settle=300, now=t0)) == 1

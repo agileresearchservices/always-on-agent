@@ -103,7 +103,7 @@ class AgentActivities:
             prs = await poll_once(http, self.core.store, a["session"], a["user"], token_provider())
         if prs:
             self.core.store.outbox_push(a["session"], "update", {"text": notice_text(prs)}, client_key=notice_key(prs))
-        review = reviews_to_start(self.core.store, a["session"], prs, a["user"])
+        review = reviews_to_start(self.core.store, a["session"], prs, a["user"], settle=self.s.review_settle_seconds)
         for pr in review:  # a commit aoa wrote to resolve conflicts: point the reviewer at those files
             files = self.core.store.kv_get(a["session"], f"{RESOLVED_KEY}{pr['repo']}#{pr['number']}@{pr['sha']}")
             if files is not None:

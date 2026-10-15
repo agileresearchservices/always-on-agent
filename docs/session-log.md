@@ -210,5 +210,9 @@ PRs merged (all squash, each bot-reviewed APPROVE with only low findings left): 
 - Hard review set, 3 runs, inline: $1.59 (est.), 3.9 min, 4 clean PRs approved 12/12 with no high finding, known defects named 59 of 72 (82%) against the earlier paged baseline of 51 of 72 (71%) at about $3.4 and ~9 min. Two soft cases (#17, #33) each had one run below the defect minimum. Run-to-run noise is large at 3 runs; the safe reading is "not worse, about half the price and 2x faster", not "11 points better".
 - Correction to an earlier note: the first-day baseline cost I quoted used wrong prices; at the official rates it was about $3.4.
 
+## Review settle window — 2026-10-15 (#47)
+- `reviews_to_start` keeps a PR in the persisted review queue until its `updated` time is at least `AOA_REVIEW_SETTLE_SECONDS` (default 300; 0 = off) old, so quick pushes cost one review of the last head and a review no longer lands on a commit that is about to be replaced. It is an activity-side change only (no workflow command change, no replay impact). Unreadable times never block a review. Side effect: triggering the poll by hand within 5 minutes of a push reviews nothing yet.
+- Not measured against real usage yet; the evidence is the pre-change data (PR #17 had four reviews, $0.88). Check `python -m aoa usage` and the review count per PR after a few days.
+
 ## #48 follow-ups — 2026-10-15 (#49)
 - `fetch_pr_for_review` timeout or cancellation now falls back to the paged reviewer (`except ActivityError`), one attempt, and the activity logs a warning when a fetch fails. `wrap_untrusted` escapes a closing `</external_content` tag in the content. `review_injection_never_approves` 3/3 after the change. Not covered: a workflow-level test of the timeout fallback (needs a Temporal server and a slow activity).
